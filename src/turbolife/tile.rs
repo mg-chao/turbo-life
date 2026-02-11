@@ -6,6 +6,7 @@
 //! - `BorderData`: pre-extracted border rows/columns for ghost zone fills
 
 pub const TILE_SIZE: usize = 64;
+pub const POPULATION_UNKNOWN: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TileIdx(pub u32);
@@ -125,7 +126,7 @@ pub struct TileCells {
 /// Per-tile metadata: flags and cached population.
 #[derive(Clone, Debug)]
 pub struct TileMeta {
-    pub population: Option<u32>,
+    pub population: u32,
     /// Epoch when this tile was last marked active.
     pub active_epoch: u32,
     pub changed: bool,
@@ -139,7 +140,7 @@ impl TileMeta {
         Self {
             changed: true,
             active_epoch: 0,
-            population: Some(0),
+            population: 0,
             occupied: true,
             in_changed_list: false,
             has_live: false,
@@ -150,7 +151,7 @@ impl TileMeta {
         Self {
             changed: false,
             active_epoch: 0,
-            population: Some(0),
+            population: 0,
             occupied: false,
             in_changed_list: false,
             has_live: false,

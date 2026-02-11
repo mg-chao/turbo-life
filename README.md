@@ -30,10 +30,13 @@ Seeds a 4096×4096 region at 42% density and runs 1000 generations, printing tot
 
 - TurboLife defaults to using the number of physical CPU cores for its internal rayon thread pool.
 - You can override this with `TURBOLIFE_NUM_THREADS` (preferred) or `RAYON_NUM_THREADS`.
+- TurboLife uses adaptive per-step parallelism to avoid over-aggressive threading on small/medium active sets.
+- `TURBOLIFE_MAX_THREADS` can cap runtime parallel fan-out while keeping pool size unchanged.
 - Example (PowerShell):
 
 ```
 $env:TURBOLIFE_NUM_THREADS=12
+$env:TURBOLIFE_MAX_THREADS=8
 cargo run --release
 ```
 

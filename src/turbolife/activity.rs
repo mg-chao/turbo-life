@@ -18,6 +18,7 @@ const PARALLEL_PRUNE_MIN_ACTIVE: usize = 384;
 
 /// Minimum active tiles per worker before enabling parallel prune/expand.
 const PARALLEL_PRUNE_TILES_PER_THREAD: usize = 48;
+const PARALLEL_PRUNE_MIN_CHUNKS: usize = 2;
 
 /// Minimum chunk size for parallel prune/expand.
 const PRUNE_CHUNK_MIN: usize = 128;
@@ -30,6 +31,52 @@ fn prune_chunk_size(active_len: usize, threads: usize) -> usize {
     let target_chunks = threads.saturating_mul(4).max(1);
     let size = active_len.div_ceil(target_chunks);
     size.clamp(PRUNE_CHUNK_MIN, PRUNE_CHUNK_MAX)
+}
+
+#[inline]
+fn effective_prune_threads(active_len: usize, thread_count: usize) -> usize {
+    if thread_count <= 1 || active_len < PARALLEL_PRUNE_MIN_ACTIVE {
+        return 1;
+    }
+
+    let by_work = active_len / PARALLEL_PRUNE_TILES_PER_THREAD;
+    let by_chunks = active_len / PRUNE_CHUNK_MIN;
+    let effective = by_work.min(by_chunks).min(thread_count).max(1);
+
+    if effective < PARALLEL_PRUNE_MIN_CHUNKS {
+        1
+    } else {
+        effective
+    }
+}
+
+#[inline]
+fn tuned_prune_threads(active_len: usize, thread_count: usize) -> usize {
+    if thread_count <= 1 {
+        return 1;
+    }
+
+    let mut effective = effective_prune_threads(active_len, thread_count);
+    if effective <= 1 {
+        return 1;
+    }
+
+    let tuned_cap = if active_len < 1_024 {
+        2
+    } else if active_len < 2_048 {
+        4
+    } else if active_len < 8_192 {
+        8
+    } else if active_len < 32_768 {
+        12
+    } else {
+        thread_count
+    };
+
+    effective = effective
+        .min(tuned_cap)
+        .min(thread_count);
+    effective.max(1)
 }
 
 /// Rebuild the active set from the changed list in O(changed * 9).
@@ -185,8 +232,8 @@ pub fn prune_and_expand(arena: &mut TileArena) {
         return;
     }
 
-    let run_parallel = active_len >= PARALLEL_PRUNE_MIN_ACTIVE
-        && active_len >= thread_count * PARALLEL_PRUNE_TILES_PER_THREAD;
+    let effective_threads = tuned_prune_threads(active_len, thread_count);
+    let run_parallel = effective_threads > 1;
 
     if !run_parallel {
         // Serial path for small active sets.
@@ -206,7 +253,7 @@ pub fn prune_and_expand(arena: &mut TileArena) {
         }
     } else {
         // Parallel path for large active sets.
-        let chunk_size = prune_chunk_size(active_len, thread_count);
+        let chunk_size = prune_chunk_size(active_len, effective_threads);
         let (expand_all, prune_all) = arena.active_set
             .par_chunks(chunk_size)
             .fold(
@@ -254,7 +301,7 @@ pub fn prune_and_expand(arena: &mut TileArena) {
         let idx = arena.allocate(coord);
         arena.meta[idx.index()].changed = true;
         arena.meta[idx.index()].active_epoch = 0;
-        arena.meta[idx.index()].population = Some(0);
+        arena.meta[idx.index()].population = 0;
         arena.mark_changed(idx);
     }
 

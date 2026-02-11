@@ -196,7 +196,7 @@ impl TileArena {
             return;
         }
         let idx = self.allocate(coord);
-        self.meta[idx.index()].population = Some(0);
+        self.meta[idx.index()].population = 0;
         self.meta[idx.index()].has_live = false;
         self.mark_changed(idx);
     }

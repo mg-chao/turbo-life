@@ -3,7 +3,7 @@
 //! Computes the next generation for a single tile using a full-adder chain.
 //! Border extraction is fused into the main loop.
 
-use super::tile::{BorderData, TileCells, TileMeta, TILE_SIZE};
+use super::tile::{BorderData, TileCells, TileMeta, TILE_SIZE, POPULATION_UNKNOWN};
 
 #[inline(always)]
 fn full_add(a: u64, b: u64, c: u64) -> (u64, u64) {
@@ -145,7 +145,7 @@ pub unsafe fn advance_tile_fused(
     unsafe { *next_borders_ptr.add(idx) = border; }
 
     meta.changed = changed;
-    meta.population = None;
+    meta.population = POPULATION_UNKNOWN;
     meta.has_live = has_live;
 
     changed

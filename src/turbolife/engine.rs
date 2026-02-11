@@ -13,6 +13,7 @@ use super::activity::{prune_and_expand, rebuild_active_set};
 use super::arena::TileArena;
 use super::kernel::{advance_tile_fused, advance_core as advance_tile_core};
 use super::sync::gather_ghost_zone;
+use super::tile::POPULATION_UNKNOWN;
 
 struct SendPtr<T> {
     _inner: *mut T,
@@ -33,35 +34,37 @@ impl<T> SendPtr<T> {
 const TILE_SIZE_I64: i64 = 64;
 const PARALLEL_KERNEL_MIN_ACTIVE: usize = 384;
 const PARALLEL_KERNEL_TILES_PER_THREAD: usize = 48;
+const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 64;
 const KERNEL_CHUNK_MAX: usize = 1024;
 const ENV_OVERRIDE_THREADS: &str = "TURBOLIFE_NUM_THREADS";
+const ENV_MAX_THREADS: &str = "TURBOLIFE_MAX_THREADS";
 
 static TURBOLIFE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
+
+#[inline]
+fn parse_positive_env(var: &str) -> Option<usize> {
+    let raw = std::env::var(var).ok()?;
+    let parsed = raw.trim().parse::<usize>().ok()?;
+    (parsed > 0).then_some(parsed)
+}
+
+#[inline]
+fn physical_core_count() -> usize {
+    *PHYSICAL_CORES.get_or_init(|| num_cpus::get_physical().max(1))
+}
 
 fn desired_thread_count() -> usize {
-    if let Ok(raw) = std::env::var(ENV_OVERRIDE_THREADS) {
-        if let Ok(parsed) = raw.trim().parse::<usize>() {
-            if parsed > 0 {
-                return parsed;
-            }
-        }
+    let mut threads = parse_positive_env(ENV_OVERRIDE_THREADS)
+        .or_else(|| parse_positive_env("RAYON_NUM_THREADS"))
+        .unwrap_or_else(physical_core_count);
+
+    if let Some(max_threads) = parse_positive_env(ENV_MAX_THREADS) {
+        threads = threads.min(max_threads);
     }
 
-    if let Ok(raw) = std::env::var("RAYON_NUM_THREADS") {
-        if let Ok(parsed) = raw.trim().parse::<usize>() {
-            if parsed > 0 {
-                return parsed;
-            }
-        }
-    }
-
-    let physical = num_cpus::get_physical();
-    if physical > 0 {
-        physical
-    } else {
-        rayon::current_num_threads().max(1)
-    }
+    threads.max(1)
 }
 
 #[inline]
@@ -83,6 +86,52 @@ fn kernel_chunk_size(active_len: usize, threads: usize) -> usize {
     let target_chunks = threads.saturating_mul(4).max(1);
     let size = active_len.div_ceil(target_chunks);
     size.clamp(KERNEL_CHUNK_MIN, KERNEL_CHUNK_MAX)
+}
+
+#[inline]
+fn effective_parallel_threads(active_len: usize, thread_count: usize) -> usize {
+    if thread_count <= 1 || active_len < PARALLEL_KERNEL_MIN_ACTIVE {
+        return 1;
+    }
+
+    let by_work = active_len / PARALLEL_KERNEL_TILES_PER_THREAD;
+    let by_chunks = active_len / KERNEL_CHUNK_MIN;
+    let effective = by_work.min(by_chunks).min(thread_count).max(1);
+
+    if effective < PARALLEL_KERNEL_MIN_CHUNKS {
+        1
+    } else {
+        effective
+    }
+}
+
+#[inline]
+fn tuned_parallel_threads(active_len: usize, thread_count: usize) -> usize {
+    if thread_count <= 1 {
+        return 1;
+    }
+
+    let mut effective = effective_parallel_threads(active_len, thread_count);
+    if effective <= 1 {
+        return 1;
+    }
+
+    let tuned_cap = if active_len < 1_024 {
+        2
+    } else if active_len < 2_048 {
+        4
+    } else if active_len < 8_192 {
+        8
+    } else if active_len < 32_768 {
+        12
+    } else {
+        thread_count
+    };
+
+    effective = effective
+        .min(tuned_cap)
+        .min(thread_count);
+    effective.max(1)
 }
 
 pub struct TurboLife {
@@ -120,7 +169,7 @@ impl TurboLife {
         *self.arena.border_mut(idx) = border;
         {
             let meta = self.arena.meta_mut(idx);
-            meta.population = None;
+            meta.population = POPULATION_UNKNOWN;
             meta.has_live = has_live;
         }
         self.population_cache = None;
@@ -170,8 +219,8 @@ impl TurboLife {
         let active_len = self.arena.active_set.len();
         let bp = self.arena.border_phase;
         let thread_count = rayon::current_num_threads().max(1);
-        let run_parallel = active_len >= PARALLEL_KERNEL_MIN_ACTIVE
-            && active_len >= thread_count * PARALLEL_KERNEL_TILES_PER_THREAD;
+        let effective_threads = tuned_parallel_threads(active_len, thread_count);
+        let run_parallel = effective_threads > 1;
 
         if !run_parallel {
             // Serial path: avoid rayon overhead for small active sets.
@@ -196,7 +245,7 @@ impl TurboLife {
                 cells.swap();
                 next_borders[idx.index()] = border;
                 meta.changed = changed;
-                meta.population = None;
+                meta.population = POPULATION_UNKNOWN;
                 meta.has_live = has_live;
 
                 if changed {
@@ -218,7 +267,7 @@ impl TurboLife {
             } else {
                 (b1[0].as_slice(), SendPtr::new(b0[0].as_mut_ptr()))
             };
-            let chunk_size = kernel_chunk_size(active_len, thread_count);
+            let chunk_size = kernel_chunk_size(active_len, effective_threads);
 
             let changed_chunks: Vec<Vec<super::tile::TileIdx>> = active_set.par_chunks(chunk_size).map({
                 let cell_mut_ptr = cell_mut_ptr;
@@ -302,14 +351,14 @@ impl TurboLife {
         for (cells, meta) in self.arena.cell_data.iter().zip(self.arena.meta.iter_mut()) {
             if !meta.occupied { continue; }
             if !meta.has_live {
-                meta.population = Some(0);
+                meta.population = 0;
                 continue;
             }
-            let pop = if let Some(cached) = meta.population {
-                cached
+            let pop = if meta.population != POPULATION_UNKNOWN {
+                meta.population
             } else {
                 let computed = cells.compute_population();
-                meta.population = Some(computed);
+                meta.population = computed;
                 computed
             };
             total += pop as u64;
