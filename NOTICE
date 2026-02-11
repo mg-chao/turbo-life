@@ -1,0 +1,14 @@
+This project includes a port of the QuickLife algorithm from Golly.
+
+Original source:
+  Golly (https://sourceforge.net/projects/golly/)
+  Files: gollybase/qlifealgo.h, gollybase/qlifealgo.cpp,
+         gollybase/liferules.h, gollybase/liferules.cpp
+
+Copyright (C) 2005-2025
+The Golly Gang (Andrew Trevorrow, Tomas Rokicki, Tim Hutton,
+Dave Greene, Jason Summers, Maks Verver, Robert Munafo,
+Brenton Bostick, Chris Rowett, Dongook Lee).
+
+This port is distributed under the GNU General Public License
+version 2 or later. See LICENSE.
