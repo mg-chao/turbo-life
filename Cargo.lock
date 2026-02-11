@@ -76,15 +76,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quick-life"
-version = "0.1.0"
-dependencies = [
- "rand",
- "rayon",
- "rustc-hash",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -163,6 +154,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "turbo-life"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "rayon",
+ "rustc-hash",
 ]
 
 [[package]]
