@@ -1,36 +1,46 @@
 //! Ghost zone synchronization for TurboLife.
 //!
-//! Gathers border data from 8 neighbors into a `GhostZone` struct.
-//! Reads from the compact `borders` array rather than full `TileCells`,
-//! keeping the working set small.
+//! Branchless sentinel-based gather: NO_NEIGHBOR indices are remapped to
+//! the sentinel slot (index 0, always zeroed), eliminating all 8 branches
+//! per tile on the hottest path.
 
-use super::tile::{BorderData, Direction, GhostZone, Neighbors, TileIdx, NO_NEIGHBOR};
+use super::arena::SENTINEL_IDX;
+use super::tile::{BorderData, GhostZone, Neighbors, TileIdx, NO_NEIGHBOR};
 
-/// Gather the ghost zone for a single tile from its neighbors' borders.
-#[inline]
+/// Remap NO_NEIGHBOR to the sentinel index.
+#[inline(always)]
+fn sentinel_or(raw: u32) -> usize {
+    if raw == NO_NEIGHBOR { SENTINEL_IDX } else { raw as usize }
+}
+
+/// Gather the ghost zone for a single tile — branchless via sentinel slot.
+#[inline(always)]
 pub fn gather_ghost_zone(
     idx: TileIdx,
     borders: &[BorderData],
     neighbors: &[Neighbors],
 ) -> GhostZone {
     let nb = &neighbors[idx.index()];
-    let north_i = nb[Direction::North.index()];
-    let south_i = nb[Direction::South.index()];
-    let west_i = nb[Direction::West.index()];
-    let east_i = nb[Direction::East.index()];
-    let nw_i = nb[Direction::NW.index()];
-    let ne_i = nb[Direction::NE.index()];
-    let sw_i = nb[Direction::SW.index()];
-    let se_i = nb[Direction::SE.index()];
+    unsafe {
+        let b = borders.as_ptr();
+        let north = &*b.add(sentinel_or(nb[0]));
+        let south = &*b.add(sentinel_or(nb[1]));
+        let west  = &*b.add(sentinel_or(nb[2]));
+        let east  = &*b.add(sentinel_or(nb[3]));
+        let nw    = &*b.add(sentinel_or(nb[4]));
+        let ne    = &*b.add(sentinel_or(nb[5]));
+        let sw    = &*b.add(sentinel_or(nb[6]));
+        let se    = &*b.add(sentinel_or(nb[7]));
 
-    GhostZone {
-        north: if north_i == NO_NEIGHBOR { 0 } else { borders[north_i as usize].south },
-        south: if south_i == NO_NEIGHBOR { 0 } else { borders[south_i as usize].north },
-        west: if west_i == NO_NEIGHBOR { 0 } else { borders[west_i as usize].east },
-        east: if east_i == NO_NEIGHBOR { 0 } else { borders[east_i as usize].west },
-        nw: if nw_i == NO_NEIGHBOR { false } else { borders[nw_i as usize].se },
-        ne: if ne_i == NO_NEIGHBOR { false } else { borders[ne_i as usize].sw },
-        sw: if sw_i == NO_NEIGHBOR { false } else { borders[sw_i as usize].ne },
-        se: if se_i == NO_NEIGHBOR { false } else { borders[se_i as usize].nw },
+        GhostZone {
+            north: north.south,
+            south: south.north,
+            west:  west.east,
+            east:  east.west,
+            nw: nw.se(),
+            ne: ne.sw(),
+            sw: sw.ne(),
+            se: se.nw(),
+        }
     }
 }

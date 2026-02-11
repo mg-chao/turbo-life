@@ -2,8 +2,9 @@
 //!
 //! Computes the next generation for a single tile using a full-adder chain.
 //! Border extraction is fused into the main loop.
+//! Works with split cell buffers (separate current/next vecs).
 
-use super::tile::{BorderData, TileCells, TileMeta, TILE_SIZE, POPULATION_UNKNOWN};
+use super::tile::{BorderData, CellBuf, TileMeta, TILE_SIZE, POPULATION_UNKNOWN};
 
 #[inline(always)]
 fn full_add(a: u64, b: u64, c: u64) -> (u64, u64) {
@@ -46,40 +47,16 @@ pub fn advance_core(
     let mut border_east = 0u64;
 
     for row in 0..TILE_SIZE {
-        let row_above = if row == TILE_SIZE - 1 {
-            ghost.north
-        } else {
-            current[row + 1]
-        };
+        let row_above = if row == TILE_SIZE - 1 { ghost.north } else { current[row + 1] };
         let row_self = current[row];
-        let row_below = if row == 0 {
-            ghost.south
-        } else {
-            current[row - 1]
-        };
+        let row_below = if row == 0 { ghost.south } else { current[row - 1] };
 
-        let ghost_w_above = if row == TILE_SIZE - 1 {
-            ghost.nw
-        } else {
-            ghost_bit(ghost.west, row + 1)
-        };
-        let ghost_e_above = if row == TILE_SIZE - 1 {
-            ghost.ne
-        } else {
-            ghost_bit(ghost.east, row + 1)
-        };
+        let ghost_w_above = if row == TILE_SIZE - 1 { ghost.nw } else { ghost_bit(ghost.west, row + 1) };
+        let ghost_e_above = if row == TILE_SIZE - 1 { ghost.ne } else { ghost_bit(ghost.east, row + 1) };
         let ghost_w_self = ghost_bit(ghost.west, row);
         let ghost_e_self = ghost_bit(ghost.east, row);
-        let ghost_w_below = if row == 0 {
-            ghost.sw
-        } else {
-            ghost_bit(ghost.west, row - 1)
-        };
-        let ghost_e_below = if row == 0 {
-            ghost.se
-        } else {
-            ghost_bit(ghost.east, row - 1)
-        };
+        let ghost_w_below = if row == 0 { ghost.sw } else { ghost_bit(ghost.west, row - 1) };
+        let ghost_e_below = if row == 0 { ghost.se } else { ghost_bit(ghost.east, row - 1) };
 
         let nw = west_neighbor_plane(row_above, ghost_w_above);
         let n = row_above;
@@ -108,46 +85,49 @@ pub fn advance_core(
         border_east |= ((next_row >> 63) & 1) << row;
     }
 
+    let mut corners = 0u8;
+    if (next[63] & 1) != 0 { corners |= BorderData::CORNER_NW; }
+    if ((next[63] >> 63) & 1) != 0 { corners |= BorderData::CORNER_NE; }
+    if (next[0] & 1) != 0 { corners |= BorderData::CORNER_SW; }
+    if ((next[0] >> 63) & 1) != 0 { corners |= BorderData::CORNER_SE; }
+
     let border = BorderData {
         north: next[63],
         south: next[0],
         west: border_west,
         east: border_east,
-        nw: (next[63] & 1) != 0,
-        ne: ((next[63] >> 63) & 1) != 0,
-        sw: (next[0] & 1) != 0,
-        se: ((next[0] >> 63) & 1) != 0,
+        corners,
     };
 
     (changed, border, has_live)
 }
 
-/// Advance a tile and swap its buffers (unsafe parallel path).
+/// Advance a tile using split buffer pointers (unsafe parallel path).
 ///
 /// # Safety
-/// `cells_ptr`, `meta_ptr`, and `next_borders_ptr` must point to valid slices,
-/// and the caller must ensure exclusive access to the element at `idx`.
-pub unsafe fn advance_tile_fused(
-    cells_ptr: *mut TileCells,
+/// `current_ptr`, `next_ptr`, `meta_ptr`, and `next_borders_ptr` must point
+/// to valid slices, and the caller must ensure exclusive write access to
+/// the element at `idx` in the write-side arrays.
+#[inline(always)]
+pub unsafe fn advance_tile_split(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
     meta_ptr: *mut TileMeta,
     next_borders_ptr: *mut BorderData,
     idx: usize,
     ghost: &super::tile::GhostZone,
 ) -> bool {
-    let cells = unsafe { &mut *cells_ptr.add(idx) };
+    let current = unsafe { &(*current_ptr.add(idx)).0 };
+    let next = unsafe { &mut (*next_ptr.add(idx)).0 };
     let meta = unsafe { &mut *meta_ptr.add(idx) };
-
-    let (current, next) = cells.current_and_next_mut();
 
     let (changed, border, has_live) = advance_core(current, next, ghost);
 
-    cells.swap();
     unsafe { *next_borders_ptr.add(idx) = border; }
 
-    meta.changed = changed;
+    meta.set_changed(changed);
     meta.population = POPULATION_UNKNOWN;
-    meta.has_live = has_live;
+    meta.set_has_live(has_live);
 
     changed
 }
-

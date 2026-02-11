@@ -1,34 +1,36 @@
 //! Tile arena with split storage for TurboLife.
 //!
-//! Cell data, metadata, and borders are stored in separate parallel `Vec`s.
-//! Borders are double-buffered: `borders[border_phase]` holds current-gen
-//! borders (read by ghost fills), `borders[1 - border_phase]` is written
-//! by the kernel. After the parallel phase, `border_phase` flips.
-//! This eliminates the post-parallel fixup loop entirely.
+//! Cell data is stored as two separate `Vec<CellBuf>` with a global phase bit,
+//! halving the kernel working set. Borders are double-buffered.
+//! Slot 0 is reserved as a sentinel (all zeros) so ghost-zone gathers
+//! can use unconditional loads — NO_NEIGHBOR maps to the sentinel.
 
 use rustc_hash::FxHashMap;
 
-use super::tile::{BorderData, Direction, Neighbors, EMPTY_NEIGHBORS, TileCells, TileIdx, TileMeta};
+use super::tile::{
+    BorderData, CellBuf, Direction, Neighbors, EMPTY_NEIGHBORS,
+    TileIdx, TileMeta, TILE_SIZE, NO_NEIGHBOR,
+};
+
+/// Index of the sentinel slot (always zeroed).
+pub const SENTINEL_IDX: usize = 0;
 
 pub struct TileArena {
-    pub cell_data: Vec<TileCells>,
+    /// Two cell buffers: `cell_bufs[phase]` = current (read), `cell_bufs[1-phase]` = next (write).
+    pub cell_bufs: [Vec<CellBuf>; 2],
+    /// Global cell phase. Flipped after each step.
+    pub cell_phase: usize,
     pub meta: Vec<TileMeta>,
     pub neighbors: Vec<Neighbors>,
-    /// Tile coordinates, parallel to cell_data/meta.
     pub coords: Vec<(i64, i64)>,
-    /// Double-buffered borders. `borders[border_phase]` = current gen (read),
-    /// `borders[1 - border_phase]` = next gen (written by kernel).
+    /// Double-buffered borders. `borders[border_phase]` = current gen (read).
     pub borders: [Vec<BorderData>; 2],
-    /// Which border buffer is current. Flipped after each parallel step.
     pub border_phase: usize,
     pub coord_to_idx: FxHashMap<(i64, i64), TileIdx>,
     pub free_list: Vec<TileIdx>,
     pub changed_list: Vec<TileIdx>,
 
-    /// Epoch counter for active-set tracking. Incremented each step.
-    /// A tile is active iff `meta[i].active_epoch == active_epoch`.
     pub active_epoch: u32,
-
     pub active_set: Vec<TileIdx>,
     pub expand_buf: Vec<(i64, i64)>,
     pub prune_buf: Vec<TileIdx>,
@@ -37,17 +39,25 @@ pub struct TileArena {
 
 impl TileArena {
     pub fn new() -> Self {
+        // Slot 0 is the sentinel — always zeroed, never used for real tiles.
+        let sentinel_cells = CellBuf::empty();
+        let sentinel_meta = TileMeta::released();
+        let sentinel_border = BorderData::default();
+        let sentinel_neighbors = EMPTY_NEIGHBORS;
+        let sentinel_coord = (i64::MIN, i64::MIN);
+
         Self {
-            cell_data: Vec::new(),
-            meta: Vec::new(),
-            neighbors: Vec::new(),
-            coords: Vec::new(),
-            borders: [Vec::new(), Vec::new()],
+            cell_bufs: [vec![sentinel_cells.clone()], vec![sentinel_cells]],
+            cell_phase: 0,
+            meta: vec![sentinel_meta],
+            neighbors: vec![sentinel_neighbors],
+            coords: vec![sentinel_coord],
+            borders: [vec![sentinel_border], vec![sentinel_border]],
             border_phase: 0,
             coord_to_idx: FxHashMap::default(),
             free_list: Vec::new(),
             changed_list: Vec::new(),
-            active_epoch: 1, // Start at 1 so default meta (epoch=0) is inactive
+            active_epoch: 1,
             active_set: Vec::new(),
             expand_buf: Vec::new(),
             prune_buf: Vec::new(),
@@ -55,59 +65,61 @@ impl TileArena {
         }
     }
 
-    /// Current-gen border for a tile (read by ghost fills).
-    #[inline]
+    /// Current cell buffer (read side).
+    #[inline(always)]
+    pub fn current_buf(&self, idx: TileIdx) -> &[u64; TILE_SIZE] {
+        &self.cell_bufs[self.cell_phase][idx.index()].0
+    }
+
+    /// Next cell buffer (write side).
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn next_buf_mut(&mut self, idx: TileIdx) -> &mut [u64; TILE_SIZE] {
+        &mut self.cell_bufs[1 - self.cell_phase][idx.index()].0
+    }
+
+    /// Mutable ref to current cell buffer (for set_cell).
+    #[inline(always)]
+    pub fn current_buf_mut(&mut self, idx: TileIdx) -> &mut [u64; TILE_SIZE] {
+        &mut self.cell_bufs[self.cell_phase][idx.index()].0
+    }
+
+    /// Flip cell phase (swap current/next).
+    #[inline(always)]
+    pub fn flip_cells(&mut self) {
+        self.cell_phase = 1 - self.cell_phase;
+    }
+
+    /// Current-gen border for a tile.
+    #[inline(always)]
     #[allow(dead_code)]
     pub fn border(&self, idx: TileIdx) -> &BorderData {
         &self.borders[self.border_phase][idx.index()]
     }
 
-    /// Mutable ref to current-gen border (for set_cell mutations).
-    #[inline]
+    /// Mutable ref to current-gen border.
+    #[inline(always)]
     pub fn border_mut(&mut self, idx: TileIdx) -> &mut BorderData {
         &mut self.borders[self.border_phase][idx.index()]
     }
 
-    /// Next-gen border buffer (written by kernel during parallel phase).
-    #[inline]
-    #[allow(dead_code)]
-    pub fn next_border_mut(&mut self, idx: TileIdx) -> &mut BorderData {
-        &mut self.borders[1 - self.border_phase][idx.index()]
-    }
-
-    /// Flip border phase after parallel compute completes.
-    #[inline]
+    /// Flip border phase.
+    #[inline(always)]
     pub fn flip_borders(&mut self) {
         self.border_phase = 1 - self.border_phase;
     }
 
-    #[inline]
-    #[allow(dead_code)]
-    pub fn neighbors(&self, idx: TileIdx) -> &Neighbors {
-        &self.neighbors[idx.index()]
-    }
-
-    #[inline]
+    #[inline(always)]
     pub fn idx_at(&self, coord: (i64, i64)) -> Option<TileIdx> {
         self.coord_to_idx.get(&coord).copied()
     }
 
-    #[inline]
-    pub fn cells(&self, idx: TileIdx) -> &TileCells {
-        &self.cell_data[idx.index()]
-    }
-
-    #[inline]
-    pub fn cells_mut(&mut self, idx: TileIdx) -> &mut TileCells {
-        &mut self.cell_data[idx.index()]
-    }
-
-    #[inline]
+    #[inline(always)]
     pub fn meta(&self, idx: TileIdx) -> &TileMeta {
         &self.meta[idx.index()]
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn meta_mut(&mut self, idx: TileIdx) -> &mut TileMeta {
         &mut self.meta[idx.index()]
     }
@@ -115,9 +127,9 @@ impl TileArena {
     #[inline]
     pub fn mark_changed(&mut self, idx: TileIdx) {
         let m = &mut self.meta[idx.index()];
-        m.changed = true;
-        if !m.in_changed_list {
-            m.in_changed_list = true;
+        m.set_changed(true);
+        if !m.in_changed_list() {
+            m.set_in_changed_list(true);
             self.changed_list.push(idx);
         }
     }
@@ -128,21 +140,29 @@ impl TileArena {
         }
 
         let idx = if let Some(recycled) = self.free_list.pop() {
-            self.cell_data[recycled.index()] = TileCells::empty();
-            self.meta[recycled.index()] = TileMeta::empty();
-            self.neighbors[recycled.index()] = EMPTY_NEIGHBORS;
-            self.coords[recycled.index()] = coord;
-            self.borders[0][recycled.index()] = BorderData::default();
-            self.borders[1][recycled.index()] = BorderData::default();
+            let i = recycled.index();
+            self.cell_bufs[0][i] = CellBuf::empty();
+            self.cell_bufs[1][i] = CellBuf::empty();
+            self.meta[i] = TileMeta::empty();
+            self.neighbors[i] = EMPTY_NEIGHBORS;
+            self.coords[i] = coord;
+            self.borders[0][i] = BorderData::default();
+            self.borders[1][i] = BorderData::default();
             recycled
         } else {
-            let idx = TileIdx(self.cell_data.len() as u32);
-            self.cell_data.push(TileCells::empty());
+            let idx = TileIdx(self.cell_bufs[0].len() as u32);
+            self.cell_bufs[0].push(CellBuf::empty());
+            self.cell_bufs[1].push(CellBuf::empty());
             self.meta.push(TileMeta::empty());
             self.neighbors.push(EMPTY_NEIGHBORS);
             self.coords.push(coord);
             self.borders[0].push(BorderData::default());
             self.borders[1].push(BorderData::default());
+
+            // Keep sentinel's neighbor mapping valid: NO_NEIGHBOR (u32::MAX)
+            // won't index into our vecs, but sentinel is at index 0 and
+            // all neighbor entries for real tiles pointing to NO_NEIGHBOR
+            // will be remapped to SENTINEL_IDX in the ghost gather.
             idx
         };
 
@@ -161,32 +181,28 @@ impl TileArena {
     }
 
     pub fn release(&mut self, idx: TileIdx) {
-        if !self.meta[idx.index()].occupied {
+        let i = idx.index();
+        if !self.meta[i].occupied() {
             return;
         }
 
         for dir in Direction::ALL {
-            let neighbor_raw = self.neighbors[idx.index()][dir.index()];
-            if neighbor_raw != super::tile::NO_NEIGHBOR {
+            let neighbor_raw = self.neighbors[i][dir.index()];
+            if neighbor_raw != NO_NEIGHBOR {
                 let neighbor_idx = TileIdx(neighbor_raw);
-                self.neighbors[neighbor_idx.index()][dir.reverse().index()] = super::tile::NO_NEIGHBOR;
+                self.neighbors[neighbor_idx.index()][dir.reverse().index()] = NO_NEIGHBOR;
             }
         }
-        self.neighbors[idx.index()] = EMPTY_NEIGHBORS;
+        self.neighbors[i] = EMPTY_NEIGHBORS;
 
-        let coord = self.coords[idx.index()];
+        let coord = self.coords[i];
         self.coord_to_idx.remove(&coord);
-        self.cell_data[idx.index()].cells = [[0; 64]; 2];
-        self.borders[0][idx.index()] = BorderData::default();
-        self.borders[1][idx.index()] = BorderData::default();
-        self.meta[idx.index()] = TileMeta::released();
+        self.cell_bufs[0][i] = CellBuf::empty();
+        self.cell_bufs[1][i] = CellBuf::empty();
+        self.borders[0][i] = BorderData::default();
+        self.borders[1][i] = BorderData::default();
+        self.meta[i] = TileMeta::released();
         self.free_list.push(idx);
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn slot_count(&self) -> usize {
-        self.cell_data.len()
     }
 
     #[inline]
@@ -196,8 +212,9 @@ impl TileArena {
             return;
         }
         let idx = self.allocate(coord);
-        self.meta[idx.index()].population = 0;
-        self.meta[idx.index()].has_live = false;
+        let m = &mut self.meta[idx.index()];
+        m.population = 0;
+        m.set_has_live(false);
         self.mark_changed(idx);
     }
 }
