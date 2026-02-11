@@ -4,7 +4,7 @@
 //! Reads from the compact `borders` array rather than full `TileCells`,
 //! keeping the working set small.
 
-use super::tile::{BorderData, Direction, GhostZone, Neighbors, TileIdx};
+use super::tile::{BorderData, Direction, GhostZone, Neighbors, TileIdx, NO_NEIGHBOR};
 
 /// Gather the ghost zone for a single tile from its neighbors' borders.
 #[inline]
@@ -16,18 +16,22 @@ pub fn gather_ghost_zone(
     let nb = &neighbors[idx.index()];
 
     #[inline(always)]
-    fn read_u64(nb: &[Option<TileIdx>; 8], borders: &[BorderData], dir: usize, field: fn(&BorderData) -> u64) -> u64 {
-        match nb[dir] {
-            Some(ni) => field(&borders[ni.index()]),
-            None => 0,
+    fn read_u64(nb: &[u32; 8], borders: &[BorderData], dir: usize, field: fn(&BorderData) -> u64) -> u64 {
+        let ni = nb[dir];
+        if ni == NO_NEIGHBOR {
+            0
+        } else {
+            field(&borders[ni as usize])
         }
     }
 
     #[inline(always)]
-    fn read_bool(nb: &[Option<TileIdx>; 8], borders: &[BorderData], dir: usize, field: fn(&BorderData) -> bool) -> bool {
-        match nb[dir] {
-            Some(ni) => field(&borders[ni.index()]),
-            None => false,
+    fn read_bool(nb: &[u32; 8], borders: &[BorderData], dir: usize, field: fn(&BorderData) -> bool) -> bool {
+        let ni = nb[dir];
+        if ni == NO_NEIGHBOR {
+            false
+        } else {
+            field(&borders[ni as usize])
         }
     }
 

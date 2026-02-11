@@ -33,14 +33,15 @@ fn ghost_bit(column: u64, row: usize) -> bool {
 }
 
 /// Advance one tile generation and extract its new border data.
-/// Returns (changed, border_data).
+/// Returns (changed, border_data, has_live).
 #[inline(always)]
 pub fn advance_core(
     current: &[u64; TILE_SIZE],
     next: &mut [u64; TILE_SIZE],
     ghost: &super::tile::GhostZone,
-) -> (bool, BorderData) {
+) -> (bool, BorderData, bool) {
     let mut changed = false;
+    let mut has_live = false;
     let mut border_west = 0u64;
     let mut border_east = 0u64;
 
@@ -102,6 +103,7 @@ pub fn advance_core(
 
         next[row] = next_row;
         changed |= next_row != row_self;
+        has_live |= next_row != 0;
         border_west |= (next_row & 1) << row;
         border_east |= ((next_row >> 63) & 1) << row;
     }
@@ -117,7 +119,7 @@ pub fn advance_core(
         se: ((next[0] >> 63) & 1) != 0,
     };
 
-    (changed, border)
+    (changed, border, has_live)
 }
 
 /// Advance a tile and swap its buffers (unsafe parallel path).
@@ -131,19 +133,21 @@ pub unsafe fn advance_tile_fused(
     next_borders_ptr: *mut BorderData,
     idx: usize,
     ghost: &super::tile::GhostZone,
-) {
+) -> bool {
     let cells = unsafe { &mut *cells_ptr.add(idx) };
     let meta = unsafe { &mut *meta_ptr.add(idx) };
 
-    let current = *cells.current();
-    let next = cells.next_mut();
+    let (current, next) = cells.current_and_next_mut();
 
-    let (changed, border) = advance_core(&current, next, ghost);
+    let (changed, border, has_live) = advance_core(current, next, ghost);
 
     cells.swap();
     unsafe { *next_borders_ptr.add(idx) = border; }
 
     meta.changed = changed;
     meta.population = None;
+    meta.has_live = has_live;
+
+    changed
 }
 

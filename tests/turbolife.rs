@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use quick_life::turbolife::TurboLife;
+use turbo_life::turbolife::TurboLife;
 use rand::Rng;
 use rand::SeedableRng;
 

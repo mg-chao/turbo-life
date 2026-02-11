@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use quick_life::quicklife::QuickLife;
+use turbo_life::quicklife::QuickLife;
 
 fn set_cells(engine: &mut QuickLife, cells: &[(i32, i32)]) {
     for &(x, y) in cells {

@@ -1,4 +1,4 @@
-use quick_life::turbolife::TurboLife;
+use turbo_life::turbolife::TurboLife;
 use rand::RngCore;
 use rand::SeedableRng;
 use std::time::Instant;

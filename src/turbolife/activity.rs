@@ -11,10 +11,26 @@
 use rayon::prelude::*;
 
 use super::arena::TileArena;
-use super::tile::{Direction, TileIdx};
+use super::tile::{Direction, TileIdx, NO_NEIGHBOR};
 
-/// Threshold: below this active set size, prune/expand runs serially.
-const PARALLEL_PRUNE_THRESHOLD: usize = 256;
+/// Minimum active tiles before enabling parallel prune/expand.
+const PARALLEL_PRUNE_MIN_ACTIVE: usize = 384;
+
+/// Minimum active tiles per worker before enabling parallel prune/expand.
+const PARALLEL_PRUNE_TILES_PER_THREAD: usize = 48;
+
+/// Minimum chunk size for parallel prune/expand.
+const PRUNE_CHUNK_MIN: usize = 128;
+
+/// Maximum chunk size for parallel prune/expand.
+const PRUNE_CHUNK_MAX: usize = 1024;
+
+#[inline]
+fn prune_chunk_size(active_len: usize, threads: usize) -> usize {
+    let target_chunks = threads.saturating_mul(4).max(1);
+    let size = active_len.div_ceil(target_chunks);
+    size.clamp(PRUNE_CHUNK_MIN, PRUNE_CHUNK_MAX)
+}
 
 /// Rebuild the active set from the changed list in O(changed * 9).
 ///
@@ -26,37 +42,22 @@ const PARALLEL_PRUNE_THRESHOLD: usize = 256;
 /// occupied neighbors to the active set, using `active_epoch` for O(1) dedup.
 pub fn rebuild_active_set(arena: &mut TileArena) {
     arena.active_epoch = arena.active_epoch.wrapping_add(1);
+    if arena.active_epoch == 0 {
+        arena.active_epoch = 1;
+        for i in 0..arena.meta.len() {
+            arena.meta[i].active_epoch = 0;
+        }
+    }
     let epoch = arena.active_epoch;
 
     arena.active_set.clear();
 
-    // Build changed_scratch from changed_list or full scan.
-    let occupied_count = arena.coord_to_idx.len();
-    let use_changed_list =
-        occupied_count > 0 && arena.changed_list.len() <= occupied_count / 4;
-
     arena.changed_scratch.clear();
-    if use_changed_list {
-        arena.changed_scratch.extend_from_slice(&arena.changed_list);
-        for &idx in &arena.changed_list {
-            arena.meta[idx.index()].in_changed_list = false;
-        }
-        arena.changed_list.clear();
-    } else {
-        for &idx in &arena.changed_list {
-            arena.meta[idx.index()].in_changed_list = false;
-        }
-        arena.changed_list.clear();
-        // Fallback: scan all slots linearly for changed+occupied tiles.
-        // Linear scan has better cache locality than hashmap iteration.
-        // This path is taken when changed_list > 25% of occupied, so
-        // most slots will match anyway.
-        for i in 0..arena.meta.len() {
-            if arena.meta[i].occupied && arena.meta[i].changed {
-                arena.changed_scratch.push(TileIdx(i as u32));
-            }
-        }
+    arena.changed_scratch.extend_from_slice(&arena.changed_list);
+    for &idx in &arena.changed_list {
+        arena.meta[idx.index()].in_changed_list = false;
     }
+    arena.changed_list.clear();
 
     let changed_count = arena.changed_scratch.len();
     if changed_count == 0 {
@@ -77,11 +78,12 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         }
         let nb = &arena.neighbors[i];
         for dir_idx in 0..8 {
-            if let Some(ni) = nb[dir_idx] {
-                let ni_i = ni.index();
+            let ni_raw = nb[dir_idx];
+            if ni_raw != NO_NEIGHBOR {
+                let ni_i = ni_raw as usize;
                 if arena.meta[ni_i].occupied && arena.meta[ni_i].active_epoch != epoch {
                     arena.meta[ni_i].active_epoch = epoch;
-                    arena.active_set.push(ni);
+                    arena.active_set.push(TileIdx(ni_raw));
                 }
             }
         }
@@ -91,16 +93,15 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
 /// Check if any neighbor has its `changed` flag set.
 #[inline]
 fn neighbor_has_changed(
-    neighbors: &[[Option<TileIdx>; 8]],
+    neighbors: &[[u32; 8]],
     meta: &[super::tile::TileMeta],
     idx: TileIdx,
 ) -> bool {
     let nb = &neighbors[idx.index()];
     for dir_idx in 0..8 {
-        if let Some(ni) = nb[dir_idx] {
-            if meta[ni.index()].changed {
-                return true;
-            }
+        let ni_raw = nb[dir_idx];
+        if ni_raw != NO_NEIGHBOR && meta[ni_raw as usize].changed {
+            return true;
         }
     }
     false
@@ -110,10 +111,9 @@ fn neighbor_has_changed(
 #[inline]
 fn scan_tile_prune_expand(
     idx: TileIdx,
-    cell_data: &[super::tile::TileCells],
     meta: &[super::tile::TileMeta],
     borders: &[super::tile::BorderData],
-    neighbors: &[[Option<TileIdx>; 8]],
+    neighbors: &[[u32; 8]],
     coords: &[(i64, i64)],
     expand: &mut Vec<(i64, i64)>,
 ) -> bool {
@@ -126,34 +126,34 @@ fn scan_tile_prune_expand(
     let border = &borders[i_idx];
     let nb = &neighbors[i_idx];
 
-    let has_missing_neighbor = nb[0].is_none() || nb[1].is_none()
-        || nb[2].is_none() || nb[3].is_none()
-        || nb[4].is_none() || nb[5].is_none()
-        || nb[6].is_none() || nb[7].is_none();
+    let has_missing_neighbor = nb[0] == NO_NEIGHBOR || nb[1] == NO_NEIGHBOR
+        || nb[2] == NO_NEIGHBOR || nb[3] == NO_NEIGHBOR
+        || nb[4] == NO_NEIGHBOR || nb[5] == NO_NEIGHBOR
+        || nb[6] == NO_NEIGHBOR || nb[7] == NO_NEIGHBOR;
 
     if has_missing_neighbor {
-        if border.north != 0 && nb[Direction::North.index()].is_none() {
+        if border.north != 0 && nb[Direction::North.index()] == NO_NEIGHBOR {
             expand.push((tx, ty + 1));
         }
-        if border.south != 0 && nb[Direction::South.index()].is_none() {
+        if border.south != 0 && nb[Direction::South.index()] == NO_NEIGHBOR {
             expand.push((tx, ty - 1));
         }
-        if border.west != 0 && nb[Direction::West.index()].is_none() {
+        if border.west != 0 && nb[Direction::West.index()] == NO_NEIGHBOR {
             expand.push((tx - 1, ty));
         }
-        if border.east != 0 && nb[Direction::East.index()].is_none() {
+        if border.east != 0 && nb[Direction::East.index()] == NO_NEIGHBOR {
             expand.push((tx + 1, ty));
         }
-        if border.nw && nb[Direction::NW.index()].is_none() {
+        if border.nw && nb[Direction::NW.index()] == NO_NEIGHBOR {
             expand.push((tx - 1, ty + 1));
         }
-        if border.ne && nb[Direction::NE.index()].is_none() {
+        if border.ne && nb[Direction::NE.index()] == NO_NEIGHBOR {
             expand.push((tx + 1, ty + 1));
         }
-        if border.sw && nb[Direction::SW.index()].is_none() {
+        if border.sw && nb[Direction::SW.index()] == NO_NEIGHBOR {
             expand.push((tx - 1, ty - 1));
         }
-        if border.se && nb[Direction::SE.index()].is_none() {
+        if border.se && nb[Direction::SE.index()] == NO_NEIGHBOR {
             expand.push((tx + 1, ty - 1));
         }
     }
@@ -165,10 +165,7 @@ fn scan_tile_prune_expand(
     if neighbor_has_changed(neighbors, meta, idx) {
         return false;
     }
-    let has_live = match meta[i_idx].population {
-        Some(p) => p > 0,
-        None => cell_data[i_idx].compute_population() > 0,
-    };
+    let has_live = meta[i_idx].has_live;
     !has_live
 }
 
@@ -182,18 +179,21 @@ pub fn prune_and_expand(arena: &mut TileArena) {
 
     let bp = arena.border_phase;
     let active_len = arena.active_set.len();
+    let thread_count = rayon::current_num_threads().max(1);
 
     if active_len == 0 {
         return;
     }
 
-    if active_len < PARALLEL_PRUNE_THRESHOLD {
+    let run_parallel = active_len >= PARALLEL_PRUNE_MIN_ACTIVE
+        && active_len >= thread_count * PARALLEL_PRUNE_TILES_PER_THREAD;
+
+    if !run_parallel {
         // Serial path for small active sets.
         for i in 0..active_len {
             let idx = arena.active_set[i];
             let should_prune = scan_tile_prune_expand(
                 idx,
-                &arena.cell_data,
                 &arena.meta,
                 &arena.borders[bp],
                 &arena.neighbors,
@@ -206,33 +206,39 @@ pub fn prune_and_expand(arena: &mut TileArena) {
         }
     } else {
         // Parallel path for large active sets.
-        let results: Vec<(Vec<(i64, i64)>, Vec<TileIdx>)> = arena.active_set
-            .par_chunks(256)
-            .map(|chunk| {
-                let mut expand = Vec::new();
-                let mut prune = Vec::new();
-                for &idx in chunk {
-                    let should_prune = scan_tile_prune_expand(
-                        idx,
-                        &arena.cell_data,
-                        &arena.meta,
-                        &arena.borders[bp],
-                        &arena.neighbors,
-                        &arena.coords,
-                        &mut expand,
-                    );
-                    if should_prune {
-                        prune.push(idx);
+        let chunk_size = prune_chunk_size(active_len, thread_count);
+        let (expand_all, prune_all) = arena.active_set
+            .par_chunks(chunk_size)
+            .fold(
+                || (Vec::new(), Vec::new()),
+                |mut acc, chunk| {
+                    for &idx in chunk {
+                        let should_prune = scan_tile_prune_expand(
+                            idx,
+                            &arena.meta,
+                            &arena.borders[bp],
+                            &arena.neighbors,
+                            &arena.coords,
+                            &mut acc.0,
+                        );
+                        if should_prune {
+                            acc.1.push(idx);
+                        }
                     }
-                }
-                (expand, prune)
-            })
-            .collect();
+                    acc
+                },
+            )
+            .reduce(
+                || (Vec::new(), Vec::new()),
+                |mut left, mut right| {
+                    left.0.append(&mut right.0);
+                    left.1.append(&mut right.1);
+                    left
+                },
+            );
 
-        for (expand, prune) in results {
-            arena.expand_buf.extend(expand);
-            arena.prune_buf.extend(prune);
-        }
+        arena.expand_buf.extend(expand_all);
+        arena.prune_buf.extend(prune_all);
     }
 
     if arena.expand_buf.len() > 16 {

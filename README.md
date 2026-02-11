@@ -26,6 +26,17 @@ cargo run --release
 
 Seeds a 4096×4096 region at 42% density and runs 1000 generations, printing total and per-iteration timings.
 
+## Threading behavior
+
+- TurboLife defaults to using the number of physical CPU cores for its internal rayon thread pool.
+- You can override this with `TURBOLIFE_NUM_THREADS` (preferred) or `RAYON_NUM_THREADS`.
+- Example (PowerShell):
+
+```
+$env:TURBOLIFE_NUM_THREADS=12
+cargo run --release
+```
+
 ## Tests
 
 ```

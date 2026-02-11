@@ -75,11 +75,17 @@ impl Direction {
     }
 }
 
-/// Pre-bound neighbor indices for a tile. Indexed by `Direction`.
-pub type Neighbors = [Option<TileIdx>; 8];
+/// Sentinel value for "no neighbor".
+pub const NO_NEIGHBOR: u32 = u32::MAX;
 
-/// An empty neighbor array (all `None`).
-pub const EMPTY_NEIGHBORS: Neighbors = [None; 8];
+/// Pre-bound neighbor indices for a tile. Indexed by `Direction`.
+///
+/// Uses raw u32 indices with `NO_NEIGHBOR` sentinel to keep the structure
+/// compact and branch-light on hot paths.
+pub type Neighbors = [u32; 8];
+
+/// An empty neighbor array (all `NO_NEIGHBOR`).
+pub const EMPTY_NEIGHBORS: Neighbors = [NO_NEIGHBOR; 8];
 
 /// Pre-extracted border data from a tile's current buffer.
 #[derive(Clone, Copy, Debug, Default)]
@@ -121,10 +127,11 @@ pub struct TileCells {
 pub struct TileMeta {
     pub population: Option<u32>,
     /// Epoch when this tile was last marked active.
-    pub active_epoch: u8,
+    pub active_epoch: u32,
     pub changed: bool,
     pub occupied: bool,
     pub in_changed_list: bool,
+    pub has_live: bool,
 }
 
 impl TileMeta {
@@ -135,6 +142,7 @@ impl TileMeta {
             population: Some(0),
             occupied: true,
             in_changed_list: false,
+            has_live: false,
         }
     }
 
@@ -145,6 +153,7 @@ impl TileMeta {
             population: Some(0),
             occupied: false,
             in_changed_list: false,
+            has_live: false,
         }
     }
 }
@@ -172,6 +181,16 @@ impl TileCells {
     #[allow(dead_code)]
     pub fn next_mut(&mut self) -> &mut [u64; TILE_SIZE] {
         &mut self.cells[1 - self.phase as usize]
+    }
+
+    #[inline]
+    pub fn current_and_next_mut(&mut self) -> (&[u64; TILE_SIZE], &mut [u64; TILE_SIZE]) {
+        let (a, b) = self.cells.split_at_mut(1);
+        if self.phase == 0 {
+            (&a[0], &mut b[0])
+        } else {
+            (&b[0], &mut a[0])
+        }
     }
 
     #[inline]

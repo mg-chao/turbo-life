@@ -27,7 +27,7 @@ pub struct TileArena {
 
     /// Epoch counter for active-set tracking. Incremented each step.
     /// A tile is active iff `meta[i].active_epoch == active_epoch`.
-    pub active_epoch: u8,
+    pub active_epoch: u32,
 
     pub active_set: Vec<TileIdx>,
     pub expand_buf: Vec<(i64, i64)>,
@@ -152,8 +152,8 @@ impl TileArena {
             let (dx, dy) = dir.offset();
             let neighbor_coord = (coord.0 + dx, coord.1 + dy);
             if let Some(neighbor_idx) = self.coord_to_idx.get(&neighbor_coord).copied() {
-                self.neighbors[idx.index()][dir.index()] = Some(neighbor_idx);
-                self.neighbors[neighbor_idx.index()][dir.reverse().index()] = Some(idx);
+                self.neighbors[idx.index()][dir.index()] = neighbor_idx.0;
+                self.neighbors[neighbor_idx.index()][dir.reverse().index()] = idx.0;
             }
         }
 
@@ -166,8 +166,10 @@ impl TileArena {
         }
 
         for dir in Direction::ALL {
-            if let Some(neighbor_idx) = self.neighbors[idx.index()][dir.index()] {
-                self.neighbors[neighbor_idx.index()][dir.reverse().index()] = None;
+            let neighbor_raw = self.neighbors[idx.index()][dir.index()];
+            if neighbor_raw != super::tile::NO_NEIGHBOR {
+                let neighbor_idx = TileIdx(neighbor_raw);
+                self.neighbors[neighbor_idx.index()][dir.reverse().index()] = super::tile::NO_NEIGHBOR;
             }
         }
         self.neighbors[idx.index()] = EMPTY_NEIGHBORS;
@@ -195,6 +197,7 @@ impl TileArena {
         }
         let idx = self.allocate(coord);
         self.meta[idx.index()].population = Some(0);
+        self.meta[idx.index()].has_live = false;
         self.mark_changed(idx);
     }
 }
