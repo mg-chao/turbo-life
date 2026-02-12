@@ -1,5 +1,4 @@
 use rayon::prelude::*;
-use rustc_hash::FxHashSet;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -273,6 +272,9 @@ pub struct TurboLife {
     population_cache: Option<u64>,
     pool: rayon::ThreadPool,
     backend: KernelBackend,
+    /// Reusable per-tile marker for batch dedup in `set_cells`.
+    /// Indexed by `TileIdx.index()`, grown on demand.
+    touched_flags: Vec<bool>,
 }
 
 impl TurboLife {
@@ -295,6 +297,7 @@ impl TurboLife {
             population_cache: Some(0),
             pool,
             backend,
+            touched_flags: Vec::new(),
         }
     }
 
@@ -362,7 +365,6 @@ impl TurboLife {
         I: IntoIterator<Item = (i64, i64, bool)>,
     {
         let mut touched_tiles = Vec::new();
-        let mut touched_set = FxHashSet::default();
 
         for (x, y, alive) in cells {
             let tile_coord = (x.div_euclid(TILE_SIZE_I64), y.div_euclid(TILE_SIZE_I64));
@@ -396,7 +398,14 @@ impl TurboLife {
                 continue;
             }
 
-            if touched_set.insert(idx) {
+            // O(1) dedup via direct-indexed flag array — no hashing needed.
+            // Grow the flags vec on demand to cover any newly allocated tiles.
+            let i = idx.index();
+            if i >= self.touched_flags.len() {
+                self.touched_flags.resize(self.arena.meta.len(), false);
+            }
+            if !self.touched_flags[i] {
+                self.touched_flags[i] = true;
                 touched_tiles.push(idx);
                 self.arena.mark_changed(idx);
             }
@@ -439,16 +448,21 @@ impl TurboLife {
             return;
         }
 
-        for idx in touched_tiles {
-            let buf = self.arena.current_buf(idx);
+        for idx in &touched_tiles {
+            let buf = self.arena.current_buf(*idx);
             let (border, has_live) = tile::recompute_border_and_has_live(buf);
 
-            *self.arena.border_mut(idx) = border;
+            *self.arena.border_mut(*idx) = border;
             {
-                let meta = self.arena.meta_mut(idx);
+                let meta = self.arena.meta_mut(*idx);
                 meta.population = POPULATION_UNKNOWN;
                 meta.set_has_live(has_live);
             }
+        }
+
+        // Clear touched flags for reuse (O(touched) not O(arena)).
+        for idx in &touched_tiles {
+            self.touched_flags[idx.index()] = false;
         }
 
         self.population_cache = None;
