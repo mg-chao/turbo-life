@@ -8,3 +8,5 @@ mod sync;
 mod tile;
 
 pub use engine::TurboLife;
+pub use engine::TurboLifeConfig;
+pub use kernel::KernelBackend;

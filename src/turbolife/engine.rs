@@ -61,9 +61,7 @@ const ENV_OVERRIDE_THREADS: &str = "TURBOLIFE_NUM_THREADS";
 const ENV_MAX_THREADS: &str = "TURBOLIFE_MAX_THREADS";
 const ENV_KERNEL: &str = "TURBOLIFE_KERNEL";
 
-static TURBOLIFE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
-static KERNEL_BACKEND: OnceLock<KernelBackend> = OnceLock::new();
 
 #[inline]
 fn parse_kernel_backend(raw: &str) -> Option<KernelBackend> {
@@ -169,11 +167,6 @@ fn calibrate_auto_backend() -> KernelBackend {
 }
 
 #[inline]
-fn kernel_backend() -> KernelBackend {
-    *KERNEL_BACKEND.get_or_init(detect_kernel_backend)
-}
-
-#[inline]
 fn parse_positive_env(var: &str) -> Option<usize> {
     let raw = std::env::var(var).ok()?;
     let parsed = raw.trim().parse::<usize>().ok()?;
@@ -183,30 +176,6 @@ fn parse_positive_env(var: &str) -> Option<usize> {
 #[inline]
 fn physical_core_count() -> usize {
     *PHYSICAL_CORES.get_or_init(|| num_cpus::get_physical().max(1))
-}
-
-fn desired_thread_count() -> usize {
-    let mut threads = parse_positive_env(ENV_OVERRIDE_THREADS)
-        .or_else(|| parse_positive_env("RAYON_NUM_THREADS"))
-        .unwrap_or_else(|| memory_parallel_cap(physical_core_count()));
-    if let Some(max_threads) = parse_positive_env(ENV_MAX_THREADS) {
-        threads = threads.min(max_threads);
-    }
-    threads.max(1)
-}
-
-#[inline]
-fn install_in_pool<T>(f: impl FnOnce() -> T + Send) -> T
-where
-    T: Send,
-{
-    let pool = TURBOLIFE_POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(desired_thread_count())
-            .build()
-            .expect("failed to build TurboLife rayon thread pool")
-    });
-    pool.install(f)
 }
 
 #[inline]
@@ -256,18 +225,115 @@ fn tuned_parallel_threads(active_len: usize, thread_count: usize) -> usize {
     effective.max(1)
 }
 
+/// Resolve the thread count from a config, falling back to env vars / auto-detect.
+fn resolve_thread_count(config: &TurboLifeConfig) -> usize {
+    let mut threads = config
+        .thread_count
+        .or_else(|| parse_positive_env(ENV_OVERRIDE_THREADS))
+        .or_else(|| parse_positive_env("RAYON_NUM_THREADS"))
+        .unwrap_or_else(|| memory_parallel_cap(physical_core_count()));
+    let max = config
+        .max_threads
+        .or_else(|| parse_positive_env(ENV_MAX_THREADS));
+    if let Some(cap) = max {
+        threads = threads.min(cap);
+    }
+    threads.max(1)
+}
+
+/// Resolve the kernel backend from a config, falling back to env var / auto-calibrate.
+fn resolve_kernel_backend(config: &TurboLifeConfig) -> KernelBackend {
+    if let Some(backend) = config.kernel {
+        // Validate AVX2 availability at runtime.
+        if backend == KernelBackend::Avx2 {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avx2") {
+                    return KernelBackend::Avx2;
+                }
+            }
+            return KernelBackend::Scalar;
+        }
+        return backend;
+    }
+    detect_kernel_backend()
+}
+
+/// Configuration for a TurboLife engine instance.
+///
+/// Use `TurboLifeConfig::default()` for auto-tuned defaults, or customise
+/// individual knobs via the builder methods.
+#[derive(Clone, Debug)]
+pub struct TurboLifeConfig {
+    /// Number of threads for the compute pool.
+    /// `None` means auto-detect (physical cores, memory-bandwidth capped).
+    pub thread_count: Option<usize>,
+    /// Hard upper bound on threads regardless of auto-detection.
+    /// `None` means no additional cap beyond `thread_count`.
+    pub max_threads: Option<usize>,
+    /// Kernel backend selection.
+    /// `None` means auto-calibrate (benchmark Scalar vs AVX2 at startup).
+    pub kernel: Option<KernelBackend>,
+}
+
+impl Default for TurboLifeConfig {
+    fn default() -> Self {
+        Self {
+            thread_count: None,
+            max_threads: None,
+            kernel: None,
+        }
+    }
+}
+
+impl TurboLifeConfig {
+    /// Set an explicit thread count for the compute pool.
+    pub fn thread_count(mut self, n: usize) -> Self {
+        self.thread_count = Some(n.max(1));
+        self
+    }
+
+    /// Set a hard upper bound on threads.
+    pub fn max_threads(mut self, n: usize) -> Self {
+        self.max_threads = Some(n.max(1));
+        self
+    }
+
+    /// Force a specific kernel backend.
+    pub fn kernel(mut self, backend: KernelBackend) -> Self {
+        self.kernel = Some(backend);
+        self
+    }
+}
+
 pub struct TurboLife {
     arena: TileArena,
     generation: u64,
     population_cache: Option<u64>,
+    pool: rayon::ThreadPool,
+    backend: KernelBackend,
 }
 
 impl TurboLife {
     pub fn new() -> Self {
+        Self::with_config(TurboLifeConfig::default())
+    }
+
+    /// Create a TurboLife engine with explicit configuration.
+    pub fn with_config(config: TurboLifeConfig) -> Self {
+        let threads = resolve_thread_count(&config);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("failed to build TurboLife rayon thread pool");
+        let backend = resolve_kernel_backend(&config);
+
         Self {
             arena: TileArena::new(),
             generation: 0,
             population_cache: Some(0),
+            pool,
+            backend,
         }
     }
 
@@ -355,7 +421,7 @@ impl TurboLife {
         let active_len = self.arena.active_set.len();
         let bp = self.arena.border_phase;
         let cp = self.arena.cell_phase;
-        let backend = kernel_backend();
+        let backend = self.backend;
         let thread_count = rayon::current_num_threads().max(1);
         let effective_threads = tuned_parallel_threads(active_len, thread_count);
         let run_parallel = effective_threads > 1;
@@ -469,13 +535,18 @@ impl TurboLife {
     }
 
     pub fn step(&mut self) {
-        install_in_pool(|| {
+        // Split borrow: take a shared ref to the pool before mutably borrowing self.
+        let pool = &self.pool as *const rayon::ThreadPool;
+        // SAFETY: `pool` is not modified during `install`, and `step_impl` only
+        // mutates arena/generation/population_cache — never the pool itself.
+        unsafe { &*pool }.install(|| {
             self.step_impl();
         });
     }
 
     pub fn step_n(&mut self, n: u64) {
-        install_in_pool(|| {
+        let pool = &self.pool as *const rayon::ThreadPool;
+        unsafe { &*pool }.install(|| {
             for _ in 0..n {
                 self.step_impl();
             }

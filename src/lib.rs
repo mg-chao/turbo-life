@@ -3,4 +3,4 @@
 pub mod quicklife;
 pub mod turbolife;
 pub use quicklife::QuickLife;
-pub use turbolife::TurboLife;
+pub use turbolife::{KernelBackend, TurboLife, TurboLifeConfig};
