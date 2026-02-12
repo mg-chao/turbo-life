@@ -1,45 +1,54 @@
-//! TurboLife engine core.
-//!
-//! Split-buffer architecture: cell_bufs[phase] is read, cell_bufs[1-phase] is written.
-//! After the parallel phase, flip_cells() + flip_borders() makes next gen current.
-//! Changed tracking uses a pre-allocated atomic byte array to eliminate per-chunk
-//! Vec allocations. Prefetch depth is 3 tiles ahead.
-
 use rayon::prelude::*;
 use std::sync::OnceLock;
 
 use super::activity::{prune_and_expand, rebuild_active_set};
 use super::arena::TileArena;
-use super::kernel::{advance_tile_split, advance_core};
+use super::kernel::{advance_core, advance_tile_split};
 use super::sync::gather_ghost_zone;
 use super::tile::{self, POPULATION_UNKNOWN};
 
 struct SendPtr<T> {
-    _inner: *mut T,
+    inner: *mut T,
 }
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 impl<T> Copy for SendPtr<T> {}
-impl<T> Clone for SendPtr<T> { fn clone(&self) -> Self { *self } }
+impl<T> Clone for SendPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
 impl<T> SendPtr<T> {
     #[inline(always)]
-    fn new(ptr: *mut T) -> Self { Self { _inner: ptr } }
+    fn new(ptr: *mut T) -> Self {
+        Self { inner: ptr }
+    }
     #[inline(always)]
-    fn get(&self) -> *mut T { self._inner }
+    fn get(&self) -> *mut T {
+        self.inner
+    }
 }
 
 struct SendConstPtr<T> {
-    _inner: *const T,
+    inner: *const T,
 }
 unsafe impl<T> Send for SendConstPtr<T> {}
 unsafe impl<T> Sync for SendConstPtr<T> {}
 impl<T> Copy for SendConstPtr<T> {}
-impl<T> Clone for SendConstPtr<T> { fn clone(&self) -> Self { *self } }
+impl<T> Clone for SendConstPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
 impl<T> SendConstPtr<T> {
     #[inline(always)]
-    fn new(ptr: *const T) -> Self { Self { _inner: ptr } }
+    fn new(ptr: *const T) -> Self {
+        Self { inner: ptr }
+    }
     #[inline(always)]
-    fn get(&self) -> *const T { self._inner }
+    fn get(&self) -> *const T {
+        self.inner
+    }
 }
 
 const TILE_SIZE_I64: i64 = 64;
@@ -79,7 +88,8 @@ fn desired_thread_count() -> usize {
 
 #[inline]
 fn install_in_pool<T>(f: impl FnOnce() -> T + Send) -> T
-where T: Send,
+where
+    T: Send,
 {
     let pool = TURBOLIFE_POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
@@ -92,8 +102,6 @@ where T: Send,
 
 #[inline]
 fn kernel_chunk_size(active_len: usize, threads: usize) -> usize {
-    // Target more chunks than threads for better work-stealing balance.
-    // On many-core machines (24+), over-decomposition helps hide latency.
     let multiplier = if threads >= 16 { 8 } else { 4 };
     let target_chunks = threads.saturating_mul(multiplier).max(1);
     let size = active_len.div_ceil(target_chunks);
@@ -108,22 +116,41 @@ fn effective_parallel_threads(active_len: usize, thread_count: usize) -> usize {
     let by_work = active_len / PARALLEL_KERNEL_TILES_PER_THREAD;
     let by_chunks = active_len / KERNEL_CHUNK_MIN;
     let effective = by_work.min(by_chunks).min(thread_count).max(1);
-    if effective < PARALLEL_KERNEL_MIN_CHUNKS { 1 } else { effective }
+    if effective < PARALLEL_KERNEL_MIN_CHUNKS {
+        1
+    } else {
+        effective
+    }
+}
+
+#[inline]
+fn memory_parallel_cap(thread_count: usize) -> usize {
+    if thread_count <= 8 {
+        thread_count
+    } else {
+        thread_count.saturating_mul(2).div_ceil(3).max(8)
+    }
 }
 
 #[inline]
 fn tuned_parallel_threads(active_len: usize, thread_count: usize) -> usize {
-    if thread_count <= 1 { return 1; }
+    if thread_count <= 1 {
+        return 1;
+    }
     let mut effective = effective_parallel_threads(active_len, thread_count);
-    if effective <= 1 { return 1; }
-    // Scale caps with core count — the old caps (2/4/12) starved many-core machines.
-    // On a 24-core machine the old cap of 12 for <4096 tiles left half the cores idle.
-    let cores = thread_count;
-    let tuned_cap = if active_len < 256 { (cores / 4).max(2) }
-        else if active_len < 512 { (cores / 3).max(4) }
-        else if active_len < 1_024 { (cores / 2).max(6) }
-        else if active_len < 4_096 { (cores * 3 / 4).max(8) }
-        else { cores };
+    if effective <= 1 {
+        return 1;
+    }
+    let bw_cap = memory_parallel_cap(thread_count);
+    let tuned_cap = if active_len < 256 {
+        bw_cap.min(2)
+    } else if active_len < 512 {
+        bw_cap.min(4)
+    } else if active_len < 2_048 {
+        bw_cap.min(6)
+    } else {
+        bw_cap
+    };
     effective = effective.min(tuned_cap).min(thread_count);
     effective.max(1)
 }
@@ -132,10 +159,6 @@ pub struct TurboLife {
     arena: TileArena,
     generation: u64,
     population_cache: Option<u64>,
-    /// Plain byte array for changed flags. No atomics needed because each tile
-    /// in the active_set appears exactly once, and par_chunks gives non-overlapping
-    /// slices — so each index is written by exactly one thread.
-    changed_flags: Vec<u8>,
 }
 
 impl TurboLife {
@@ -144,23 +167,7 @@ impl TurboLife {
             arena: TileArena::new(),
             generation: 0,
             population_cache: Some(0),
-            changed_flags: vec![0u8],
         }
-    }
-
-    /// Ensure changed_flags has enough slots for all tile indices.
-    #[inline]
-    fn ensure_changed_flags(&mut self) {
-        let needed = self.arena.cell_bufs[0].len();
-        if self.changed_flags.len() < needed {
-            self.changed_flags.resize(needed, 0u8);
-        }
-    }
-
-    /// Set a changed flag via raw pointer (safe because each index is written by one thread).
-    #[inline(always)]
-    unsafe fn set_changed_flag(flags: *mut u8, idx: usize) {
-        unsafe { *flags.add(idx) = 1; }
     }
 
     pub fn set_cell(&mut self, x: i64, y: i64, alive: bool) {
@@ -173,7 +180,6 @@ impl TurboLife {
         }
 
         let idx = self.arena.allocate(tile_coord);
-        self.ensure_changed_flags();
 
         let buf = self.arena.current_buf_mut(idx);
         tile::set_local_cell(buf, local_x, local_y, alive);
@@ -196,16 +202,30 @@ impl TurboLife {
             let on_west = local_x == 0;
             let on_east = local_x == 63;
 
-            if on_north { self.arena.ensure_neighbor(tx, ty + 1); }
-            if on_south { self.arena.ensure_neighbor(tx, ty - 1); }
-            if on_west  { self.arena.ensure_neighbor(tx - 1, ty); }
-            if on_east  { self.arena.ensure_neighbor(tx + 1, ty); }
-            if on_north && on_west { self.arena.ensure_neighbor(tx - 1, ty + 1); }
-            if on_north && on_east { self.arena.ensure_neighbor(tx + 1, ty + 1); }
-            if on_south && on_west { self.arena.ensure_neighbor(tx - 1, ty - 1); }
-            if on_south && on_east { self.arena.ensure_neighbor(tx + 1, ty - 1); }
-
-            self.ensure_changed_flags();
+            if on_north {
+                self.arena.ensure_neighbor(tx, ty + 1);
+            }
+            if on_south {
+                self.arena.ensure_neighbor(tx, ty - 1);
+            }
+            if on_west {
+                self.arena.ensure_neighbor(tx - 1, ty);
+            }
+            if on_east {
+                self.arena.ensure_neighbor(tx + 1, ty);
+            }
+            if on_north && on_west {
+                self.arena.ensure_neighbor(tx - 1, ty + 1);
+            }
+            if on_north && on_east {
+                self.arena.ensure_neighbor(tx + 1, ty + 1);
+            }
+            if on_south && on_west {
+                self.arena.ensure_neighbor(tx - 1, ty - 1);
+            }
+            if on_south && on_east {
+                self.arena.ensure_neighbor(tx + 1, ty - 1);
+            }
         }
     }
 
@@ -231,8 +251,6 @@ impl TurboLife {
             return;
         }
 
-        self.ensure_changed_flags();
-
         let active_len = self.arena.active_set.len();
         let bp = self.arena.border_phase;
         let cp = self.arena.cell_phase;
@@ -240,7 +258,6 @@ impl TurboLife {
         let effective_threads = tuned_parallel_threads(active_len, thread_count);
         let run_parallel = effective_threads > 1;
 
-        // Split borrows for cell_bufs and borders using split_at_mut.
         let (cb_lo, cb_hi) = self.arena.cell_bufs.split_at_mut(1);
         let (current_vec, next_vec) = if cp == 0 {
             (&cb_lo[0], &mut cb_hi[0])
@@ -255,7 +272,6 @@ impl TurboLife {
         };
 
         if !run_parallel {
-            // Serial path
             let neighbors = &self.arena.neighbors;
 
             for i in 0..active_len {
@@ -274,15 +290,12 @@ impl TurboLife {
                 meta.population = POPULATION_UNKNOWN;
                 meta.set_has_live(has_live);
 
-                if changed {
-                    if !meta.in_changed_list() {
-                        meta.set_in_changed_list(true);
-                        self.arena.changed_list.push(idx);
-                    }
+                if changed && !meta.in_changed_list() {
+                    meta.set_in_changed_list(true);
+                    self.arena.changed_list.push(idx);
                 }
             }
         } else {
-            // Parallel path: plain byte flags (no atomics — each tile written by one thread).
             let active_set = &self.arena.active_set;
             let current_ptr = SendConstPtr::new(current_vec.as_ptr());
             let next_ptr = SendPtr::new(next_vec.as_mut_ptr());
@@ -291,78 +304,84 @@ impl TurboLife {
             let next_borders_ptr = SendPtr::new(next_borders_vec.as_mut_ptr());
             let chunk_size = kernel_chunk_size(active_len, effective_threads);
 
-            // Clear flags for active tiles.
-            for &idx in active_set {
-                self.changed_flags[idx.index()] = 0;
-            }
+            let changed_tiles = active_set
+                .par_chunks(chunk_size)
+                .fold(Vec::new, {
+                    let current_ptr = current_ptr;
+                    let next_ptr = next_ptr;
+                    let meta_ptr = meta_ptr;
+                    let next_borders_ptr = next_borders_ptr;
+                    move |mut local_changed, chunk| {
+                        if local_changed.is_empty() {
+                            local_changed.reserve(chunk.len().max(16));
+                        }
 
-            let flags_ptr = SendPtr::new(self.changed_flags.as_mut_ptr());
+                        for (ci, &idx) in chunk.iter().enumerate() {
+                            if ci + PREFETCH_DISTANCE < chunk.len() {
+                                let pf_idx = chunk[ci + PREFETCH_DISTANCE];
+                                unsafe {
+                                    let cell_ptr =
+                                        current_ptr.get().add(pf_idx.index()) as *const i8;
+                                    let nb_ptr =
+                                        neighbors.as_ptr().add(pf_idx.index()) as *const i8;
+                                    let border_ptr =
+                                        borders_read.as_ptr().add(pf_idx.index()) as *const i8;
+                                    let next_cell_ptr =
+                                        next_ptr.get().add(pf_idx.index()) as *const i8;
+                                    let next_meta_ptr =
+                                        meta_ptr.get().add(pf_idx.index()) as *const i8;
+                                    let next_border_ptr =
+                                        next_borders_ptr.get().add(pf_idx.index()) as *const i8;
+                                    #[cfg(target_arch = "x86_64")]
+                                    {
+                                        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                                        _mm_prefetch(cell_ptr, _MM_HINT_T0);
+                                        _mm_prefetch(cell_ptr.add(64), _MM_HINT_T0);
+                                        _mm_prefetch(cell_ptr.add(128), _MM_HINT_T0);
+                                        _mm_prefetch(cell_ptr.add(192), _MM_HINT_T0);
+                                        _mm_prefetch(nb_ptr, _MM_HINT_T0);
+                                        _mm_prefetch(border_ptr, _MM_HINT_T0);
+                                        _mm_prefetch(next_cell_ptr, _MM_HINT_T0);
+                                        _mm_prefetch(next_cell_ptr.add(64), _MM_HINT_T0);
+                                        _mm_prefetch(next_cell_ptr.add(128), _MM_HINT_T0);
+                                        _mm_prefetch(next_cell_ptr.add(192), _MM_HINT_T0);
+                                        _mm_prefetch(next_meta_ptr, _MM_HINT_T0);
+                                        _mm_prefetch(next_border_ptr, _MM_HINT_T0);
+                                    }
+                                }
+                            }
 
-            active_set.par_chunks(chunk_size).for_each({
-                let current_ptr = current_ptr;
-                let next_ptr = next_ptr;
-                let meta_ptr = meta_ptr;
-                let next_borders_ptr = next_borders_ptr;
-                let flags_ptr = flags_ptr;
-                move |chunk| {
-                    for (ci, &idx) in chunk.iter().enumerate() {
-                        // Deep prefetch: read-side and write-side for upcoming tiles.
-                        if ci + PREFETCH_DISTANCE < chunk.len() {
-                            let pf_idx = chunk[ci + PREFETCH_DISTANCE];
+                            let ghost = gather_ghost_zone(idx, borders_read, neighbors);
+
                             unsafe {
-                                let cell_ptr = current_ptr.get().add(pf_idx.index()) as *const i8;
-                                let nb_ptr = neighbors.as_ptr().add(pf_idx.index()) as *const i8;
-                                let border_ptr = borders_read.as_ptr().add(pf_idx.index()) as *const i8;
-                                let next_cell_ptr = next_ptr.get().add(pf_idx.index()) as *const i8;
-                                let next_meta_ptr = meta_ptr.get().add(pf_idx.index()) as *const i8;
-                                let next_border_ptr = next_borders_ptr.get().add(pf_idx.index()) as *const i8;
-                                #[cfg(target_arch = "x86_64")]
-                                {
-                                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                                    _mm_prefetch(cell_ptr, _MM_HINT_T0);
-                                    _mm_prefetch(cell_ptr.add(64), _MM_HINT_T0);
-                                    _mm_prefetch(cell_ptr.add(128), _MM_HINT_T0);
-                                    _mm_prefetch(cell_ptr.add(192), _MM_HINT_T0);
-                                    _mm_prefetch(nb_ptr, _MM_HINT_T0);
-                                    _mm_prefetch(border_ptr, _MM_HINT_T0);
-                                    _mm_prefetch(next_cell_ptr, _MM_HINT_T0);
-                                    _mm_prefetch(next_cell_ptr.add(64), _MM_HINT_T0);
-                                    _mm_prefetch(next_cell_ptr.add(128), _MM_HINT_T0);
-                                    _mm_prefetch(next_cell_ptr.add(192), _MM_HINT_T0);
-                                    _mm_prefetch(next_meta_ptr, _MM_HINT_T0);
-                                    _mm_prefetch(next_border_ptr, _MM_HINT_T0);
+                                let tile_changed = advance_tile_split(
+                                    current_ptr.get(),
+                                    next_ptr.get(),
+                                    meta_ptr.get(),
+                                    next_borders_ptr.get(),
+                                    idx.index(),
+                                    &ghost,
+                                );
+
+                                if tile_changed {
+                                    local_changed.push(idx);
                                 }
                             }
                         }
 
-                        let ghost = gather_ghost_zone(idx, borders_read, neighbors);
-
-                        unsafe {
-                            let tile_changed = advance_tile_split(
-                                current_ptr.get(),
-                                next_ptr.get(),
-                                meta_ptr.get(),
-                                next_borders_ptr.get(),
-                                idx.index(),
-                                &ghost,
-                            );
-
-                            if tile_changed {
-                                Self::set_changed_flag(flags_ptr.get(), idx.index());
-                            }
-                        }
+                        local_changed
                     }
-                }
-            });
+                })
+                .reduce(Vec::new, |mut left, mut right| {
+                    left.append(&mut right);
+                    left
+                });
 
-            // Collect changed tiles from flags (serial, very fast).
-            for &idx in active_set {
-                if self.changed_flags[idx.index()] != 0 {
-                    let m = &mut self.arena.meta[idx.index()];
-                    if !m.in_changed_list() {
-                        m.set_in_changed_list(true);
-                        self.arena.changed_list.push(idx);
-                    }
+            for idx in changed_tiles {
+                let meta = &mut self.arena.meta[idx.index()];
+                if !meta.in_changed_list() {
+                    meta.set_in_changed_list(true);
+                    self.arena.changed_list.push(idx);
                 }
             }
         }
@@ -397,8 +416,13 @@ impl TurboLife {
 
         let cp = self.arena.cell_phase;
         let mut total = 0u64;
-        for (buf, meta) in self.arena.cell_bufs[cp].iter().zip(self.arena.meta.iter_mut()) {
-            if !meta.occupied() { continue; }
+        for (buf, meta) in self.arena.cell_bufs[cp]
+            .iter()
+            .zip(self.arena.meta.iter_mut())
+        {
+            if !meta.occupied() {
+                continue;
+            }
             if !meta.has_live() {
                 meta.population = 0;
                 continue;
@@ -443,7 +467,9 @@ impl TurboLife {
         let cp = self.arena.cell_phase;
         for i in 0..self.arena.cell_bufs[cp].len() {
             let meta = &self.arena.meta[i];
-            if !meta.occupied() { continue; }
+            if !meta.occupied() {
+                continue;
+            }
 
             let current = &self.arena.cell_bufs[cp][i].0;
             let coord = self.arena.coords[i];
