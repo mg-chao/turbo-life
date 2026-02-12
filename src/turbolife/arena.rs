@@ -5,12 +5,11 @@
 //! Slot 0 is reserved as a sentinel (all zeros) so ghost-zone gathers
 //! can use unconditional loads — NO_NEIGHBOR maps to the sentinel.
 
-use rustc_hash::FxHashMap;
-
 use super::tile::{
     BorderData, CellBuf, Direction, EMPTY_NEIGHBORS, NO_NEIGHBOR, Neighbors, TILE_SIZE, TileIdx,
     TileMeta,
 };
+use super::tilemap::TileMap;
 
 /// Index of the sentinel slot (always zeroed).
 pub const SENTINEL_IDX: usize = 0;
@@ -28,7 +27,7 @@ pub struct TileArena {
     /// Double-buffered borders. `borders[border_phase]` = current gen (read).
     pub borders: [Vec<BorderData>; 2],
     pub border_phase: usize,
-    pub coord_to_idx: FxHashMap<(i64, i64), TileIdx>,
+    pub coord_to_idx: TileMap,
     pub free_list: Vec<TileIdx>,
     pub changed_list: Vec<TileIdx>,
     pub occupied_count: usize,
@@ -73,10 +72,7 @@ impl TileArena {
             coords,
             borders: [borders0, borders1],
             border_phase: 0,
-            coord_to_idx: FxHashMap::with_capacity_and_hasher(
-                INITIAL_TILE_CAPACITY,
-                Default::default(),
-            ),
+            coord_to_idx: TileMap::with_capacity(INITIAL_TILE_CAPACITY),
             free_list: Vec::new(),
             changed_list: Vec::new(),
             occupied_count: 0,
@@ -134,7 +130,7 @@ impl TileArena {
 
     #[inline(always)]
     pub fn idx_at(&self, coord: (i64, i64)) -> Option<TileIdx> {
-        self.coord_to_idx.get(&coord).copied()
+        self.coord_to_idx.get(coord.0, coord.1)
     }
 
     #[inline(always)]
@@ -218,7 +214,7 @@ impl TileArena {
         for dir in Direction::ALL {
             let (dx, dy) = dir.offset();
             let neighbor_coord = (coord.0 + dx, coord.1 + dy);
-            if let Some(neighbor_idx) = self.coord_to_idx.get(&neighbor_coord).copied() {
+            if let Some(neighbor_idx) = self.coord_to_idx.get(neighbor_coord.0, neighbor_coord.1) {
                 self.neighbors[idx.index()][dir.index()] = neighbor_idx.0;
                 self.neighbors[neighbor_idx.index()][dir.reverse().index()] = idx.0;
             }
@@ -227,9 +223,9 @@ impl TileArena {
 
     #[inline]
     pub(crate) fn allocate_absent(&mut self, coord: (i64, i64)) -> TileIdx {
-        debug_assert!(self.coord_to_idx.get(&coord).is_none());
+        debug_assert!(self.coord_to_idx.get(coord.0, coord.1).is_none());
         let idx = self.allocate_slot(coord);
-        self.coord_to_idx.insert(coord, idx);
+        self.coord_to_idx.insert(coord.0, coord.1, idx);
         self.occupied_count += 1;
 
         self.link_neighbors(idx, coord);
@@ -261,7 +257,7 @@ impl TileArena {
         self.neighbors[i] = EMPTY_NEIGHBORS;
 
         let coord = self.coords[i];
-        self.coord_to_idx.remove(&coord);
+        self.coord_to_idx.remove(coord.0, coord.1);
         self.cell_bufs[0][i] = CellBuf::empty();
         self.cell_bufs[1][i] = CellBuf::empty();
         self.borders[0][i] = BorderData::default();
