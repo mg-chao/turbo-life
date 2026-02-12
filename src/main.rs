@@ -53,28 +53,53 @@ fn main() {
         }
     }
 
-    let iterations = 1000u64;
+    let total_iterations = 10000u64;
+    let check_interval = 1000u64;
+    let mut quick_total_duration = std::time::Duration::ZERO;
+    let mut turbo_total_duration = std::time::Duration::ZERO;
+    let mut quick_prev_duration = std::time::Duration::ZERO;
+    let mut turbo_prev_duration = std::time::Duration::ZERO;
 
-    let start = Instant::now();
-    quick.step(iterations);
-    let quick_duration = start.elapsed();
+    for checkpoint in 1..=(total_iterations / check_interval) {
+        let iteration = checkpoint * check_interval;
 
-    let start = Instant::now();
-    turbo.step_n(iterations);
-    let turbo_duration = start.elapsed();
+        let start = Instant::now();
+        quick.step(check_interval);
+        quick_total_duration += start.elapsed();
 
-    let quick_total_ms = quick_duration.as_secs_f64() * 1000.0;
-    let quick_avg_ms = quick_total_ms / iterations as f64;
-    let turbo_total_ms = turbo_duration.as_secs_f64() * 1000.0;
-    let turbo_avg_ms = turbo_total_ms / iterations as f64;
+        let start = Instant::now();
+        turbo.step_n(check_interval);
+        turbo_total_duration += start.elapsed();
 
-    println!("QuickLife total iteration time: {quick_total_ms:.3} ms");
-    println!("QuickLife average time per iteration: {quick_avg_ms:.6} ms");
-    println!("TurboLife total iteration time: {turbo_total_ms:.3} ms");
-    println!("TurboLife average time per iteration: {turbo_avg_ms:.6} ms");
+        let quick_phase = quick_total_duration - quick_prev_duration;
+        let turbo_phase = turbo_total_duration - turbo_prev_duration;
+        quick_prev_duration = quick_total_duration;
+        turbo_prev_duration = turbo_total_duration;
 
-    let quick_population = quick.population();
-    let turbo_population = turbo.population();
-    println!("QuickLife population: {quick_population}");
-    println!("TurboLife population: {turbo_population}");
+        let quick_ms = quick_phase.as_secs_f64() * 1000.0;
+        let turbo_ms = turbo_phase.as_secs_f64() * 1000.0;
+        let quick_avg_ms = quick_ms / check_interval as f64;
+        let turbo_avg_ms = turbo_ms / check_interval as f64;
+
+        let quick_population = quick.population();
+        let turbo_population = turbo.population();
+        let match_status = if quick_population == turbo_population { "MATCH" } else { "MISMATCH" };
+        println!(
+            "Iteration {iteration}: QuickLife pop = {quick_population}, TurboLife pop = {turbo_population} [{match_status}]"
+        );
+        println!(
+            "  QuickLife: {quick_ms:.3} ms total, {quick_avg_ms:.6} ms/iter | TurboLife: {turbo_ms:.3} ms total, {turbo_avg_ms:.6} ms/iter"
+        );
+    }
+
+    let quick_total_ms = quick_total_duration.as_secs_f64() * 1000.0;
+    let turbo_total_ms = turbo_total_duration.as_secs_f64() * 1000.0;
+    let quick_avg_ms = quick_total_ms / total_iterations as f64;
+    let turbo_avg_ms = turbo_total_ms / total_iterations as f64;
+    let speedup = quick_total_ms / turbo_total_ms;
+
+    println!("\n--- Summary ({total_iterations} iterations) ---");
+    println!("QuickLife: {quick_total_ms:.3} ms total, {quick_avg_ms:.6} ms/iter");
+    println!("TurboLife: {turbo_total_ms:.3} ms total, {turbo_avg_ms:.6} ms/iter");
+    println!("Speedup (QuickLife / TurboLife): {speedup:.2}x");
 }
