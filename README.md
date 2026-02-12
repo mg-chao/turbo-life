@@ -28,7 +28,7 @@ Seeds a 4096×4096 region at 42% density and runs 1000 generations, printing tot
 
 ## Threading behavior
 
-- TurboLife defaults to using the number of physical CPU cores for its internal rayon thread pool.
+- TurboLife defaults to a memory-bandwidth-aware cap derived from physical CPU cores for its internal rayon thread pool.
 - You can override this with `TURBOLIFE_NUM_THREADS` (preferred) or `RAYON_NUM_THREADS`.
 - TurboLife uses adaptive per-step parallelism to avoid over-aggressive threading on small/medium active sets.
 - `TURBOLIFE_MAX_THREADS` can cap runtime parallel fan-out while keeping pool size unchanged.
@@ -39,6 +39,12 @@ $env:TURBOLIFE_NUM_THREADS=12
 $env:TURBOLIFE_MAX_THREADS=8
 cargo run --release
 ```
+
+## Kernel backend selection
+
+- `TURBOLIFE_KERNEL=auto|scalar|avx2` controls kernel dispatch behavior.
+- Default is `auto` (uses AVX2 on supported `x86_64` CPUs, otherwise scalar).
+- `scalar` is useful for comparison and debugging.
 
 ## Tests
 

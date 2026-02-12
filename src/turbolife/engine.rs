@@ -1,9 +1,10 @@
 use rayon::prelude::*;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use super::activity::{prune_and_expand, rebuild_active_set};
 use super::arena::TileArena;
-use super::kernel::{advance_core, advance_tile_split};
+use super::kernel::{KernelBackend, advance_core, advance_tile_split};
 use super::sync::{gather_ghost_zone, gather_ghost_zone_raw};
 use super::tile::{self, POPULATION_UNKNOWN};
 
@@ -59,10 +60,120 @@ const KERNEL_CHUNK_MIN: usize = 32;
 const KERNEL_CHUNK_MAX: usize = 256;
 const ENV_OVERRIDE_THREADS: &str = "TURBOLIFE_NUM_THREADS";
 const ENV_MAX_THREADS: &str = "TURBOLIFE_MAX_THREADS";
+const ENV_KERNEL: &str = "TURBOLIFE_KERNEL";
 const PREFETCH_DISTANCE: usize = 5;
 
 static TURBOLIFE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
+static KERNEL_BACKEND: OnceLock<KernelBackend> = OnceLock::new();
+
+#[inline]
+fn parse_kernel_backend(raw: &str) -> Option<KernelBackend> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "scalar" => Some(KernelBackend::Scalar),
+        "avx2" => Some(KernelBackend::Avx2),
+        "auto" => None,
+        _ => None,
+    }
+}
+
+#[inline]
+fn detect_kernel_backend() -> KernelBackend {
+    if let Ok(raw) = std::env::var(ENV_KERNEL) {
+        if let Some(forced) = parse_kernel_backend(&raw) {
+            if forced == KernelBackend::Avx2 {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if std::is_x86_feature_detected!("avx2") {
+                        return KernelBackend::Avx2;
+                    }
+                }
+                return KernelBackend::Scalar;
+            }
+            return forced;
+        }
+    }
+
+    calibrate_auto_backend()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn next_seed(seed: &mut u64) -> u64 {
+    let mut x = *seed;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *seed = x;
+    x
+}
+
+#[cfg(target_arch = "x86_64")]
+fn benchmark_backend(backend: KernelBackend) -> u128 {
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut current = [0u64; tile::TILE_SIZE];
+    let mut next = [0u64; tile::TILE_SIZE];
+    for row in &mut current {
+        *row = next_seed(&mut seed);
+    }
+
+    let ghost = tile::GhostZone {
+        north: next_seed(&mut seed),
+        south: next_seed(&mut seed),
+        west: next_seed(&mut seed),
+        east: next_seed(&mut seed),
+        nw: (next_seed(&mut seed) & 1) != 0,
+        ne: (next_seed(&mut seed) & 1) != 0,
+        sw: (next_seed(&mut seed) & 1) != 0,
+        se: (next_seed(&mut seed) & 1) != 0,
+    };
+
+    let rounds = 1536usize;
+    let start = Instant::now();
+    let mut checksum = 0u64;
+    for round in 0..rounds {
+        let (changed, border, has_live) = advance_core(&current, &mut next, &ghost, backend);
+        checksum ^= border.north
+            ^ border.south
+            ^ border.west
+            ^ border.east
+            ^ border.corners as u64
+            ^ changed as u64
+            ^ has_live as u64;
+
+        if round & 1 == 0 {
+            current = next;
+            next = [0u64; tile::TILE_SIZE];
+        }
+    }
+    std::hint::black_box(checksum);
+    start.elapsed().as_nanos()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn calibrate_auto_backend() -> KernelBackend {
+    if !std::is_x86_feature_detected!("avx2") {
+        return KernelBackend::Scalar;
+    }
+
+    let scalar_ns = benchmark_backend(KernelBackend::Scalar);
+    let avx2_ns = benchmark_backend(KernelBackend::Avx2);
+    if avx2_ns <= scalar_ns {
+        KernelBackend::Avx2
+    } else {
+        KernelBackend::Scalar
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn calibrate_auto_backend() -> KernelBackend {
+    KernelBackend::Scalar
+}
+
+#[inline]
+fn kernel_backend() -> KernelBackend {
+    *KERNEL_BACKEND.get_or_init(detect_kernel_backend)
+}
 
 #[inline]
 fn parse_positive_env(var: &str) -> Option<usize> {
@@ -79,7 +190,7 @@ fn physical_core_count() -> usize {
 fn desired_thread_count() -> usize {
     let mut threads = parse_positive_env(ENV_OVERRIDE_THREADS)
         .or_else(|| parse_positive_env("RAYON_NUM_THREADS"))
-        .unwrap_or_else(physical_core_count);
+        .unwrap_or_else(|| memory_parallel_cap(physical_core_count()));
     if let Some(max_threads) = parse_positive_env(ENV_MAX_THREADS) {
         threads = threads.min(max_threads);
     }
@@ -259,6 +370,7 @@ impl TurboLife {
         let active_len = self.arena.active_set.len();
         let bp = self.arena.border_phase;
         let cp = self.arena.cell_phase;
+        let backend = kernel_backend();
         let thread_count = rayon::current_num_threads().max(1);
         let effective_threads = tuned_parallel_threads(active_len, thread_count);
         let run_parallel = effective_threads > 1;
@@ -276,6 +388,12 @@ impl TurboLife {
             (bd_hi[0].as_slice(), &mut bd_lo[0])
         };
 
+        debug_assert_eq!(self.arena.meta.len(), current_vec.len());
+        debug_assert_eq!(self.arena.meta.len(), next_vec.len());
+        debug_assert_eq!(self.arena.meta.len(), borders_read.len());
+        debug_assert_eq!(self.arena.meta.len(), next_borders_vec.len());
+        debug_assert_eq!(self.arena.meta.len(), self.arena.neighbors.len());
+
         if !run_parallel {
             let neighbors = &self.arena.neighbors;
 
@@ -288,7 +406,7 @@ impl TurboLife {
                 let next_border = &mut next_borders_vec[idx.index()];
                 let meta = &mut self.arena.meta[idx.index()];
 
-                let (changed, border, has_live) = advance_core(current, next, &ghost);
+                let (changed, border, has_live) = advance_core(current, next, &ghost, backend);
 
                 *next_border = border;
                 meta.set_changed(changed);
@@ -312,71 +430,87 @@ impl TurboLife {
             let borders_read_ptr = SendConstPtr::new(borders_read.as_ptr());
             let chunk_size = kernel_chunk_size(active_len, effective_threads);
 
-            active_set.par_chunks(chunk_size).for_each({
-                let current_ptr = current_ptr;
-                let next_ptr = next_ptr;
-                let meta_ptr = meta_ptr;
-                let next_borders_ptr = next_borders_ptr;
-                let neighbors_ptr = neighbors_ptr;
-                let borders_read_ptr = borders_read_ptr;
-                move |chunk| {
-                    for (ci, &idx) in chunk.iter().enumerate() {
-                        if ci + PREFETCH_DISTANCE < chunk.len() {
-                            let pf_idx = chunk[ci + PREFETCH_DISTANCE];
+            let changed_tiles = active_set
+                .par_chunks(chunk_size)
+                .map({
+                    let current_ptr = current_ptr;
+                    let next_ptr = next_ptr;
+                    let meta_ptr = meta_ptr;
+                    let next_borders_ptr = next_borders_ptr;
+                    let neighbors_ptr = neighbors_ptr;
+                    let borders_read_ptr = borders_read_ptr;
+                    let backend = backend;
+                    move |chunk| {
+                        let mut changed_local = Vec::with_capacity(chunk.len() / 2 + 4);
+                        for (ci, &idx) in chunk.iter().enumerate() {
+                            if ci + PREFETCH_DISTANCE < chunk.len() {
+                                let pf_idx = chunk[ci + PREFETCH_DISTANCE];
+                                unsafe {
+                                    let cell_ptr =
+                                        current_ptr.get().add(pf_idx.index()) as *const i8;
+                                    let nb_ptr =
+                                        neighbors.as_ptr().add(pf_idx.index()) as *const i8;
+                                    let border_ptr =
+                                        borders_read.as_ptr().add(pf_idx.index()) as *const i8;
+                                    let next_cell_ptr =
+                                        next_ptr.get().add(pf_idx.index()) as *const i8;
+                                    let next_meta_ptr =
+                                        meta_ptr.get().add(pf_idx.index()) as *const i8;
+                                    let next_border_ptr =
+                                        next_borders_ptr.get().add(pf_idx.index()) as *const i8;
+                                    #[cfg(target_arch = "x86_64")]
+                                    {
+                                        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                                        _mm_prefetch(cell_ptr, _MM_HINT_T0);
+                                        _mm_prefetch(cell_ptr.add(64), _MM_HINT_T0);
+                                        _mm_prefetch(cell_ptr.add(128), _MM_HINT_T0);
+                                        _mm_prefetch(cell_ptr.add(192), _MM_HINT_T0);
+                                        _mm_prefetch(nb_ptr, _MM_HINT_T0);
+                                        _mm_prefetch(border_ptr, _MM_HINT_T0);
+                                        _mm_prefetch(next_cell_ptr, _MM_HINT_T0);
+                                        _mm_prefetch(next_cell_ptr.add(64), _MM_HINT_T0);
+                                        _mm_prefetch(next_cell_ptr.add(128), _MM_HINT_T0);
+                                        _mm_prefetch(next_cell_ptr.add(192), _MM_HINT_T0);
+                                        _mm_prefetch(next_meta_ptr, _MM_HINT_T0);
+                                        _mm_prefetch(next_border_ptr, _MM_HINT_T0);
+                                    }
+                                }
+                            }
+
+                            let ghost = unsafe {
+                                gather_ghost_zone_raw(
+                                    idx.index(),
+                                    borders_read_ptr.get(),
+                                    neighbors_ptr.get(),
+                                )
+                            };
+
                             unsafe {
-                                let cell_ptr = current_ptr.get().add(pf_idx.index()) as *const i8;
-                                let nb_ptr = neighbors.as_ptr().add(pf_idx.index()) as *const i8;
-                                let border_ptr =
-                                    borders_read.as_ptr().add(pf_idx.index()) as *const i8;
-                                let next_cell_ptr = next_ptr.get().add(pf_idx.index()) as *const i8;
-                                let next_meta_ptr = meta_ptr.get().add(pf_idx.index()) as *const i8;
-                                let next_border_ptr =
-                                    next_borders_ptr.get().add(pf_idx.index()) as *const i8;
-                                #[cfg(target_arch = "x86_64")]
-                                {
-                                    use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-                                    _mm_prefetch(cell_ptr, _MM_HINT_T0);
-                                    _mm_prefetch(cell_ptr.add(64), _MM_HINT_T0);
-                                    _mm_prefetch(cell_ptr.add(128), _MM_HINT_T0);
-                                    _mm_prefetch(cell_ptr.add(192), _MM_HINT_T0);
-                                    _mm_prefetch(nb_ptr, _MM_HINT_T0);
-                                    _mm_prefetch(border_ptr, _MM_HINT_T0);
-                                    _mm_prefetch(next_cell_ptr, _MM_HINT_T0);
-                                    _mm_prefetch(next_cell_ptr.add(64), _MM_HINT_T0);
-                                    _mm_prefetch(next_cell_ptr.add(128), _MM_HINT_T0);
-                                    _mm_prefetch(next_cell_ptr.add(192), _MM_HINT_T0);
-                                    _mm_prefetch(next_meta_ptr, _MM_HINT_T0);
-                                    _mm_prefetch(next_border_ptr, _MM_HINT_T0);
+                                let tile_changed = advance_tile_split(
+                                    current_ptr.get(),
+                                    next_ptr.get(),
+                                    meta_ptr.get(),
+                                    next_borders_ptr.get(),
+                                    idx.index(),
+                                    &ghost,
+                                    backend,
+                                );
+                                if tile_changed {
+                                    changed_local.push(idx);
                                 }
                             }
                         }
-
-                        let ghost = unsafe {
-                            gather_ghost_zone_raw(
-                                idx.index(),
-                                borders_read_ptr.get(),
-                                neighbors_ptr.get(),
-                            )
-                        };
-
-                        unsafe {
-                            let _tile_changed = advance_tile_split(
-                                current_ptr.get(),
-                                next_ptr.get(),
-                                meta_ptr.get(),
-                                next_borders_ptr.get(),
-                                idx.index(),
-                                &ghost,
-                            );
-                        }
+                        changed_local
                     }
-                }
-            });
+                })
+                .reduce(Vec::new, |mut left, mut right| {
+                    left.append(&mut right);
+                    left
+                });
 
-            for i in 0..active_len {
-                let idx = active_set[i];
+            for idx in changed_tiles {
                 let meta = &mut self.arena.meta[idx.index()];
-                if meta.changed() && !meta.in_changed_list() {
+                if !meta.in_changed_list() {
                     meta.set_in_changed_list(true);
                     self.arena.changed_list.push(idx);
                 }

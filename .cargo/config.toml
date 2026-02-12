@@ -1,5 +1,2 @@
-[build]
-target = "x86_64-pc-windows-msvc"
-
-[target.x86_64-pc-windows-msvc]
+[target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=native"]

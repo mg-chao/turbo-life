@@ -8,8 +8,8 @@
 use rustc_hash::FxHashMap;
 
 use super::tile::{
-    BorderData, CellBuf, Direction, Neighbors, EMPTY_NEIGHBORS,
-    TileIdx, TileMeta, TILE_SIZE, NO_NEIGHBOR,
+    BorderData, CellBuf, Direction, EMPTY_NEIGHBORS, NO_NEIGHBOR, Neighbors, TILE_SIZE, TileIdx,
+    TileMeta,
 };
 
 /// Index of the sentinel slot (always zeroed).
@@ -29,6 +29,7 @@ pub struct TileArena {
     pub coord_to_idx: FxHashMap<(i64, i64), TileIdx>,
     pub free_list: Vec<TileIdx>,
     pub changed_list: Vec<TileIdx>,
+    pub occupied_count: usize,
 
     pub active_epoch: u32,
     pub active_set: Vec<TileIdx>,
@@ -57,6 +58,7 @@ impl TileArena {
             coord_to_idx: FxHashMap::default(),
             free_list: Vec::new(),
             changed_list: Vec::new(),
+            occupied_count: 0,
             active_epoch: 1,
             active_set: Vec::new(),
             expand_buf: Vec::new(),
@@ -167,6 +169,7 @@ impl TileArena {
         };
 
         self.coord_to_idx.insert(coord, idx);
+        self.occupied_count += 1;
 
         for dir in Direction::ALL {
             let (dx, dy) = dir.offset();
@@ -203,6 +206,7 @@ impl TileArena {
         self.borders[1][i] = BorderData::default();
         self.meta[i] = TileMeta::released();
         self.free_list.push(idx);
+        self.occupied_count = self.occupied_count.saturating_sub(1);
     }
 
     #[inline]

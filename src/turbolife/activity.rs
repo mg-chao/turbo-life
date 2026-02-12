@@ -1,9 +1,9 @@
-﻿//! Active set and prune/expand logic for TurboLife.
+//! Active set and prune/expand logic for TurboLife.
 
 use rayon::prelude::*;
 
 use super::arena::TileArena;
-use super::tile::{Direction, TileIdx, TileMeta, BorderData, NO_NEIGHBOR};
+use super::tile::{BorderData, Direction, NO_NEIGHBOR, TileIdx, TileMeta};
 
 const PARALLEL_PRUNE_MIN_ACTIVE: usize = 192;
 const PARALLEL_PRUNE_TILES_PER_THREAD: usize = 24;
@@ -26,20 +26,34 @@ fn effective_prune_threads(active_len: usize, thread_count: usize) -> usize {
     let by_work = active_len / PARALLEL_PRUNE_TILES_PER_THREAD;
     let by_chunks = active_len / PRUNE_CHUNK_MIN;
     let effective = by_work.min(by_chunks).min(thread_count).max(1);
-    if effective < PARALLEL_PRUNE_MIN_CHUNKS { 1 } else { effective }
+    if effective < PARALLEL_PRUNE_MIN_CHUNKS {
+        1
+    } else {
+        effective
+    }
 }
 
 #[inline]
 fn tuned_prune_threads(active_len: usize, thread_count: usize) -> usize {
-    if thread_count <= 1 { return 1; }
+    if thread_count <= 1 {
+        return 1;
+    }
     let mut effective = effective_prune_threads(active_len, thread_count);
-    if effective <= 1 { return 1; }
+    if effective <= 1 {
+        return 1;
+    }
     let cores = thread_count;
-    let tuned_cap = if active_len < 256 { (cores / 4).max(2) }
-        else if active_len < 512 { (cores / 3).max(4) }
-        else if active_len < 1_024 { (cores / 2).max(6) }
-        else if active_len < 4_096 { (cores * 3 / 4).max(8) }
-        else { cores };
+    let tuned_cap = if active_len < 256 {
+        (cores / 4).max(2)
+    } else if active_len < 512 {
+        (cores / 3).max(4)
+    } else if active_len < 1_024 {
+        (cores / 2).max(6)
+    } else if active_len < 4_096 {
+        (cores * 3 / 4).max(8)
+    } else {
+        cores
+    };
     effective = effective.min(tuned_cap).min(thread_count);
     effective.max(1)
 }
@@ -65,7 +79,22 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     arena.changed_list.clear();
 
     let changed_count = arena.changed_scratch.len();
-    if changed_count == 0 { return; }
+    if changed_count == 0 {
+        return;
+    }
+
+    let dense_rebuild = arena.occupied_count >= 4096
+        && changed_count.saturating_mul(100) >= arena.occupied_count.saturating_mul(95);
+    if dense_rebuild {
+        arena.active_set.reserve(arena.occupied_count);
+        for i in 1..arena.meta.len() {
+            if arena.meta[i].occupied() {
+                arena.meta[i].active_epoch = epoch;
+                arena.active_set.push(TileIdx(i as u32));
+            }
+        }
+        return;
+    }
 
     // The epoch-stamping must be serial (it's a dedup mechanism), but we can
     // at least avoid branch mispredictions by pre-reserving.
@@ -91,11 +120,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
 }
 
 #[inline]
-fn neighbor_has_changed(
-    neighbors: &[[u32; 8]],
-    meta: &[TileMeta],
-    idx: TileIdx,
-) -> bool {
+fn neighbor_has_changed(neighbors: &[[u32; 8]], meta: &[TileMeta], idx: TileIdx) -> bool {
     let nb = &neighbors[idx.index()];
     for dir_idx in 0..8 {
         let ni_raw = nb[dir_idx];
@@ -116,31 +141,57 @@ fn scan_tile_prune_expand(
     expand: &mut Vec<(i64, i64)>,
 ) -> bool {
     let i_idx = idx.index();
-    if !meta[i_idx].occupied() { return false; }
+    if !meta[i_idx].occupied() {
+        return false;
+    }
 
     let (tx, ty) = coords[i_idx];
     let border = &borders[i_idx];
     let nb = &neighbors[i_idx];
 
-    let has_missing_neighbor = nb[0] == NO_NEIGHBOR || nb[1] == NO_NEIGHBOR
-        || nb[2] == NO_NEIGHBOR || nb[3] == NO_NEIGHBOR
-        || nb[4] == NO_NEIGHBOR || nb[5] == NO_NEIGHBOR
-        || nb[6] == NO_NEIGHBOR || nb[7] == NO_NEIGHBOR;
+    let has_missing_neighbor = nb[0] == NO_NEIGHBOR
+        || nb[1] == NO_NEIGHBOR
+        || nb[2] == NO_NEIGHBOR
+        || nb[3] == NO_NEIGHBOR
+        || nb[4] == NO_NEIGHBOR
+        || nb[5] == NO_NEIGHBOR
+        || nb[6] == NO_NEIGHBOR
+        || nb[7] == NO_NEIGHBOR;
 
     if has_missing_neighbor {
-        if border.north != 0 && nb[Direction::North.index()] == NO_NEIGHBOR { expand.push((tx, ty + 1)); }
-        if border.south != 0 && nb[Direction::South.index()] == NO_NEIGHBOR { expand.push((tx, ty - 1)); }
-        if border.west != 0 && nb[Direction::West.index()] == NO_NEIGHBOR { expand.push((tx - 1, ty)); }
-        if border.east != 0 && nb[Direction::East.index()] == NO_NEIGHBOR { expand.push((tx + 1, ty)); }
-        if border.nw() && nb[Direction::NW.index()] == NO_NEIGHBOR { expand.push((tx - 1, ty + 1)); }
-        if border.ne() && nb[Direction::NE.index()] == NO_NEIGHBOR { expand.push((tx + 1, ty + 1)); }
-        if border.sw() && nb[Direction::SW.index()] == NO_NEIGHBOR { expand.push((tx - 1, ty - 1)); }
-        if border.se() && nb[Direction::SE.index()] == NO_NEIGHBOR { expand.push((tx + 1, ty - 1)); }
+        if border.north != 0 && nb[Direction::North.index()] == NO_NEIGHBOR {
+            expand.push((tx, ty + 1));
+        }
+        if border.south != 0 && nb[Direction::South.index()] == NO_NEIGHBOR {
+            expand.push((tx, ty - 1));
+        }
+        if border.west != 0 && nb[Direction::West.index()] == NO_NEIGHBOR {
+            expand.push((tx - 1, ty));
+        }
+        if border.east != 0 && nb[Direction::East.index()] == NO_NEIGHBOR {
+            expand.push((tx + 1, ty));
+        }
+        if border.nw() && nb[Direction::NW.index()] == NO_NEIGHBOR {
+            expand.push((tx - 1, ty + 1));
+        }
+        if border.ne() && nb[Direction::NE.index()] == NO_NEIGHBOR {
+            expand.push((tx + 1, ty + 1));
+        }
+        if border.sw() && nb[Direction::SW.index()] == NO_NEIGHBOR {
+            expand.push((tx - 1, ty - 1));
+        }
+        if border.se() && nb[Direction::SE.index()] == NO_NEIGHBOR {
+            expand.push((tx + 1, ty - 1));
+        }
     }
 
     let changed = meta[i_idx].changed();
-    if changed { return false; }
-    if neighbor_has_changed(neighbors, meta, idx) { return false; }
+    if changed {
+        return false;
+    }
+    if neighbor_has_changed(neighbors, meta, idx) {
+        return false;
+    }
     !meta[i_idx].has_live()
 }
 
@@ -153,7 +204,9 @@ pub fn prune_and_expand(arena: &mut TileArena) {
     let active_len = arena.active_set.len();
     let thread_count = rayon::current_num_threads().max(1);
 
-    if active_len == 0 { return; }
+    if active_len == 0 {
+        return;
+    }
 
     let effective_threads = tuned_prune_threads(active_len, thread_count);
     let run_parallel = effective_threads > 1;
@@ -162,24 +215,37 @@ pub fn prune_and_expand(arena: &mut TileArena) {
         for i in 0..active_len {
             let idx = arena.active_set[i];
             let should_prune = scan_tile_prune_expand(
-                idx, &arena.meta, &arena.borders[bp],
-                &arena.neighbors, &arena.coords, &mut arena.expand_buf,
+                idx,
+                &arena.meta,
+                &arena.borders[bp],
+                &arena.neighbors,
+                &arena.coords,
+                &mut arena.expand_buf,
             );
-            if should_prune { arena.prune_buf.push(idx); }
+            if should_prune {
+                arena.prune_buf.push(idx);
+            }
         }
     } else {
         let chunk_size = prune_chunk_size(active_len, effective_threads);
-        let (expand_all, prune_all) = arena.active_set
+        let (expand_all, prune_all) = arena
+            .active_set
             .par_chunks(chunk_size)
             .fold(
                 || (Vec::new(), Vec::new()),
                 |mut acc, chunk| {
                     for &idx in chunk {
                         let should_prune = scan_tile_prune_expand(
-                            idx, &arena.meta, &arena.borders[bp],
-                            &arena.neighbors, &arena.coords, &mut acc.0,
+                            idx,
+                            &arena.meta,
+                            &arena.borders[bp],
+                            &arena.neighbors,
+                            &arena.coords,
+                            &mut acc.0,
                         );
-                        if should_prune { acc.1.push(idx); }
+                        if should_prune {
+                            acc.1.push(idx);
+                        }
                     }
                     acc
                 },
@@ -203,7 +269,9 @@ pub fn prune_and_expand(arena: &mut TileArena) {
 
     for i in 0..arena.expand_buf.len() {
         let coord = arena.expand_buf[i];
-        if arena.idx_at(coord).is_some() { continue; }
+        if arena.idx_at(coord).is_some() {
+            continue;
+        }
         let idx = arena.allocate(coord);
         arena.meta[idx.index()].set_changed(true);
         arena.meta[idx.index()].active_epoch = 0;
