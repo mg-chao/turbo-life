@@ -260,11 +260,13 @@ pub fn prune_and_expand(arena: &mut TileArena) {
         arena.prune_buf.extend(prune_all);
     }
 
-    if arena.expand_buf.len() > 16 {
-        arena.expand_buf.sort_unstable();
-        arena.expand_buf.dedup();
+    // Dedup via the tilemap itself: allocate_absent inserts into coord_to_idx,
+    // so subsequent idx_at calls for the same coord will find it and skip.
+    // This is O(n) vs O(n log n) for sort+dedup, and avoids the sort overhead.
+    // Pre-reserve to avoid repeated growth checks during batch allocation.
+    if !arena.expand_buf.is_empty() {
+        arena.reserve_additional_tiles(arena.expand_buf.len());
     }
-
     for i in 0..arena.expand_buf.len() {
         let coord = arena.expand_buf[i];
         if arena.idx_at(coord).is_some() {

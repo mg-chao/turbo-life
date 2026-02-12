@@ -154,7 +154,7 @@ impl TileArena {
     }
 
     #[inline]
-    fn reserve_additional_tiles(&mut self, additional: usize) {
+    pub(crate) fn reserve_additional_tiles(&mut self, additional: usize) {
         if additional == 0 {
             return;
         }

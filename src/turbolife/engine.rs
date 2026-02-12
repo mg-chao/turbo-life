@@ -311,8 +311,7 @@ impl TurboLife {
 
         let buf = self.arena.current_buf_mut(idx);
         tile::set_local_cell(buf, local_x, local_y, alive);
-        let border = tile::recompute_border(buf);
-        let has_live = buf.iter().any(|&row| row != 0);
+        let (border, has_live) = tile::recompute_border_and_has_live(buf);
 
         *self.arena.border_mut(idx) = border;
         {
@@ -442,8 +441,7 @@ impl TurboLife {
 
         for idx in touched_tiles {
             let buf = self.arena.current_buf(idx);
-            let border = tile::recompute_border(buf);
-            let has_live = buf.iter().any(|&row| row != 0);
+            let (border, has_live) = tile::recompute_border_and_has_live(buf);
 
             *self.arena.border_mut(idx) = border;
             {

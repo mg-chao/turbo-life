@@ -6,6 +6,7 @@
 //! - Robin Hood probing with backward-shift deletion (no tombstones).
 //! - Specialized hash for tile coordinates (distinct multipliers + rotation).
 //! - Fingerprint check in the control word to skip full key comparisons.
+//! - Cached hash eliminates rehashing in probes, deletes, and resizes.
 
 use super::tile::TileIdx;
 
@@ -31,7 +32,11 @@ const OCCUPIED_BIT: u32 = 0x8000_0000;
 
 /// A single slot in the hash table.
 ///
-/// 32 bytes, naturally aligned so two slots fill one 64-byte cache line.
+/// Layout: key_x(8) + key_y(8) + value(4) + ctrl(4) + hash(8) = 32 bytes.
+/// Two slots fill one 64-byte cache line.
+///
+/// The cached `hash` field eliminates rehashing during Robin Hood probes,
+/// displacement comparisons, backward-shift deletion, and resize.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Slot {
@@ -41,6 +46,8 @@ struct Slot {
     /// High bit = occupied flag.  Lower 31 bits = hash fingerprint.
     /// `0` means empty.
     ctrl: u32,
+    /// Cached full hash of (key_x, key_y). Only meaningful when occupied.
+    hash: u64,
 }
 
 impl Slot {
@@ -49,6 +56,7 @@ impl Slot {
         key_y: 0,
         value: 0,
         ctrl: EMPTY,
+        hash: 0,
     };
 
     #[inline(always)]
@@ -64,6 +72,12 @@ impl Slot {
     #[inline(always)]
     fn fingerprint(self) -> u32 {
         self.ctrl & !OCCUPIED_BIT
+    }
+
+    /// Home bucket for this slot (only valid when occupied).
+    #[inline(always)]
+    fn home(self, mask: usize) -> usize {
+        self.hash as usize & mask
     }
 }
 
@@ -166,6 +180,7 @@ impl TileMap {
             key_y: y,
             value: value.0,
             ctrl,
+            hash,
         };
         let mut ins_home = pos;
 
@@ -179,19 +194,46 @@ impl TileMap {
             }
 
             // Exact match — update in place.
-            if slot.is_occupied()
-                && slot.fingerprint() == fp
-                && slot.key_x == x
-                && slot.key_y == y
-            {
+            if slot.fingerprint() == fp && slot.key_x == x && slot.key_y == y {
                 let old = TileIdx(slot.value);
                 slot.value = value.0;
                 return Some(old);
             }
 
             // Robin Hood: if the existing entry is closer to home, steal its spot.
-            let existing_home =
-                tile_hash(slot.key_x, slot.key_y) as usize & self.mask;
+            // Uses cached hash — no rehashing needed.
+            let existing_home = slot.home(self.mask);
+            let existing_dist = displacement(existing_home, pos, self.mask);
+            let ins_dist = displacement(ins_home, pos, self.mask);
+
+            if ins_dist > existing_dist {
+                let displaced = *slot;
+                *slot = ins;
+                ins = displaced;
+                ins_home = existing_home;
+            }
+
+            pos = (pos + 1) & self.mask;
+        }
+    }
+
+    /// Insert during resize — uses pre-computed hash, skips duplicate check.
+    #[inline]
+    fn insert_rehash(&mut self, slot_in: Slot) {
+        let mut pos = slot_in.hash as usize & self.mask;
+        let mut ins = slot_in;
+        let mut ins_home = pos;
+
+        loop {
+            let slot = &mut self.slots[pos];
+
+            if slot.is_empty() {
+                *slot = ins;
+                self.len += 1;
+                return;
+            }
+
+            let existing_home = slot.home(self.mask);
             let existing_dist = displacement(existing_home, pos, self.mask);
             let ins_dist = displacement(ins_home, pos, self.mask);
 
@@ -234,8 +276,7 @@ impl TileMap {
         }
     }
 
-    /// Backward-shift deletion: pull subsequent displaced entries back to
-    /// fill the gap, keeping probe chains intact without tombstones.
+    /// Backward-shift deletion using cached hash — no rehashing needed.
     fn backward_shift_delete(&mut self, removed: usize) {
         let mut gap = removed;
         loop {
@@ -247,9 +288,10 @@ impl TileMap {
                 return;
             }
 
-            // If the candidate is at its home position it doesn't need to shift.
-            let home = tile_hash(candidate.key_x, candidate.key_y) as usize & self.mask;
+            // Use cached hash to check displacement without rehashing.
+            let home = candidate.home(self.mask);
             if home == next {
+                // Candidate is at its home position — doesn't need to shift.
                 self.slots[gap] = Slot::EMPTY;
                 return;
             }
@@ -272,6 +314,7 @@ impl TileMap {
         self.resize(new_cap);
     }
 
+    /// Resize using cached hashes — no rehashing of keys needed.
     fn resize(&mut self, new_cap: usize) {
         debug_assert!(new_cap.is_power_of_two());
         let old_slots = std::mem::replace(&mut self.slots, vec![Slot::EMPTY; new_cap]);
@@ -279,7 +322,7 @@ impl TileMap {
         self.len = 0;
         for slot in old_slots {
             if slot.is_occupied() {
-                self.insert_no_grow(slot.key_x, slot.key_y, TileIdx(slot.value));
+                self.insert_rehash(slot);
             }
         }
     }
@@ -403,5 +446,10 @@ mod tests {
             assert_eq!(y, -(i as i64));
             assert_eq!(idx.0, i as u32);
         }
+    }
+
+    #[test]
+    fn slot_size_is_32_bytes() {
+        assert_eq!(std::mem::size_of::<Slot>(), 32);
     }
 }

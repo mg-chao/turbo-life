@@ -259,13 +259,16 @@ pub fn compute_population(buf: &[u64; TILE_SIZE]) -> u32 {
 }
 
 /// Recompute border data from a cell buffer.
+/// Also returns whether the buffer has any live cells (fused into the same loop).
 #[inline]
-pub fn recompute_border(buf: &[u64; TILE_SIZE]) -> BorderData {
+pub fn recompute_border_and_has_live(buf: &[u64; TILE_SIZE]) -> (BorderData, bool) {
     let mut west = 0u64;
     let mut east = 0u64;
+    let mut any_live = 0u64;
     for (row_index, &row) in buf.iter().enumerate() {
         west |= (row & 1) << row_index;
         east |= ((row >> 63) & 1) << row_index;
+        any_live |= row;
     }
     let mut corners = 0u8;
     if (buf[63] & 1) != 0 {
@@ -280,13 +283,23 @@ pub fn recompute_border(buf: &[u64; TILE_SIZE]) -> BorderData {
     if ((buf[0] >> 63) & 1) != 0 {
         corners |= BorderData::CORNER_SE;
     }
-    BorderData {
-        north: buf[63],
-        south: buf[0],
-        west,
-        east,
-        corners,
-    }
+    (
+        BorderData {
+            north: buf[63],
+            south: buf[0],
+            west,
+            east,
+            corners,
+        },
+        any_live != 0,
+    )
+}
+
+/// Recompute border data from a cell buffer.
+#[inline]
+#[allow(dead_code)]
+pub fn recompute_border(buf: &[u64; TILE_SIZE]) -> BorderData {
+    recompute_border_and_has_live(buf).0
 }
 
 /// Set a cell in a buffer.
