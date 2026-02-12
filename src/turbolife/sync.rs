@@ -13,24 +13,27 @@ fn sentinel_or(raw: u32) -> usize {
     if raw == NO_NEIGHBOR { SENTINEL_IDX } else { raw as usize }
 }
 
-/// Gather the ghost zone for a single tile — branchless via sentinel slot.
+/// Gather the ghost zone for a single tile using raw pointers.
+///
+/// # Safety
+/// `borders_ptr` and `neighbors_ptr` must be valid for reads at `idx`
+/// and all mapped neighbor indices (or sentinel index 0).
 #[inline(always)]
-pub fn gather_ghost_zone(
-    idx: TileIdx,
-    borders: &[BorderData],
-    neighbors: &[Neighbors],
+pub unsafe fn gather_ghost_zone_raw(
+    idx: usize,
+    borders_ptr: *const BorderData,
+    neighbors_ptr: *const Neighbors,
 ) -> GhostZone {
-    let nb = &neighbors[idx.index()];
     unsafe {
-        let b = borders.as_ptr();
-        let north = &*b.add(sentinel_or(nb[0]));
-        let south = &*b.add(sentinel_or(nb[1]));
-        let west  = &*b.add(sentinel_or(nb[2]));
-        let east  = &*b.add(sentinel_or(nb[3]));
-        let nw    = &*b.add(sentinel_or(nb[4]));
-        let ne    = &*b.add(sentinel_or(nb[5]));
-        let sw    = &*b.add(sentinel_or(nb[6]));
-        let se    = &*b.add(sentinel_or(nb[7]));
+        let nb = &*neighbors_ptr.add(idx);
+        let north = &*borders_ptr.add(sentinel_or(nb[0]));
+        let south = &*borders_ptr.add(sentinel_or(nb[1]));
+        let west  = &*borders_ptr.add(sentinel_or(nb[2]));
+        let east  = &*borders_ptr.add(sentinel_or(nb[3]));
+        let nw    = &*borders_ptr.add(sentinel_or(nb[4]));
+        let ne    = &*borders_ptr.add(sentinel_or(nb[5]));
+        let sw    = &*borders_ptr.add(sentinel_or(nb[6]));
+        let se    = &*borders_ptr.add(sentinel_or(nb[7]));
 
         GhostZone {
             north: north.south,
@@ -43,4 +46,14 @@ pub fn gather_ghost_zone(
             se: se.nw(),
         }
     }
+}
+
+/// Gather the ghost zone for a single tile — branchless via sentinel slot.
+#[inline(always)]
+pub fn gather_ghost_zone(
+    idx: TileIdx,
+    borders: &[BorderData],
+    neighbors: &[Neighbors],
+) -> GhostZone {
+    unsafe { gather_ghost_zone_raw(idx.index(), borders.as_ptr(), neighbors.as_ptr()) }
 }

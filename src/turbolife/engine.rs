@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use super::activity::{prune_and_expand, rebuild_active_set};
 use super::arena::TileArena;
 use super::kernel::{advance_core, advance_tile_split};
-use super::sync::gather_ghost_zone;
+use super::sync::{gather_ghost_zone, gather_ghost_zone_raw};
 use super::tile::{self, POPULATION_UNKNOWN};
 
 struct SendPtr<T> {
@@ -105,7 +105,12 @@ fn kernel_chunk_size(active_len: usize, threads: usize) -> usize {
     let multiplier = if threads >= 16 { 8 } else { 4 };
     let target_chunks = threads.saturating_mul(multiplier).max(1);
     let size = active_len.div_ceil(target_chunks);
-    size.clamp(KERNEL_CHUNK_MIN, KERNEL_CHUNK_MAX)
+    let chunk_max = if active_len >= 12_000 {
+        KERNEL_CHUNK_MAX * 2
+    } else {
+        KERNEL_CHUNK_MAX
+    };
+    size.clamp(KERNEL_CHUNK_MIN, chunk_max)
 }
 
 #[inline]
@@ -287,12 +292,13 @@ impl TurboLife {
 
                 *next_border = border;
                 meta.set_changed(changed);
-                meta.population = POPULATION_UNKNOWN;
-                meta.set_has_live(has_live);
-
-                if changed && !meta.in_changed_list() {
-                    meta.set_in_changed_list(true);
-                    self.arena.changed_list.push(idx);
+                if changed {
+                    meta.population = POPULATION_UNKNOWN;
+                    meta.set_has_live(has_live);
+                    if !meta.in_changed_list() {
+                        meta.set_in_changed_list(true);
+                        self.arena.changed_list.push(idx);
+                    }
                 }
             }
         } else {
@@ -301,85 +307,76 @@ impl TurboLife {
             let next_ptr = SendPtr::new(next_vec.as_mut_ptr());
             let meta_ptr = SendPtr::new(self.arena.meta.as_mut_ptr());
             let neighbors = &self.arena.neighbors;
+            let neighbors_ptr = SendConstPtr::new(neighbors.as_ptr());
             let next_borders_ptr = SendPtr::new(next_borders_vec.as_mut_ptr());
+            let borders_read_ptr = SendConstPtr::new(borders_read.as_ptr());
             let chunk_size = kernel_chunk_size(active_len, effective_threads);
 
-            let changed_tiles = active_set
-                .par_chunks(chunk_size)
-                .fold(Vec::new, {
-                    let current_ptr = current_ptr;
-                    let next_ptr = next_ptr;
-                    let meta_ptr = meta_ptr;
-                    let next_borders_ptr = next_borders_ptr;
-                    move |mut local_changed, chunk| {
-                        if local_changed.is_empty() {
-                            local_changed.reserve(chunk.len().max(16));
-                        }
-
-                        for (ci, &idx) in chunk.iter().enumerate() {
-                            if ci + PREFETCH_DISTANCE < chunk.len() {
-                                let pf_idx = chunk[ci + PREFETCH_DISTANCE];
-                                unsafe {
-                                    let cell_ptr =
-                                        current_ptr.get().add(pf_idx.index()) as *const i8;
-                                    let nb_ptr =
-                                        neighbors.as_ptr().add(pf_idx.index()) as *const i8;
-                                    let border_ptr =
-                                        borders_read.as_ptr().add(pf_idx.index()) as *const i8;
-                                    let next_cell_ptr =
-                                        next_ptr.get().add(pf_idx.index()) as *const i8;
-                                    let next_meta_ptr =
-                                        meta_ptr.get().add(pf_idx.index()) as *const i8;
-                                    let next_border_ptr =
-                                        next_borders_ptr.get().add(pf_idx.index()) as *const i8;
-                                    #[cfg(target_arch = "x86_64")]
-                                    {
-                                        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-                                        _mm_prefetch(cell_ptr, _MM_HINT_T0);
-                                        _mm_prefetch(cell_ptr.add(64), _MM_HINT_T0);
-                                        _mm_prefetch(cell_ptr.add(128), _MM_HINT_T0);
-                                        _mm_prefetch(cell_ptr.add(192), _MM_HINT_T0);
-                                        _mm_prefetch(nb_ptr, _MM_HINT_T0);
-                                        _mm_prefetch(border_ptr, _MM_HINT_T0);
-                                        _mm_prefetch(next_cell_ptr, _MM_HINT_T0);
-                                        _mm_prefetch(next_cell_ptr.add(64), _MM_HINT_T0);
-                                        _mm_prefetch(next_cell_ptr.add(128), _MM_HINT_T0);
-                                        _mm_prefetch(next_cell_ptr.add(192), _MM_HINT_T0);
-                                        _mm_prefetch(next_meta_ptr, _MM_HINT_T0);
-                                        _mm_prefetch(next_border_ptr, _MM_HINT_T0);
-                                    }
-                                }
-                            }
-
-                            let ghost = gather_ghost_zone(idx, borders_read, neighbors);
-
+            active_set.par_chunks(chunk_size).for_each({
+                let current_ptr = current_ptr;
+                let next_ptr = next_ptr;
+                let meta_ptr = meta_ptr;
+                let next_borders_ptr = next_borders_ptr;
+                let neighbors_ptr = neighbors_ptr;
+                let borders_read_ptr = borders_read_ptr;
+                move |chunk| {
+                    for (ci, &idx) in chunk.iter().enumerate() {
+                        if ci + PREFETCH_DISTANCE < chunk.len() {
+                            let pf_idx = chunk[ci + PREFETCH_DISTANCE];
                             unsafe {
-                                let tile_changed = advance_tile_split(
-                                    current_ptr.get(),
-                                    next_ptr.get(),
-                                    meta_ptr.get(),
-                                    next_borders_ptr.get(),
-                                    idx.index(),
-                                    &ghost,
-                                );
-
-                                if tile_changed {
-                                    local_changed.push(idx);
+                                let cell_ptr = current_ptr.get().add(pf_idx.index()) as *const i8;
+                                let nb_ptr = neighbors.as_ptr().add(pf_idx.index()) as *const i8;
+                                let border_ptr =
+                                    borders_read.as_ptr().add(pf_idx.index()) as *const i8;
+                                let next_cell_ptr = next_ptr.get().add(pf_idx.index()) as *const i8;
+                                let next_meta_ptr = meta_ptr.get().add(pf_idx.index()) as *const i8;
+                                let next_border_ptr =
+                                    next_borders_ptr.get().add(pf_idx.index()) as *const i8;
+                                #[cfg(target_arch = "x86_64")]
+                                {
+                                    use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                                    _mm_prefetch(cell_ptr, _MM_HINT_T0);
+                                    _mm_prefetch(cell_ptr.add(64), _MM_HINT_T0);
+                                    _mm_prefetch(cell_ptr.add(128), _MM_HINT_T0);
+                                    _mm_prefetch(cell_ptr.add(192), _MM_HINT_T0);
+                                    _mm_prefetch(nb_ptr, _MM_HINT_T0);
+                                    _mm_prefetch(border_ptr, _MM_HINT_T0);
+                                    _mm_prefetch(next_cell_ptr, _MM_HINT_T0);
+                                    _mm_prefetch(next_cell_ptr.add(64), _MM_HINT_T0);
+                                    _mm_prefetch(next_cell_ptr.add(128), _MM_HINT_T0);
+                                    _mm_prefetch(next_cell_ptr.add(192), _MM_HINT_T0);
+                                    _mm_prefetch(next_meta_ptr, _MM_HINT_T0);
+                                    _mm_prefetch(next_border_ptr, _MM_HINT_T0);
                                 }
                             }
                         }
 
-                        local_changed
-                    }
-                })
-                .reduce(Vec::new, |mut left, mut right| {
-                    left.append(&mut right);
-                    left
-                });
+                        let ghost = unsafe {
+                            gather_ghost_zone_raw(
+                                idx.index(),
+                                borders_read_ptr.get(),
+                                neighbors_ptr.get(),
+                            )
+                        };
 
-            for idx in changed_tiles {
+                        unsafe {
+                            let _tile_changed = advance_tile_split(
+                                current_ptr.get(),
+                                next_ptr.get(),
+                                meta_ptr.get(),
+                                next_borders_ptr.get(),
+                                idx.index(),
+                                &ghost,
+                            );
+                        }
+                    }
+                }
+            });
+
+            for i in 0..active_len {
+                let idx = active_set[i];
                 let meta = &mut self.arena.meta[idx.index()];
-                if !meta.in_changed_list() {
+                if meta.changed() && !meta.in_changed_list() {
                     meta.set_in_changed_list(true);
                     self.arena.changed_list.push(idx);
                 }

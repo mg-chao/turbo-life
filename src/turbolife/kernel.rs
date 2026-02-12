@@ -126,8 +126,10 @@ pub unsafe fn advance_tile_split(
     unsafe { *next_borders_ptr.add(idx) = border; }
 
     meta.set_changed(changed);
-    meta.population = POPULATION_UNKNOWN;
-    meta.set_has_live(has_live);
+    if changed {
+        meta.population = POPULATION_UNKNOWN;
+        meta.set_has_live(has_live);
+    }
 
     changed
 }
