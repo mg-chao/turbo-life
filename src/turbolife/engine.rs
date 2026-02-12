@@ -57,11 +57,11 @@ const PARALLEL_KERNEL_MIN_ACTIVE: usize = 128;
 const PARALLEL_KERNEL_TILES_PER_THREAD: usize = 16;
 const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
-const KERNEL_CHUNK_MAX: usize = 256;
 const ENV_OVERRIDE_THREADS: &str = "TURBOLIFE_NUM_THREADS";
 const ENV_MAX_THREADS: &str = "TURBOLIFE_MAX_THREADS";
 const ENV_KERNEL: &str = "TURBOLIFE_KERNEL";
 const PREFETCH_DISTANCE: usize = 5;
+const ENABLE_PREFETCH: bool = false;
 
 static TURBOLIFE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
@@ -209,19 +209,6 @@ where
             .expect("failed to build TurboLife rayon thread pool")
     });
     pool.install(f)
-}
-
-#[inline]
-fn kernel_chunk_size(active_len: usize, threads: usize) -> usize {
-    let multiplier = if threads >= 16 { 8 } else { 4 };
-    let target_chunks = threads.saturating_mul(multiplier).max(1);
-    let size = active_len.div_ceil(target_chunks);
-    let chunk_max = if active_len >= 12_000 {
-        KERNEL_CHUNK_MAX * 2
-    } else {
-        KERNEL_CHUNK_MAX
-    };
-    size.clamp(KERNEL_CHUNK_MIN, chunk_max)
 }
 
 #[inline]
@@ -428,10 +415,11 @@ impl TurboLife {
             let neighbors_ptr = SendConstPtr::new(neighbors.as_ptr());
             let next_borders_ptr = SendPtr::new(next_borders_vec.as_mut_ptr());
             let borders_read_ptr = SendConstPtr::new(borders_read.as_ptr());
-            let chunk_size = kernel_chunk_size(active_len, effective_threads);
+            let worker_count = effective_threads.min(active_len);
+            let block_size = active_len.div_ceil(worker_count);
 
-            let changed_tiles = active_set
-                .par_chunks(chunk_size)
+            let changed_tiles = (0..worker_count)
+                .into_par_iter()
                 .map({
                     let current_ptr = current_ptr;
                     let next_ptr = next_ptr;
@@ -440,10 +428,16 @@ impl TurboLife {
                     let neighbors_ptr = neighbors_ptr;
                     let borders_read_ptr = borders_read_ptr;
                     let backend = backend;
-                    move |chunk| {
+                    move |worker_idx| {
+                        let start = worker_idx * block_size;
+                        let end = ((worker_idx + 1) * block_size).min(active_len);
+                        if start >= end {
+                            return Vec::new();
+                        }
+                        let chunk = &active_set[start..end];
                         let mut changed_local = Vec::with_capacity(chunk.len() / 2 + 4);
                         for (ci, &idx) in chunk.iter().enumerate() {
-                            if ci + PREFETCH_DISTANCE < chunk.len() {
+                            if ENABLE_PREFETCH && ci + PREFETCH_DISTANCE < chunk.len() {
                                 let pf_idx = chunk[ci + PREFETCH_DISTANCE];
                                 unsafe {
                                     let cell_ptr =

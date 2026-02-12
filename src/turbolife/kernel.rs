@@ -51,6 +51,8 @@ pub fn advance_core_scalar(
     let mut has_live = false;
     let mut border_west = 0u64;
     let mut border_east = 0u64;
+    let ghost_w = ghost.west;
+    let ghost_e = ghost.east;
 
     for row in 0..TILE_SIZE {
         let row_above = if row == TILE_SIZE - 1 {
@@ -68,24 +70,24 @@ pub fn advance_core_scalar(
         let ghost_w_above = if row == TILE_SIZE - 1 {
             ghost.nw
         } else {
-            ghost_bit(ghost.west, row + 1)
+            ghost_bit(ghost_w, row + 1)
         };
         let ghost_e_above = if row == TILE_SIZE - 1 {
             ghost.ne
         } else {
-            ghost_bit(ghost.east, row + 1)
+            ghost_bit(ghost_e, row + 1)
         };
-        let ghost_w_self = ghost_bit(ghost.west, row);
-        let ghost_e_self = ghost_bit(ghost.east, row);
+        let ghost_w_self = ghost_bit(ghost_w, row);
+        let ghost_e_self = ghost_bit(ghost_e, row);
         let ghost_w_below = if row == 0 {
             ghost.sw
         } else {
-            ghost_bit(ghost.west, row - 1)
+            ghost_bit(ghost_w, row - 1)
         };
         let ghost_e_below = if row == 0 {
             ghost.se
         } else {
-            ghost_bit(ghost.east, row - 1)
+            ghost_bit(ghost_e, row - 1)
         };
 
         let nw = west_neighbor_plane(row_above, ghost_w_above);
@@ -143,16 +145,9 @@ pub fn advance_core_scalar(
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn avx2_set_u64x4(words: [u64; 4]) -> std::arch::x86_64::__m256i {
-    use std::arch::x86_64::_mm256_set_epi64x;
+    use std::arch::x86_64::{__m256i, _mm256_loadu_si256};
 
-    unsafe {
-        _mm256_set_epi64x(
-            words[3] as i64,
-            words[2] as i64,
-            words[1] as i64,
-            words[0] as i64,
-        )
-    }
+    unsafe { _mm256_loadu_si256(words.as_ptr() as *const __m256i) }
 }
 
 #[cfg(target_arch = "x86_64")]
