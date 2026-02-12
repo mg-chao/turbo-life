@@ -82,11 +82,29 @@ fn seed_board(engine: &mut TurboLife, size: i64, density: f64, seed: u64) {
     }
 }
 
+fn seed_board_bulk(engine: &mut TurboLife, size: i64, density: f64, seed: u64) {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let threshold = (u64::MAX as f64 * density) as u64;
+    let mut cells = Vec::new();
+    for y in 0..size {
+        for x in 0..size {
+            if rng.next_u64() <= threshold {
+                cells.push((x, y));
+            }
+        }
+    }
+    engine.set_cells_alive(cells);
+}
+
 fn main() {
     let cfg = parse_args();
 
     let mut engine = TurboLife::new();
-    seed_board(&mut engine, cfg.size, cfg.density, cfg.seed);
+    if std::env::var("TURBOLIFE_BENCH_SEED_BULK").ok().as_deref() == Some("1") {
+        seed_board_bulk(&mut engine, cfg.size, cfg.density, cfg.seed);
+    } else {
+        seed_board(&mut engine, cfg.size, cfg.density, cfg.seed);
+    }
 
     if cfg.warmup > 0 {
         engine.step_n(cfg.warmup);

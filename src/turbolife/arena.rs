@@ -14,6 +14,8 @@ use super::tile::{
 
 /// Index of the sentinel slot (always zeroed).
 pub const SENTINEL_IDX: usize = 0;
+const INITIAL_TILE_CAPACITY: usize = 256;
+const MIN_GROW_TILES: usize = 256;
 
 pub struct TileArena {
     /// Two cell buffers: `cell_bufs[phase]` = current (read), `cell_bufs[1-phase]` = next (write).
@@ -40,22 +42,41 @@ pub struct TileArena {
 
 impl TileArena {
     pub fn new() -> Self {
-        // Slot 0 is the sentinel — always zeroed, never used for real tiles.
+        // Slot 0 is the sentinel – always zeroed, never used for real tiles.
         let sentinel_cells = CellBuf::empty();
         let sentinel_meta = TileMeta::released();
         let sentinel_border = BorderData::default();
         let sentinel_neighbors = EMPTY_NEIGHBORS;
         let sentinel_coord = (i64::MIN, i64::MIN);
 
+        let mut cell_bufs0 = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
+        let mut cell_bufs1 = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
+        let mut meta = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
+        let mut neighbors = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
+        let mut coords = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
+        let mut borders0 = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
+        let mut borders1 = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
+
+        cell_bufs0.push(sentinel_cells.clone());
+        cell_bufs1.push(sentinel_cells);
+        meta.push(sentinel_meta);
+        neighbors.push(sentinel_neighbors);
+        coords.push(sentinel_coord);
+        borders0.push(sentinel_border);
+        borders1.push(sentinel_border);
+
         Self {
-            cell_bufs: [vec![sentinel_cells.clone()], vec![sentinel_cells]],
+            cell_bufs: [cell_bufs0, cell_bufs1],
             cell_phase: 0,
-            meta: vec![sentinel_meta],
-            neighbors: vec![sentinel_neighbors],
-            coords: vec![sentinel_coord],
-            borders: [vec![sentinel_border], vec![sentinel_border]],
+            meta,
+            neighbors,
+            coords,
+            borders: [borders0, borders1],
             border_phase: 0,
-            coord_to_idx: FxHashMap::default(),
+            coord_to_idx: FxHashMap::with_capacity_and_hasher(
+                INITIAL_TILE_CAPACITY,
+                Default::default(),
+            ),
             free_list: Vec::new(),
             changed_list: Vec::new(),
             occupied_count: 0,
@@ -136,12 +157,34 @@ impl TileArena {
         }
     }
 
-    pub fn allocate(&mut self, coord: (i64, i64)) -> TileIdx {
-        if let Some(existing) = self.idx_at(coord) {
-            return existing;
+    #[inline]
+    fn reserve_additional_tiles(&mut self, additional: usize) {
+        if additional == 0 {
+            return;
         }
+        self.cell_bufs[0].reserve(additional);
+        self.cell_bufs[1].reserve(additional);
+        self.meta.reserve(additional);
+        self.neighbors.reserve(additional);
+        self.coords.reserve(additional);
+        self.borders[0].reserve(additional);
+        self.borders[1].reserve(additional);
+        self.coord_to_idx.reserve(additional);
+    }
 
-        let idx = if let Some(recycled) = self.free_list.pop() {
+    #[inline]
+    fn ensure_growth_capacity(&mut self) {
+        let len = self.cell_bufs[0].len();
+        if len < self.cell_bufs[0].capacity() {
+            return;
+        }
+        let grow_by = (len / 2).max(MIN_GROW_TILES);
+        self.reserve_additional_tiles(grow_by);
+    }
+
+    #[inline]
+    fn allocate_slot(&mut self, coord: (i64, i64)) -> TileIdx {
+        if let Some(recycled) = self.free_list.pop() {
             let i = recycled.index();
             self.cell_bufs[0][i] = CellBuf::empty();
             self.cell_bufs[1][i] = CellBuf::empty();
@@ -152,6 +195,7 @@ impl TileArena {
             self.borders[1][i] = BorderData::default();
             recycled
         } else {
+            self.ensure_growth_capacity();
             let idx = TileIdx(self.cell_bufs[0].len() as u32);
             self.cell_bufs[0].push(CellBuf::empty());
             self.cell_bufs[1].push(CellBuf::empty());
@@ -166,11 +210,11 @@ impl TileArena {
             // all neighbor entries for real tiles pointing to NO_NEIGHBOR
             // will be remapped to SENTINEL_IDX in the ghost gather.
             idx
-        };
+        }
+    }
 
-        self.coord_to_idx.insert(coord, idx);
-        self.occupied_count += 1;
-
+    #[inline]
+    fn link_neighbors(&mut self, idx: TileIdx, coord: (i64, i64)) {
         for dir in Direction::ALL {
             let (dx, dy) = dir.offset();
             let neighbor_coord = (coord.0 + dx, coord.1 + dy);
@@ -179,8 +223,26 @@ impl TileArena {
                 self.neighbors[neighbor_idx.index()][dir.reverse().index()] = idx.0;
             }
         }
+    }
 
+    #[inline]
+    pub(crate) fn allocate_absent(&mut self, coord: (i64, i64)) -> TileIdx {
+        debug_assert!(self.coord_to_idx.get(&coord).is_none());
+        let idx = self.allocate_slot(coord);
+        self.coord_to_idx.insert(coord, idx);
+        self.occupied_count += 1;
+
+        self.link_neighbors(idx, coord);
         idx
+    }
+
+    #[allow(dead_code)]
+    pub fn allocate(&mut self, coord: (i64, i64)) -> TileIdx {
+        if let Some(existing) = self.idx_at(coord) {
+            return existing;
+        }
+
+        self.allocate_absent(coord)
     }
 
     pub fn release(&mut self, idx: TileIdx) {
@@ -215,7 +277,7 @@ impl TileArena {
         if self.idx_at(coord).is_some() {
             return;
         }
-        let idx = self.allocate(coord);
+        let idx = self.allocate_absent(coord);
         let m = &mut self.meta[idx.index()];
         m.population = 0;
         m.set_has_live(false);

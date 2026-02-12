@@ -270,7 +270,7 @@ pub fn prune_and_expand(arena: &mut TileArena) {
         if arena.idx_at(coord).is_some() {
             continue;
         }
-        let idx = arena.allocate(coord);
+        let idx = arena.allocate_absent(coord);
         arena.meta[idx.index()].set_changed(true);
         arena.meta[idx.index()].active_epoch = 0;
         arena.meta[idx.index()].population = 0;

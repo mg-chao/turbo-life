@@ -1,4 +1,5 @@
 use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -302,11 +303,11 @@ impl TurboLife {
         let local_x = x.rem_euclid(TILE_SIZE_I64) as usize;
         let local_y = y.rem_euclid(TILE_SIZE_I64) as usize;
 
-        if !alive && self.arena.idx_at(tile_coord).is_none() {
-            return;
-        }
-
-        let idx = self.arena.allocate(tile_coord);
+        let idx = match self.arena.idx_at(tile_coord) {
+            Some(existing) => existing,
+            None if alive => self.arena.allocate_absent(tile_coord),
+            None => return,
+        };
 
         let buf = self.arena.current_buf_mut(idx);
         tile::set_local_cell(buf, local_x, local_y, alive);
@@ -354,6 +355,113 @@ impl TurboLife {
                 self.arena.ensure_neighbor(tx + 1, ty - 1);
             }
         }
+    }
+
+    /// Batch-update many cells, amortizing per-tile metadata recompute.
+    pub fn set_cells<I>(&mut self, cells: I)
+    where
+        I: IntoIterator<Item = (i64, i64, bool)>,
+    {
+        let mut touched_tiles = Vec::new();
+        let mut touched_set = FxHashSet::default();
+
+        for (x, y, alive) in cells {
+            let tile_coord = (x.div_euclid(TILE_SIZE_I64), y.div_euclid(TILE_SIZE_I64));
+            let local_x = x.rem_euclid(TILE_SIZE_I64) as usize;
+            let local_y = y.rem_euclid(TILE_SIZE_I64) as usize;
+
+            let idx = match self.arena.idx_at(tile_coord) {
+                Some(existing) => existing,
+                None if alive => self.arena.allocate_absent(tile_coord),
+                None => continue,
+            };
+
+            let changed = {
+                let buf = self.arena.current_buf_mut(idx);
+                let mask = 1u64 << local_x;
+                let row = &mut buf[local_y];
+                let was_alive = (*row & mask) != 0;
+                if was_alive == alive {
+                    false
+                } else {
+                    if alive {
+                        *row |= mask;
+                    } else {
+                        *row &= !mask;
+                    }
+                    true
+                }
+            };
+
+            if !changed {
+                continue;
+            }
+
+            if touched_set.insert(idx) {
+                touched_tiles.push(idx);
+                self.arena.mark_changed(idx);
+            }
+
+            if alive {
+                let (tx, ty) = tile_coord;
+                let on_south = local_y == 0;
+                let on_north = local_y == 63;
+                let on_west = local_x == 0;
+                let on_east = local_x == 63;
+
+                if on_north {
+                    self.arena.ensure_neighbor(tx, ty + 1);
+                }
+                if on_south {
+                    self.arena.ensure_neighbor(tx, ty - 1);
+                }
+                if on_west {
+                    self.arena.ensure_neighbor(tx - 1, ty);
+                }
+                if on_east {
+                    self.arena.ensure_neighbor(tx + 1, ty);
+                }
+                if on_north && on_west {
+                    self.arena.ensure_neighbor(tx - 1, ty + 1);
+                }
+                if on_north && on_east {
+                    self.arena.ensure_neighbor(tx + 1, ty + 1);
+                }
+                if on_south && on_west {
+                    self.arena.ensure_neighbor(tx - 1, ty - 1);
+                }
+                if on_south && on_east {
+                    self.arena.ensure_neighbor(tx + 1, ty - 1);
+                }
+            }
+        }
+
+        if touched_tiles.is_empty() {
+            return;
+        }
+
+        for idx in touched_tiles {
+            let buf = self.arena.current_buf(idx);
+            let border = tile::recompute_border(buf);
+            let has_live = buf.iter().any(|&row| row != 0);
+
+            *self.arena.border_mut(idx) = border;
+            {
+                let meta = self.arena.meta_mut(idx);
+                meta.population = POPULATION_UNKNOWN;
+                meta.set_has_live(has_live);
+            }
+        }
+
+        self.population_cache = None;
+    }
+
+    /// Batch-set many live cells.
+    pub fn set_cells_alive<I>(&mut self, cells: I)
+    where
+        I: IntoIterator<Item = (i64, i64)>,
+    {
+        self.set_cells(cells.into_iter().map(|(x, y)| (x, y, true)));
     }
 
     pub fn get_cell(&self, x: i64, y: i64) -> bool {
