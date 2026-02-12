@@ -106,8 +106,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
             arena.active_set.push(idx);
         }
         let nb = &arena.neighbors[i];
-        for dir_idx in 0..8 {
-            let ni_raw = nb[dir_idx];
+        for &ni_raw in nb.iter().take(8) {
             if ni_raw != NO_NEIGHBOR {
                 let ni_i = ni_raw as usize;
                 if arena.meta[ni_i].occupied() && arena.meta[ni_i].active_epoch != epoch {
@@ -122,8 +121,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
 #[inline]
 fn neighbor_has_changed(neighbors: &[[u32; 8]], meta: &[TileMeta], idx: TileIdx) -> bool {
     let nb = &neighbors[idx.index()];
-    for dir_idx in 0..8 {
-        let ni_raw = nb[dir_idx];
+    for &ni_raw in nb.iter().take(8) {
         if ni_raw != NO_NEIGHBOR && meta[ni_raw as usize].changed() {
             return true;
         }

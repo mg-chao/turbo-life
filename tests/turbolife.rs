@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
-use turbo_life::turbolife::TurboLife;
 use rand::Rng;
 use rand::SeedableRng;
+use turbo_life::turbolife::TurboLife;
 
 fn set_cells(engine: &mut TurboLife, cells: &[(i64, i64)]) {
     for &(x, y) in cells {

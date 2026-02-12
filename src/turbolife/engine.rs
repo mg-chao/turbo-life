@@ -60,8 +60,6 @@ const KERNEL_CHUNK_MIN: usize = 32;
 const ENV_OVERRIDE_THREADS: &str = "TURBOLIFE_NUM_THREADS";
 const ENV_MAX_THREADS: &str = "TURBOLIFE_MAX_THREADS";
 const ENV_KERNEL: &str = "TURBOLIFE_KERNEL";
-const PREFETCH_DISTANCE: usize = 5;
-const ENABLE_PREFETCH: bool = false;
 
 static TURBOLIFE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
@@ -79,19 +77,19 @@ fn parse_kernel_backend(raw: &str) -> Option<KernelBackend> {
 
 #[inline]
 fn detect_kernel_backend() -> KernelBackend {
-    if let Ok(raw) = std::env::var(ENV_KERNEL) {
-        if let Some(forced) = parse_kernel_backend(&raw) {
-            if forced == KernelBackend::Avx2 {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    if std::is_x86_feature_detected!("avx2") {
-                        return KernelBackend::Avx2;
-                    }
+    if let Ok(raw) = std::env::var(ENV_KERNEL)
+        && let Some(forced) = parse_kernel_backend(&raw)
+    {
+        if forced == KernelBackend::Avx2 {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avx2") {
+                    return KernelBackend::Avx2;
                 }
-                return KernelBackend::Scalar;
             }
-            return forced;
+            return KernelBackend::Scalar;
         }
+        return forced;
     }
 
     calibrate_auto_backend()
@@ -411,91 +409,41 @@ impl TurboLife {
             let current_ptr = SendConstPtr::new(current_vec.as_ptr());
             let next_ptr = SendPtr::new(next_vec.as_mut_ptr());
             let meta_ptr = SendPtr::new(self.arena.meta.as_mut_ptr());
-            let neighbors = &self.arena.neighbors;
-            let neighbors_ptr = SendConstPtr::new(neighbors.as_ptr());
+            let neighbors_ptr = SendConstPtr::new(self.arena.neighbors.as_ptr());
             let next_borders_ptr = SendPtr::new(next_borders_vec.as_mut_ptr());
             let borders_read_ptr = SendConstPtr::new(borders_read.as_ptr());
             let worker_count = effective_threads.min(active_len);
-            let block_size = active_len.div_ceil(worker_count);
+            let chunk_size = active_len.div_ceil(worker_count);
 
-            let changed_tiles = (0..worker_count)
-                .into_par_iter()
-                .map({
-                    let current_ptr = current_ptr;
-                    let next_ptr = next_ptr;
-                    let meta_ptr = meta_ptr;
-                    let next_borders_ptr = next_borders_ptr;
-                    let neighbors_ptr = neighbors_ptr;
-                    let borders_read_ptr = borders_read_ptr;
-                    let backend = backend;
-                    move |worker_idx| {
-                        let start = worker_idx * block_size;
-                        let end = ((worker_idx + 1) * block_size).min(active_len);
-                        if start >= end {
-                            return Vec::new();
-                        }
-                        let chunk = &active_set[start..end];
-                        let mut changed_local = Vec::with_capacity(chunk.len() / 2 + 4);
-                        for (ci, &idx) in chunk.iter().enumerate() {
-                            if ENABLE_PREFETCH && ci + PREFETCH_DISTANCE < chunk.len() {
-                                let pf_idx = chunk[ci + PREFETCH_DISTANCE];
-                                unsafe {
-                                    let cell_ptr =
-                                        current_ptr.get().add(pf_idx.index()) as *const i8;
-                                    let nb_ptr =
-                                        neighbors.as_ptr().add(pf_idx.index()) as *const i8;
-                                    let border_ptr =
-                                        borders_read.as_ptr().add(pf_idx.index()) as *const i8;
-                                    let next_cell_ptr =
-                                        next_ptr.get().add(pf_idx.index()) as *const i8;
-                                    let next_meta_ptr =
-                                        meta_ptr.get().add(pf_idx.index()) as *const i8;
-                                    let next_border_ptr =
-                                        next_borders_ptr.get().add(pf_idx.index()) as *const i8;
-                                    #[cfg(target_arch = "x86_64")]
-                                    {
-                                        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-                                        _mm_prefetch(cell_ptr, _MM_HINT_T0);
-                                        _mm_prefetch(cell_ptr.add(64), _MM_HINT_T0);
-                                        _mm_prefetch(cell_ptr.add(128), _MM_HINT_T0);
-                                        _mm_prefetch(cell_ptr.add(192), _MM_HINT_T0);
-                                        _mm_prefetch(nb_ptr, _MM_HINT_T0);
-                                        _mm_prefetch(border_ptr, _MM_HINT_T0);
-                                        _mm_prefetch(next_cell_ptr, _MM_HINT_T0);
-                                        _mm_prefetch(next_cell_ptr.add(64), _MM_HINT_T0);
-                                        _mm_prefetch(next_cell_ptr.add(128), _MM_HINT_T0);
-                                        _mm_prefetch(next_cell_ptr.add(192), _MM_HINT_T0);
-                                        _mm_prefetch(next_meta_ptr, _MM_HINT_T0);
-                                        _mm_prefetch(next_border_ptr, _MM_HINT_T0);
-                                    }
-                                }
-                            }
+            let changed_tiles = active_set
+                .par_chunks(chunk_size)
+                .map(move |chunk| {
+                    let mut changed_local = Vec::with_capacity(chunk.len() / 2 + 4);
+                    for &idx in chunk {
+                        let ghost = unsafe {
+                            gather_ghost_zone_raw(
+                                idx.index(),
+                                borders_read_ptr.get(),
+                                neighbors_ptr.get(),
+                            )
+                        };
 
-                            let ghost = unsafe {
-                                gather_ghost_zone_raw(
-                                    idx.index(),
-                                    borders_read_ptr.get(),
-                                    neighbors_ptr.get(),
-                                )
-                            };
-
-                            unsafe {
-                                let tile_changed = advance_tile_split(
-                                    current_ptr.get(),
-                                    next_ptr.get(),
-                                    meta_ptr.get(),
-                                    next_borders_ptr.get(),
-                                    idx.index(),
-                                    &ghost,
-                                    backend,
-                                );
-                                if tile_changed {
-                                    changed_local.push(idx);
-                                }
+                        unsafe {
+                            let tile_changed = advance_tile_split(
+                                current_ptr.get(),
+                                next_ptr.get(),
+                                meta_ptr.get(),
+                                next_borders_ptr.get(),
+                                idx.index(),
+                                &ghost,
+                                backend,
+                            );
+                            if tile_changed {
+                                changed_local.push(idx);
                             }
                         }
-                        changed_local
                     }
+                    changed_local
                 })
                 .reduce(Vec::new, |mut left, mut right| {
                     left.append(&mut right);

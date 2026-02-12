@@ -1,8 +1,8 @@
-use turbo_life::quicklife::QuickLife;
-use turbo_life::turbolife::TurboLife;
 use rand::RngCore;
 use rand::SeedableRng;
 use std::time::Instant;
+use turbo_life::quicklife::QuickLife;
+use turbo_life::turbolife::TurboLife;
 
 fn main() {
     let mut quick = QuickLife::new();

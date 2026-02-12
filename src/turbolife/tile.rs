@@ -25,20 +25,24 @@ impl TileIdx {
 pub enum Direction {
     North = 0,
     South = 1,
-    West  = 2,
-    East  = 3,
-    NW    = 4,
-    NE    = 5,
-    SW    = 6,
-    SE    = 7,
+    West = 2,
+    East = 3,
+    NW = 4,
+    NE = 5,
+    SW = 6,
+    SE = 7,
 }
 
 impl Direction {
     pub const ALL: [Direction; 8] = [
-        Direction::North, Direction::South,
-        Direction::West,  Direction::East,
-        Direction::NW,    Direction::NE,
-        Direction::SW,    Direction::SE,
+        Direction::North,
+        Direction::South,
+        Direction::West,
+        Direction::East,
+        Direction::NW,
+        Direction::NE,
+        Direction::SW,
+        Direction::SE,
     ];
 
     #[inline(always)]
@@ -46,12 +50,12 @@ impl Direction {
         match self {
             Direction::North => (0, 1),
             Direction::South => (0, -1),
-            Direction::West  => (-1, 0),
-            Direction::East  => (1, 0),
-            Direction::NW    => (-1, 1),
-            Direction::NE    => (1, 1),
-            Direction::SW    => (-1, -1),
-            Direction::SE    => (1, -1),
+            Direction::West => (-1, 0),
+            Direction::East => (1, 0),
+            Direction::NW => (-1, 1),
+            Direction::NE => (1, 1),
+            Direction::SW => (-1, -1),
+            Direction::SE => (1, -1),
         }
     }
 
@@ -60,12 +64,12 @@ impl Direction {
         match self {
             Direction::North => Direction::South,
             Direction::South => Direction::North,
-            Direction::West  => Direction::East,
-            Direction::East  => Direction::West,
-            Direction::NW    => Direction::SE,
-            Direction::NE    => Direction::SW,
-            Direction::SW    => Direction::NE,
-            Direction::SE    => Direction::NW,
+            Direction::West => Direction::East,
+            Direction::East => Direction::West,
+            Direction::NW => Direction::SE,
+            Direction::NE => Direction::SW,
+            Direction::SW => Direction::NE,
+            Direction::SE => Direction::NW,
         }
     }
 
@@ -96,7 +100,13 @@ pub struct BorderData {
 impl Default for BorderData {
     #[inline(always)]
     fn default() -> Self {
-        Self { north: 0, south: 0, west: 0, east: 0, corners: 0 }
+        Self {
+            north: 0,
+            south: 0,
+            west: 0,
+            east: 0,
+            corners: 0,
+        }
     }
 }
 
@@ -106,10 +116,22 @@ impl BorderData {
     pub const CORNER_SW: u8 = 1 << 2;
     pub const CORNER_SE: u8 = 1 << 3;
 
-    #[inline(always)] pub fn nw(self) -> bool { self.corners & Self::CORNER_NW != 0 }
-    #[inline(always)] pub fn ne(self) -> bool { self.corners & Self::CORNER_NE != 0 }
-    #[inline(always)] pub fn sw(self) -> bool { self.corners & Self::CORNER_SW != 0 }
-    #[inline(always)] pub fn se(self) -> bool { self.corners & Self::CORNER_SE != 0 }
+    #[inline(always)]
+    pub fn nw(self) -> bool {
+        self.corners & Self::CORNER_NW != 0
+    }
+    #[inline(always)]
+    pub fn ne(self) -> bool {
+        self.corners & Self::CORNER_NE != 0
+    }
+    #[inline(always)]
+    pub fn sw(self) -> bool {
+        self.corners & Self::CORNER_SW != 0
+    }
+    #[inline(always)]
+    pub fn se(self) -> bool {
+        self.corners & Self::CORNER_SE != 0
+    }
 }
 
 /// One-cell halo gathered from 8 neighbors before compute.
@@ -127,10 +149,10 @@ pub struct GhostZone {
 
 // ── TileMeta with packed flags ──────────────────────────────────────────
 
-const FLAG_CHANGED: u8         = 1 << 0;
-const FLAG_OCCUPIED: u8        = 1 << 1;
+const FLAG_CHANGED: u8 = 1 << 0;
+const FLAG_OCCUPIED: u8 = 1 << 1;
 const FLAG_IN_CHANGED_LIST: u8 = 1 << 2;
-const FLAG_HAS_LIVE: u8        = 1 << 3;
+const FLAG_HAS_LIVE: u8 = 1 << 3;
 
 /// Per-tile metadata with flags packed into a single byte.
 #[derive(Clone, Copy, Debug)]
@@ -142,15 +164,56 @@ pub struct TileMeta {
 }
 
 impl TileMeta {
-    #[inline(always)] pub fn changed(self) -> bool { self.flags & FLAG_CHANGED != 0 }
-    #[inline(always)] pub fn occupied(self) -> bool { self.flags & FLAG_OCCUPIED != 0 }
-    #[inline(always)] pub fn in_changed_list(self) -> bool { self.flags & FLAG_IN_CHANGED_LIST != 0 }
-    #[inline(always)] pub fn has_live(self) -> bool { self.flags & FLAG_HAS_LIVE != 0 }
+    #[inline(always)]
+    pub fn changed(self) -> bool {
+        self.flags & FLAG_CHANGED != 0
+    }
+    #[inline(always)]
+    pub fn occupied(self) -> bool {
+        self.flags & FLAG_OCCUPIED != 0
+    }
+    #[inline(always)]
+    pub fn in_changed_list(self) -> bool {
+        self.flags & FLAG_IN_CHANGED_LIST != 0
+    }
+    #[inline(always)]
+    pub fn has_live(self) -> bool {
+        self.flags & FLAG_HAS_LIVE != 0
+    }
 
-    #[inline(always)] pub fn set_changed(&mut self, v: bool) { if v { self.flags |= FLAG_CHANGED } else { self.flags &= !FLAG_CHANGED } }
-    #[inline(always)] #[allow(dead_code)] pub fn set_occupied(&mut self, v: bool) { if v { self.flags |= FLAG_OCCUPIED } else { self.flags &= !FLAG_OCCUPIED } }
-    #[inline(always)] pub fn set_in_changed_list(&mut self, v: bool) { if v { self.flags |= FLAG_IN_CHANGED_LIST } else { self.flags &= !FLAG_IN_CHANGED_LIST } }
-    #[inline(always)] pub fn set_has_live(&mut self, v: bool) { if v { self.flags |= FLAG_HAS_LIVE } else { self.flags &= !FLAG_HAS_LIVE } }
+    #[inline(always)]
+    pub fn set_changed(&mut self, v: bool) {
+        if v {
+            self.flags |= FLAG_CHANGED
+        } else {
+            self.flags &= !FLAG_CHANGED
+        }
+    }
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn set_occupied(&mut self, v: bool) {
+        if v {
+            self.flags |= FLAG_OCCUPIED
+        } else {
+            self.flags &= !FLAG_OCCUPIED
+        }
+    }
+    #[inline(always)]
+    pub fn set_in_changed_list(&mut self, v: bool) {
+        if v {
+            self.flags |= FLAG_IN_CHANGED_LIST
+        } else {
+            self.flags &= !FLAG_IN_CHANGED_LIST
+        }
+    }
+    #[inline(always)]
+    pub fn set_has_live(&mut self, v: bool) {
+        if v {
+            self.flags |= FLAG_HAS_LIVE
+        } else {
+            self.flags &= !FLAG_HAS_LIVE
+        }
+    }
 
     pub fn empty() -> Self {
         Self {
@@ -178,11 +241,15 @@ pub struct CellBuf(pub [u64; TILE_SIZE]);
 
 impl CellBuf {
     #[inline(always)]
-    pub const fn empty() -> Self { Self([0u64; TILE_SIZE]) }
+    pub const fn empty() -> Self {
+        Self([0u64; TILE_SIZE])
+    }
 }
 
 impl Default for CellBuf {
-    fn default() -> Self { Self::empty() }
+    fn default() -> Self {
+        Self::empty()
+    }
 }
 
 /// Compute population of a cell buffer.
@@ -201,10 +268,18 @@ pub fn recompute_border(buf: &[u64; TILE_SIZE]) -> BorderData {
         east |= ((row >> 63) & 1) << row_index;
     }
     let mut corners = 0u8;
-    if (buf[63] & 1) != 0 { corners |= BorderData::CORNER_NW; }
-    if ((buf[63] >> 63) & 1) != 0 { corners |= BorderData::CORNER_NE; }
-    if (buf[0] & 1) != 0 { corners |= BorderData::CORNER_SW; }
-    if ((buf[0] >> 63) & 1) != 0 { corners |= BorderData::CORNER_SE; }
+    if (buf[63] & 1) != 0 {
+        corners |= BorderData::CORNER_NW;
+    }
+    if ((buf[63] >> 63) & 1) != 0 {
+        corners |= BorderData::CORNER_NE;
+    }
+    if (buf[0] & 1) != 0 {
+        corners |= BorderData::CORNER_SW;
+    }
+    if ((buf[0] >> 63) & 1) != 0 {
+        corners |= BorderData::CORNER_SE;
+    }
     BorderData {
         north: buf[63],
         south: buf[0],

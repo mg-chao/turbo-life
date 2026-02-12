@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
-use turbo_life::quicklife::QuickLife;
-use turbo_life::turbolife::TurboLife;
 use rand::RngCore;
 use rand::SeedableRng;
+use turbo_life::quicklife::QuickLife;
+use turbo_life::turbolife::TurboLife;
 
 fn collect_quick(engine: &QuickLife) -> HashSet<(i32, i32)> {
     let mut out = HashSet::new();
