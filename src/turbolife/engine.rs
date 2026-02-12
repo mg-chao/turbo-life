@@ -57,39 +57,11 @@ const PARALLEL_KERNEL_MIN_ACTIVE: usize = 128;
 const PARALLEL_KERNEL_TILES_PER_THREAD: usize = 16;
 const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
-const ENV_OVERRIDE_THREADS: &str = "TURBOLIFE_NUM_THREADS";
-const ENV_MAX_THREADS: &str = "TURBOLIFE_MAX_THREADS";
-const ENV_KERNEL: &str = "TURBOLIFE_KERNEL";
 
 static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
 
 #[inline]
-fn parse_kernel_backend(raw: &str) -> Option<KernelBackend> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "scalar" => Some(KernelBackend::Scalar),
-        "avx2" => Some(KernelBackend::Avx2),
-        "auto" => None,
-        _ => None,
-    }
-}
-
-#[inline]
 fn detect_kernel_backend() -> KernelBackend {
-    if let Ok(raw) = std::env::var(ENV_KERNEL)
-        && let Some(forced) = parse_kernel_backend(&raw)
-    {
-        if forced == KernelBackend::Avx2 {
-            #[cfg(target_arch = "x86_64")]
-            {
-                if std::is_x86_feature_detected!("avx2") {
-                    return KernelBackend::Avx2;
-                }
-            }
-            return KernelBackend::Scalar;
-        }
-        return forced;
-    }
-
     calibrate_auto_backend()
 }
 
@@ -167,13 +139,6 @@ fn calibrate_auto_backend() -> KernelBackend {
 }
 
 #[inline]
-fn parse_positive_env(var: &str) -> Option<usize> {
-    let raw = std::env::var(var).ok()?;
-    let parsed = raw.trim().parse::<usize>().ok()?;
-    (parsed > 0).then_some(parsed)
-}
-
-#[inline]
 fn physical_core_count() -> usize {
     *PHYSICAL_CORES.get_or_init(|| num_cpus::get_physical().max(1))
 }
@@ -225,23 +190,18 @@ fn tuned_parallel_threads(active_len: usize, thread_count: usize) -> usize {
     effective.max(1)
 }
 
-/// Resolve the thread count from a config, falling back to env vars / auto-detect.
+/// Resolve the thread count from a config, falling back to auto-detect.
 fn resolve_thread_count(config: &TurboLifeConfig) -> usize {
     let mut threads = config
         .thread_count
-        .or_else(|| parse_positive_env(ENV_OVERRIDE_THREADS))
-        .or_else(|| parse_positive_env("RAYON_NUM_THREADS"))
         .unwrap_or_else(|| memory_parallel_cap(physical_core_count()));
-    let max = config
-        .max_threads
-        .or_else(|| parse_positive_env(ENV_MAX_THREADS));
-    if let Some(cap) = max {
+    if let Some(cap) = config.max_threads {
         threads = threads.min(cap);
     }
     threads.max(1)
 }
 
-/// Resolve the kernel backend from a config, falling back to env var / auto-calibrate.
+/// Resolve the kernel backend from a config, falling back to auto-calibrate.
 fn resolve_kernel_backend(config: &TurboLifeConfig) -> KernelBackend {
     if let Some(backend) = config.kernel {
         // Validate AVX2 availability at runtime.
