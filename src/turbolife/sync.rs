@@ -57,6 +57,7 @@ pub unsafe fn gather_ghost_zone_raw(
 
 /// Gather the ghost zone for a single tile — branchless via sentinel slot.
 #[inline(always)]
+#[allow(dead_code)]
 pub fn gather_ghost_zone(
     idx: TileIdx,
     borders: &[BorderData],

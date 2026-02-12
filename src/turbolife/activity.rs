@@ -59,7 +59,9 @@ fn tuned_prune_threads(active_len: usize, thread_count: usize) -> usize {
 }
 
 /// Rebuild the active set from the changed list in O(changed * 9).
-/// Uses parallel candidate gathering when the changed list is large enough.
+///
+/// Uses unsafe raw pointer access to meta/neighbors for the hot inner loop
+/// to eliminate bounds checks on every neighbor lookup.
 pub fn rebuild_active_set(arena: &mut TileArena) {
     arena.active_epoch = arena.active_epoch.wrapping_add(1);
     if arena.active_epoch == 0 {
@@ -72,11 +74,11 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
 
     arena.active_set.clear();
     arena.changed_scratch.clear();
-    arena.changed_scratch.extend_from_slice(&arena.changed_list);
-    for &idx in &arena.changed_list {
+    // Swap instead of copy to avoid O(n) memcpy.
+    std::mem::swap(&mut arena.changed_scratch, &mut arena.changed_list);
+    for &idx in &arena.changed_scratch {
         arena.meta[idx.index()].set_in_changed_list(false);
     }
-    arena.changed_list.clear();
 
     let changed_count = arena.changed_scratch.len();
     if changed_count == 0 {
@@ -96,29 +98,49 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         return;
     }
 
-    // The epoch-stamping must be serial (it's a dedup mechanism), but we can
-    // at least avoid branch mispredictions by pre-reserving.
+    // Hot loop: epoch-stamp changed tiles + their 8 neighbors.
+    // Use raw pointers to eliminate bounds checks on every neighbor access.
     arena.active_set.reserve(changed_count * 4);
+    let meta_ptr = arena.meta.as_mut_ptr();
+    let neighbors_ptr = arena.neighbors.as_ptr();
+    let meta_len = arena.meta.len();
+
     for &idx in &arena.changed_scratch {
         let i = idx.index();
-        if arena.meta[i].occupied() && arena.meta[i].active_epoch != epoch {
-            arena.meta[i].active_epoch = epoch;
-            arena.active_set.push(idx);
-        }
-        let nb = &arena.neighbors[i];
-        for &ni_raw in nb.iter().take(8) {
-            if ni_raw != NO_NEIGHBOR {
-                let ni_i = ni_raw as usize;
-                if arena.meta[ni_i].occupied() && arena.meta[ni_i].active_epoch != epoch {
-                    arena.meta[ni_i].active_epoch = epoch;
-                    arena.active_set.push(TileIdx(ni_raw));
+        debug_assert!(i < meta_len);
+        // SAFETY: i < meta_len guaranteed by arena invariants (idx came from changed_list).
+        unsafe {
+            let m = &mut *meta_ptr.add(i);
+            if m.occupied() && m.active_epoch != epoch {
+                m.active_epoch = epoch;
+                arena.active_set.push(idx);
+            }
+            let nb = &*neighbors_ptr.add(i);
+            for &ni_raw in nb.iter() {
+                if ni_raw != NO_NEIGHBOR {
+                    let ni_i = ni_raw as usize;
+                    debug_assert!(ni_i < meta_len);
+                    let nm = &mut *meta_ptr.add(ni_i);
+                    if nm.occupied() && nm.active_epoch != epoch {
+                        nm.active_epoch = epoch;
+                        arena.active_set.push(TileIdx(ni_raw));
+                    }
                 }
             }
         }
     }
+
+    // Sort active set by index for better cache locality during kernel execution.
+    // The kernel accesses cell_bufs, borders, meta, and neighbors arrays sequentially
+    // by tile index — sorting ensures we walk these arrays in order.
+    // Only sort when the set is small enough that sort cost < cache benefit.
+    if arena.active_set.len() <= 16384 {
+        arena.active_set.sort_unstable_by_key(|idx| idx.0);
+    }
 }
 
 #[inline]
+#[allow(dead_code)]
 fn neighbor_has_changed(neighbors: &[[u32; 8]], meta: &[TileMeta], idx: TileIdx) -> bool {
     let nb = &neighbors[idx.index()];
     for &ni_raw in nb.iter().take(8) {
@@ -129,68 +151,80 @@ fn neighbor_has_changed(neighbors: &[[u32; 8]], meta: &[TileMeta], idx: TileIdx)
     false
 }
 
+/// Scan a tile for prune/expand using raw pointers to avoid bounds checks.
+///
+/// # Safety
+/// All pointers must be valid and `idx.index()` must be within bounds.
+/// Neighbor indices in `neighbors_ptr[idx]` must be valid or NO_NEIGHBOR.
 #[inline]
-fn scan_tile_prune_expand(
+unsafe fn scan_tile_prune_expand_raw(
     idx: TileIdx,
-    meta: &[TileMeta],
-    borders: &[BorderData],
-    neighbors: &[[u32; 8]],
-    coords: &[(i64, i64)],
+    meta_ptr: *const TileMeta,
+    borders_ptr: *const BorderData,
+    neighbors_ptr: *const [u32; 8],
+    coords_ptr: *const (i64, i64),
     expand: &mut Vec<(i64, i64)>,
 ) -> bool {
-    let i_idx = idx.index();
-    if !meta[i_idx].occupied() {
-        return false;
-    }
+    unsafe {
+        let i_idx = idx.index();
+        let meta = &*meta_ptr.add(i_idx);
+        if !meta.occupied() {
+            return false;
+        }
 
-    let (tx, ty) = coords[i_idx];
-    let border = &borders[i_idx];
-    let nb = &neighbors[i_idx];
+        let (tx, ty) = *coords_ptr.add(i_idx);
+        let border = &*borders_ptr.add(i_idx);
+        let nb = &*neighbors_ptr.add(i_idx);
 
-    let has_missing_neighbor = nb[0] == NO_NEIGHBOR
-        || nb[1] == NO_NEIGHBOR
-        || nb[2] == NO_NEIGHBOR
-        || nb[3] == NO_NEIGHBOR
-        || nb[4] == NO_NEIGHBOR
-        || nb[5] == NO_NEIGHBOR
-        || nb[6] == NO_NEIGHBOR
-        || nb[7] == NO_NEIGHBOR;
+        // Check if any neighbor is missing.
+        let has_missing_neighbor = nb[0] == NO_NEIGHBOR
+            || nb[1] == NO_NEIGHBOR
+            || nb[2] == NO_NEIGHBOR
+            || nb[3] == NO_NEIGHBOR
+            || nb[4] == NO_NEIGHBOR
+            || nb[5] == NO_NEIGHBOR
+            || nb[6] == NO_NEIGHBOR
+            || nb[7] == NO_NEIGHBOR;
 
-    if has_missing_neighbor {
-        if border.north != 0 && nb[Direction::North.index()] == NO_NEIGHBOR {
-            expand.push((tx, ty + 1));
+        if has_missing_neighbor {
+            if border.north != 0 && nb[Direction::North.index()] == NO_NEIGHBOR {
+                expand.push((tx, ty + 1));
+            }
+            if border.south != 0 && nb[Direction::South.index()] == NO_NEIGHBOR {
+                expand.push((tx, ty - 1));
+            }
+            if border.west != 0 && nb[Direction::West.index()] == NO_NEIGHBOR {
+                expand.push((tx - 1, ty));
+            }
+            if border.east != 0 && nb[Direction::East.index()] == NO_NEIGHBOR {
+                expand.push((tx + 1, ty));
+            }
+            if border.nw() && nb[Direction::NW.index()] == NO_NEIGHBOR {
+                expand.push((tx - 1, ty + 1));
+            }
+            if border.ne() && nb[Direction::NE.index()] == NO_NEIGHBOR {
+                expand.push((tx + 1, ty + 1));
+            }
+            if border.sw() && nb[Direction::SW.index()] == NO_NEIGHBOR {
+                expand.push((tx - 1, ty - 1));
+            }
+            if border.se() && nb[Direction::SE.index()] == NO_NEIGHBOR {
+                expand.push((tx + 1, ty - 1));
+            }
         }
-        if border.south != 0 && nb[Direction::South.index()] == NO_NEIGHBOR {
-            expand.push((tx, ty - 1));
-        }
-        if border.west != 0 && nb[Direction::West.index()] == NO_NEIGHBOR {
-            expand.push((tx - 1, ty));
-        }
-        if border.east != 0 && nb[Direction::East.index()] == NO_NEIGHBOR {
-            expand.push((tx + 1, ty));
-        }
-        if border.nw() && nb[Direction::NW.index()] == NO_NEIGHBOR {
-            expand.push((tx - 1, ty + 1));
-        }
-        if border.ne() && nb[Direction::NE.index()] == NO_NEIGHBOR {
-            expand.push((tx + 1, ty + 1));
-        }
-        if border.sw() && nb[Direction::SW.index()] == NO_NEIGHBOR {
-            expand.push((tx - 1, ty - 1));
-        }
-        if border.se() && nb[Direction::SE.index()] == NO_NEIGHBOR {
-            expand.push((tx + 1, ty - 1));
-        }
-    }
 
-    let changed = meta[i_idx].changed();
-    if changed {
-        return false;
+        let changed = meta.changed();
+        if changed {
+            return false;
+        }
+        // Check if any neighbor changed — use raw pointer for meta access.
+        for &ni_raw in nb.iter() {
+            if ni_raw != NO_NEIGHBOR && (*meta_ptr.add(ni_raw as usize)).changed() {
+                return false;
+            }
+        }
+        !meta.has_live()
     }
-    if neighbor_has_changed(neighbors, meta, idx) {
-        return false;
-    }
-    !meta[i_idx].has_live()
 }
 
 /// Prune dead tiles and expand the frontier.
@@ -209,38 +243,60 @@ pub fn prune_and_expand(arena: &mut TileArena) {
     let effective_threads = tuned_prune_threads(active_len, thread_count);
     let run_parallel = effective_threads > 1;
 
+    // Get raw pointers for bounds-check-free access in both serial and parallel paths.
+    let meta_ptr = arena.meta.as_ptr();
+    let borders_ptr = arena.borders[bp].as_ptr();
+    let neighbors_ptr = arena.neighbors.as_ptr();
+    let coords_ptr = arena.coords.as_ptr();
+
     if !run_parallel {
         for i in 0..active_len {
             let idx = arena.active_set[i];
-            let should_prune = scan_tile_prune_expand(
-                idx,
-                &arena.meta,
-                &arena.borders[bp],
-                &arena.neighbors,
-                &arena.coords,
-                &mut arena.expand_buf,
-            );
+            let should_prune = unsafe {
+                scan_tile_prune_expand_raw(
+                    idx,
+                    meta_ptr,
+                    borders_ptr,
+                    neighbors_ptr,
+                    coords_ptr,
+                    &mut arena.expand_buf,
+                )
+            };
             if should_prune {
                 arena.prune_buf.push(idx);
             }
         }
     } else {
+        // Wrap raw pointers for Send/Sync using usize transmutation.
+        // SAFETY: pointers are valid for the duration of the parallel phase
+        // (arena is not modified during par_chunks).
+        let s_meta = meta_ptr as usize;
+        let s_borders = borders_ptr as usize;
+        let s_neighbors = neighbors_ptr as usize;
+        let s_coords = coords_ptr as usize;
+
         let chunk_size = prune_chunk_size(active_len, effective_threads);
         let (expand_all, prune_all) = arena
             .active_set
             .par_chunks(chunk_size)
             .fold(
                 || (Vec::new(), Vec::new()),
-                |mut acc, chunk| {
+                move |mut acc, chunk| {
+                    let mp = s_meta as *const TileMeta;
+                    let bp = s_borders as *const BorderData;
+                    let np = s_neighbors as *const [u32; 8];
+                    let cp = s_coords as *const (i64, i64);
                     for &idx in chunk {
-                        let should_prune = scan_tile_prune_expand(
-                            idx,
-                            &arena.meta,
-                            &arena.borders[bp],
-                            &arena.neighbors,
-                            &arena.coords,
-                            &mut acc.0,
-                        );
+                        let should_prune = unsafe {
+                            scan_tile_prune_expand_raw(
+                                idx,
+                                mp,
+                                bp,
+                                np,
+                                cp,
+                                &mut acc.0,
+                            )
+                        };
                         if should_prune {
                             acc.1.push(idx);
                         }
@@ -262,8 +318,6 @@ pub fn prune_and_expand(arena: &mut TileArena) {
 
     // Dedup via the tilemap itself: allocate_absent inserts into coord_to_idx,
     // so subsequent idx_at calls for the same coord will find it and skip.
-    // This is O(n) vs O(n log n) for sort+dedup, and avoids the sort overhead.
-    // Pre-reserve to avoid repeated growth checks during batch allocation.
     if !arena.expand_buf.is_empty() {
         arena.reserve_additional_tiles(arena.expand_buf.len());
     }

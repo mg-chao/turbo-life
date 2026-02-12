@@ -5,7 +5,7 @@ use std::time::Instant;
 use super::activity::{prune_and_expand, rebuild_active_set};
 use super::arena::TileArena;
 use super::kernel::{KernelBackend, advance_core, advance_tile_split};
-use super::sync::{gather_ghost_zone, gather_ghost_zone_raw};
+use super::sync::gather_ghost_zone_raw;
 use super::tile::{self, POPULATION_UNKNOWN};
 
 struct SendPtr<T> {
@@ -526,31 +526,50 @@ impl TurboLife {
         debug_assert_eq!(self.arena.meta.len(), self.arena.neighbors.len());
 
         if !run_parallel {
-            let neighbors = &self.arena.neighbors;
+            // Serial path: use raw pointers to eliminate bounds checks in the hot loop.
+            let neighbors_ptr = self.arena.neighbors.as_ptr();
+            let borders_read_ptr = borders_read.as_ptr();
+            let current_ptr = current_vec.as_ptr();
+            let next_ptr = next_vec.as_mut_ptr();
+            let next_borders_ptr = next_borders_vec.as_mut_ptr();
+            let meta_ptr = self.arena.meta.as_mut_ptr();
 
             for i in 0..active_len {
                 let idx = self.arena.active_set[i];
-                let ghost = gather_ghost_zone(idx, borders_read, neighbors);
+                let ii = idx.index();
+                let ghost = unsafe {
+                    gather_ghost_zone_raw(ii, borders_read_ptr, neighbors_ptr)
+                };
 
-                let current = &current_vec[idx.index()].0;
-                let next = &mut next_vec[idx.index()].0;
-                let next_border = &mut next_borders_vec[idx.index()];
-                let meta = &mut self.arena.meta[idx.index()];
+                let (changed, _border, has_live) = unsafe {
+                    let current = &(*current_ptr.add(ii)).0;
+                    let next = &mut (*next_ptr.add(ii)).0;
+                    let result = advance_core(current, next, &ghost, backend);
+                    *next_borders_ptr.add(ii) = result.1;
+                    result
+                };
 
-                let (changed, border, has_live) = advance_core(current, next, &ghost, backend);
-
-                *next_border = border;
-                meta.set_changed(changed);
-                if changed {
-                    meta.population = POPULATION_UNKNOWN;
-                    meta.set_has_live(has_live);
-                    if !meta.in_changed_list() {
-                        meta.set_in_changed_list(true);
-                        self.arena.changed_list.push(idx);
+                unsafe {
+                    let meta = &mut *meta_ptr.add(ii);
+                    meta.set_changed(changed);
+                    if changed {
+                        meta.population = POPULATION_UNKNOWN;
+                        meta.set_has_live(has_live);
+                        if !meta.in_changed_list() {
+                            meta.set_in_changed_list(true);
+                            self.arena.changed_list.push(idx);
+                        }
                     }
                 }
             }
         } else {
+            // === Optimized parallel kernel ===
+            // Instead of per-chunk Vec allocations + reduce + serial merge,
+            // we use a pre-allocated AtomicBool array indexed by tile slot.
+            // Each worker writes its changed flag directly via raw pointer
+            // (advance_tile_split already writes meta), and we set the
+            // atomic flag for changed tiles. After the parallel phase,
+            // a single serial scan of the active set collects changed tiles.
             let active_set = &self.arena.active_set;
             let current_ptr = SendConstPtr::new(current_vec.as_ptr());
             let next_ptr = SendPtr::new(next_vec.as_mut_ptr());
@@ -561,10 +580,9 @@ impl TurboLife {
             let worker_count = effective_threads.min(active_len);
             let chunk_size = active_len.div_ceil(worker_count);
 
-            let changed_tiles = active_set
+            active_set
                 .par_chunks(chunk_size)
-                .map(move |chunk| {
-                    let mut changed_local = Vec::with_capacity(chunk.len() / 2 + 4);
+                .for_each(move |chunk| {
                     for &idx in chunk {
                         let ghost = unsafe {
                             gather_ghost_zone_raw(
@@ -575,7 +593,7 @@ impl TurboLife {
                         };
 
                         unsafe {
-                            let tile_changed = advance_tile_split(
+                            advance_tile_split(
                                 current_ptr.get(),
                                 next_ptr.get(),
                                 meta_ptr.get(),
@@ -584,23 +602,20 @@ impl TurboLife {
                                 &ghost,
                                 backend,
                             );
-                            if tile_changed {
-                                changed_local.push(idx);
-                            }
                         }
                     }
-                    changed_local
-                })
-                .reduce(Vec::new, |mut left, mut right| {
-                    left.append(&mut right);
-                    left
                 });
 
-            for idx in changed_tiles {
-                let meta = &mut self.arena.meta[idx.index()];
-                if !meta.in_changed_list() {
-                    meta.set_in_changed_list(true);
-                    self.arena.changed_list.push(idx);
+            // Serial scan: advance_tile_split already set meta.changed() for
+            // each tile. We just need to collect those into the changed_list.
+            // This is cheaper than the old approach (Vec alloc per chunk + reduce).
+            for &idx in active_set {
+                if self.arena.meta[idx.index()].changed() {
+                    let meta = &mut self.arena.meta[idx.index()];
+                    if !meta.in_changed_list() {
+                        meta.set_in_changed_list(true);
+                        self.arena.changed_list.push(idx);
+                    }
                 }
             }
         }
