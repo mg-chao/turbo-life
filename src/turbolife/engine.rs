@@ -1,5 +1,6 @@
 use rayon::prelude::*;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use super::activity::{append_expand_candidates, finalize_prune_and_expand, rebuild_active_set};
@@ -62,13 +63,59 @@ const PARALLEL_KERNEL_TILES_PER_THREAD: usize = 16;
 const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
 const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
-const PARALLEL_POST_SCAN_THRESHOLD: usize = 8192;
+const PARALLEL_POST_SCAN_THRESHOLD: usize = 32_768;
+const PARALLEL_WORK_GRAIN_MIN: usize = 64;
+const PARALLEL_WORK_GRAIN_MAX: usize = 512;
+const PARALLEL_WORK_CHUNKS_PER_THREAD: usize = 4;
 
 static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
+static AUTO_KERNEL_BACKEND: OnceLock<KernelBackend> = OnceLock::new();
+
+#[derive(Default)]
+struct WorkerScratch {
+    changed: Vec<TileIdx>,
+    expand: Vec<u64>,
+    prune: Vec<TileIdx>,
+}
+
+impl WorkerScratch {
+    #[inline]
+    fn clear(&mut self) {
+        self.changed.clear();
+        self.expand.clear();
+        self.prune.clear();
+    }
+
+    #[inline]
+    fn reserve_for_chunk(&mut self, chunk_len: usize) {
+        if self.changed.capacity() < chunk_len {
+            self.changed.reserve(chunk_len - self.changed.capacity());
+        }
+        if self.prune.capacity() < chunk_len {
+            self.prune.reserve(chunk_len - self.prune.capacity());
+        }
+        let expand_target = chunk_len.saturating_mul(2);
+        if self.expand.capacity() < expand_target {
+            self.expand.reserve(expand_target - self.expand.capacity());
+        }
+    }
+}
 
 #[inline]
 fn detect_kernel_backend() -> KernelBackend {
-    calibrate_auto_backend()
+    let auto_enabled = std::env::var("TURBOLIFE_AUTO_KERNEL")
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false);
+
+    if auto_enabled {
+        *AUTO_KERNEL_BACKEND.get_or_init(calibrate_auto_backend)
+    } else {
+        KernelBackend::Scalar
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -125,14 +172,26 @@ fn benchmark_backend(backend: KernelBackend) -> u128 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[inline]
+fn benchmark_backend_best(backend: KernelBackend, trials: usize) -> u128 {
+    let mut best = u128::MAX;
+    for _ in 0..trials.max(1) {
+        best = best.min(benchmark_backend(backend));
+    }
+    best
+}
+
+#[cfg(target_arch = "x86_64")]
 fn calibrate_auto_backend() -> KernelBackend {
     if !std::is_x86_feature_detected!("avx2") {
         return KernelBackend::Scalar;
     }
 
-    let scalar_ns = benchmark_backend(KernelBackend::Scalar);
-    let avx2_ns = benchmark_backend(KernelBackend::Avx2);
-    if avx2_ns <= scalar_ns {
+    let scalar_ns = benchmark_backend_best(KernelBackend::Scalar, 3);
+    let avx2_ns = benchmark_backend_best(KernelBackend::Avx2, 3);
+
+    // Require a large win to avoid picking AVX2 on calibration noise.
+    if avx2_ns.saturating_mul(100) <= scalar_ns.saturating_mul(85) {
         KernelBackend::Avx2
     } else {
         KernelBackend::Scalar
@@ -196,6 +255,16 @@ fn tuned_parallel_threads(active_len: usize, thread_count: usize) -> usize {
     effective.max(1)
 }
 
+#[inline]
+fn parallel_work_grain(active_len: usize, workers: usize) -> usize {
+    let target_chunks = workers
+        .saturating_mul(PARALLEL_WORK_CHUNKS_PER_THREAD)
+        .max(1);
+    active_len
+        .div_ceil(target_chunks)
+        .clamp(PARALLEL_WORK_GRAIN_MIN, PARALLEL_WORK_GRAIN_MAX)
+}
+
 /// Resolve the thread count from a config, falling back to auto-detect.
 fn resolve_thread_count(config: &TurboLifeConfig) -> usize {
     let mut threads = config
@@ -207,7 +276,7 @@ fn resolve_thread_count(config: &TurboLifeConfig) -> usize {
     threads.max(1)
 }
 
-/// Resolve the kernel backend from a config, falling back to auto-calibrate.
+/// Resolve the kernel backend from a config, falling back to default policy.
 fn resolve_kernel_backend(config: &TurboLifeConfig) -> KernelBackend {
     if let Some(backend) = config.kernel {
         // Validate AVX2 availability at runtime.
@@ -238,7 +307,8 @@ pub struct TurboLifeConfig {
     /// `None` means no additional cap beyond `thread_count`.
     pub max_threads: Option<usize>,
     /// Kernel backend selection.
-    /// `None` means auto-calibrate (benchmark Scalar vs AVX2 at startup).
+    /// `None` means scalar by default.
+    /// Set `TURBOLIFE_AUTO_KERNEL=1` to enable startup auto-calibration.
     pub kernel: Option<KernelBackend>,
 }
 
@@ -273,6 +343,8 @@ pub struct TurboLife {
     touched_flags: Vec<bool>,
     /// Direct-mapped tile result cache for kernel memoization.
     tile_cache: TileCache,
+    /// Per-worker scratch buffers used by the lock-free parallel scheduler.
+    worker_scratch: Vec<WorkerScratch>,
 }
 
 impl Default for TurboLife {
@@ -303,6 +375,23 @@ impl TurboLife {
             backend,
             touched_flags: Vec::new(),
             tile_cache: TileCache::new(),
+            worker_scratch: (0..threads).map(|_| WorkerScratch::default()).collect(),
+        }
+    }
+
+    #[inline]
+    fn prepare_worker_scratch(&mut self, worker_count: usize, active_len: usize) {
+        if self.worker_scratch.len() < worker_count {
+            self.worker_scratch
+                .resize_with(worker_count, WorkerScratch::default);
+        }
+        if worker_count == 0 {
+            return;
+        }
+        let chunk_len = active_len.div_ceil(worker_count);
+        for scratch in self.worker_scratch.iter_mut().take(worker_count) {
+            scratch.clear();
+            scratch.reserve_for_chunk(chunk_len);
         }
     }
 
@@ -485,7 +574,7 @@ impl TurboLife {
                 continue;
             }
 
-            // O(1) dedup via direct-indexed flag array — no hashing needed.
+            // O(1) dedup via direct-indexed flag array - no hashing needed.
             // Grow the flags vec on demand to cover any newly allocated tiles.
             let i = idx.index();
             if i >= self.touched_flags.len() {
@@ -783,10 +872,12 @@ impl TurboLife {
                 }
             }
         } else {
-            // Parallel kernel compute with fused ghost-gather + two-level prefetching.
-            // Note: the tile cache is NOT used in the parallel path to avoid
-            // torn reads/writes from concurrent access to the same cache slot.
+            // Parallel kernel compute:
+            // - Small/medium active sets keep the existing par_chunks collect path.
+            // - Very large active sets switch to a lock-free scheduler and
+            //   per-worker scratch buffers to parallelize post-scan work.
             let active_set = &self.arena.active_set;
+            let active_ptr = SendConstPtr::new(active_set.as_ptr());
             let current_ptr = SendConstPtr::new(current_vec.as_ptr());
             let next_ptr = SendPtr::new(next_vec.as_mut_ptr());
             let meta_ptr = SendPtr::new(self.arena.meta.as_mut_ptr());
@@ -794,68 +885,67 @@ impl TurboLife {
             let next_borders_ptr = SendPtr::new(next_borders_vec.as_mut_ptr());
             let borders_read_ptr = SendConstPtr::new(borders_read.as_ptr());
             let worker_count = effective_threads.min(active_len);
-            let chunk_size = active_len.div_ceil(worker_count);
 
-            macro_rules! parallel_loop_collect {
-                ($advance:path) => {{
-                    active_set
-                        .par_chunks(chunk_size)
-                        .fold(
-                            || {
-                                (
-                                    Vec::<TileIdx>::new(),
-                                    Vec::<u64>::new(),
-                                    Vec::<TileIdx>::new(),
-                                )
-                            },
-                            move |mut acc, chunk| {
-                                for (ci, &idx) in chunk.iter().enumerate() {
-                                    #[cfg(target_arch = "x86_64")]
-                                    unsafe {
-                                        use super::tile::NO_NEIGHBOR;
-                                        use std::arch::x86_64::*;
-                                        // Two-level prefetching: L2 far, L1 near.
-                                        if ci + 2 < chunk.len() {
-                                            let far_ii = chunk[ci + 2].index();
-                                            _mm_prefetch(
-                                                current_ptr.get().add(far_ii) as *const i8,
-                                                _MM_HINT_T1,
-                                            );
-                                            _mm_prefetch(
-                                                next_ptr.get().add(far_ii) as *const i8,
-                                                _MM_HINT_T1,
-                                            );
-                                        }
-                                        if ci + 1 < chunk.len() {
-                                            let near_ii = chunk[ci + 1].index();
-                                            _mm_prefetch(
-                                                current_ptr.get().add(near_ii) as *const i8,
-                                                _MM_HINT_T0,
-                                            );
-                                            _mm_prefetch(
-                                                next_ptr.get().add(near_ii) as *const i8,
-                                                _MM_HINT_T0,
-                                            );
-                                            _mm_prefetch(
-                                                neighbors_ptr.get().add(near_ii) as *const i8,
-                                                _MM_HINT_T0,
-                                            );
-                                            // Prefetch neighbor borders for ghost zone gather.
-                                            let nb = &*neighbors_ptr.get().add(near_ii);
-                                            for &ni in nb.iter() {
-                                                if ni != NO_NEIGHBOR {
-                                                    _mm_prefetch(
-                                                        borders_read_ptr.get().add(ni as usize)
-                                                            as *const i8,
-                                                        _MM_HINT_T0,
-                                                    );
-                                                }
-                                            }
-                                        }
+            if active_len >= PARALLEL_POST_SCAN_THRESHOLD {
+                let grain = parallel_work_grain(active_len, worker_count);
+
+                self.prepare_worker_scratch(worker_count, active_len);
+                let scratch_ptr = SendPtr::new(self.worker_scratch.as_mut_ptr());
+
+                macro_rules! prefetch_for_work_item {
+                    ($i:expr, $end:expr) => {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            use super::tile::NO_NEIGHBOR;
+                            use std::arch::x86_64::*;
+
+                            if $i + 2 < $end {
+                                let far_ii = (*active_ptr.get().add($i + 2)).index();
+                                _mm_prefetch(
+                                    current_ptr.get().add(far_ii) as *const i8,
+                                    _MM_HINT_T1,
+                                );
+                                _mm_prefetch(next_ptr.get().add(far_ii) as *const i8, _MM_HINT_T1);
+                            }
+                            if $i + 1 < $end {
+                                let near_ii = (*active_ptr.get().add($i + 1)).index();
+                                _mm_prefetch(
+                                    current_ptr.get().add(near_ii) as *const i8,
+                                    _MM_HINT_T0,
+                                );
+                                _mm_prefetch(next_ptr.get().add(near_ii) as *const i8, _MM_HINT_T0);
+                                _mm_prefetch(
+                                    neighbors_ptr.get().add(near_ii) as *const i8,
+                                    _MM_HINT_T0,
+                                );
+                                let nb = &*neighbors_ptr.get().add(near_ii);
+                                for &ni in nb.iter() {
+                                    if ni != NO_NEIGHBOR {
+                                        _mm_prefetch(
+                                            borders_read_ptr.get().add(ni as usize) as *const i8,
+                                            _MM_HINT_T0,
+                                        );
                                     }
+                                }
+                            }
+                        }
+                    };
+                }
 
-                                    let ii = idx.index();
-                                    let changed = unsafe {
+                macro_rules! parallel_kernel_compute_only {
+                    ($advance:path) => {{
+                        let cursor = AtomicUsize::new(0);
+                        (0..worker_count).into_par_iter().for_each(|_| {
+                            loop {
+                                let start = cursor.fetch_add(grain, Ordering::Relaxed);
+                                if start >= active_len {
+                                    break;
+                                }
+                                let end = (start + grain).min(active_len);
+                                for i in start..end {
+                                    prefetch_for_work_item!(i, end);
+                                    let idx = unsafe { *active_ptr.get().add(i) };
+                                    unsafe {
                                         $advance(
                                             current_ptr.get(),
                                             next_ptr.get(),
@@ -863,157 +953,217 @@ impl TurboLife {
                                             next_borders_ptr.get(),
                                             borders_read_ptr.get(),
                                             neighbors_ptr.get(),
-                                            ii,
-                                        )
-                                    };
+                                            idx.index(),
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }};
+                }
 
+                macro_rules! parallel_post_scan {
+                    () => {{
+                        let cursor = AtomicUsize::new(0);
+                        (0..worker_count).into_par_iter().for_each(|worker_id| {
+                            let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
+                            loop {
+                                let start = cursor.fetch_add(grain, Ordering::Relaxed);
+                                if start >= active_len {
+                                    break;
+                                }
+                                let end = (start + grain).min(active_len);
+                                for i in start..end {
+                                    let idx = unsafe { *active_ptr.get().add(i) };
+                                    let ii = idx.index();
                                     unsafe {
                                         let meta = &*meta_ptr.get().add(ii);
+                                        let changed = meta.changed();
+                                        if changed {
+                                            scratch.changed.push(idx);
+                                        }
+
                                         let missing = meta.missing_mask;
                                         if missing != 0 {
                                             let live_mask =
                                                 (*next_borders_ptr.get().add(ii)).live_mask;
                                             append_expand_candidates(
-                                                &mut acc.1, idx, missing, live_mask,
+                                                &mut scratch.expand,
+                                                idx,
+                                                missing,
+                                                live_mask,
                                             );
                                         }
+
                                         if !changed && !meta.has_live() {
-                                            acc.2.push(idx);
-                                        }
-                                    }
-                                    if changed {
-                                        acc.0.push(idx);
-                                    }
-                                }
-                                acc
-                            },
-                        )
-                        .reduce(
-                            || {
-                                (
-                                    Vec::<TileIdx>::new(),
-                                    Vec::<u64>::new(),
-                                    Vec::<TileIdx>::new(),
-                                )
-                            },
-                            |mut left, mut right| {
-                                left.0.append(&mut right.0);
-                                left.1.append(&mut right.1);
-                                left.2.append(&mut right.2);
-                                left
-                            },
-                        )
-                }};
-            }
-
-            macro_rules! parallel_loop_compute {
-                ($advance:path) => {{
-                    active_set.par_chunks(chunk_size).for_each(move |chunk| {
-                        for (ci, &idx) in chunk.iter().enumerate() {
-                            #[cfg(target_arch = "x86_64")]
-                            unsafe {
-                                use super::tile::NO_NEIGHBOR;
-                                use std::arch::x86_64::*;
-                                // Two-level prefetching: L2 far, L1 near.
-                                if ci + 2 < chunk.len() {
-                                    let far_ii = chunk[ci + 2].index();
-                                    _mm_prefetch(
-                                        current_ptr.get().add(far_ii) as *const i8,
-                                        _MM_HINT_T1,
-                                    );
-                                    _mm_prefetch(
-                                        next_ptr.get().add(far_ii) as *const i8,
-                                        _MM_HINT_T1,
-                                    );
-                                }
-                                if ci + 1 < chunk.len() {
-                                    let near_ii = chunk[ci + 1].index();
-                                    _mm_prefetch(
-                                        current_ptr.get().add(near_ii) as *const i8,
-                                        _MM_HINT_T0,
-                                    );
-                                    _mm_prefetch(
-                                        next_ptr.get().add(near_ii) as *const i8,
-                                        _MM_HINT_T0,
-                                    );
-                                    _mm_prefetch(
-                                        neighbors_ptr.get().add(near_ii) as *const i8,
-                                        _MM_HINT_T0,
-                                    );
-                                    // Prefetch neighbor borders for ghost zone gather.
-                                    let nb = &*neighbors_ptr.get().add(near_ii);
-                                    for &ni in nb.iter() {
-                                        if ni != NO_NEIGHBOR {
-                                            _mm_prefetch(
-                                                borders_read_ptr.get().add(ni as usize)
-                                                    as *const i8,
-                                                _MM_HINT_T0,
-                                            );
+                                            scratch.prune.push(idx);
                                         }
                                     }
                                 }
                             }
+                        });
+                    }};
+                }
 
-                            unsafe {
-                                $advance(
-                                    current_ptr.get(),
-                                    next_ptr.get(),
-                                    meta_ptr.get(),
-                                    next_borders_ptr.get(),
-                                    borders_read_ptr.get(),
-                                    neighbors_ptr.get(),
-                                    idx.index(),
-                                );
-                            }
-                        }
-                    })
-                }};
-            }
-
-            if active_len >= PARALLEL_POST_SCAN_THRESHOLD {
                 match backend {
-                    KernelBackend::Scalar => parallel_loop_compute!(advance_tile_fused_scalar),
+                    KernelBackend::Scalar => {
+                        parallel_kernel_compute_only!(advance_tile_fused_scalar)
+                    }
                     KernelBackend::Avx2 => {
                         #[cfg(target_arch = "x86_64")]
                         {
-                            parallel_loop_compute!(advance_tile_fused_avx2)
+                            parallel_kernel_compute_only!(advance_tile_fused_avx2)
                         }
                         #[cfg(not(target_arch = "x86_64"))]
                         {
-                            parallel_loop_compute!(advance_tile_fused_scalar)
+                            parallel_kernel_compute_only!(advance_tile_fused_scalar)
                         }
                     }
                 }
+                parallel_post_scan!();
+
+                let mut reserve_expand = 0usize;
+                let mut reserve_prune = 0usize;
+                let mut reserve_changed = 0usize;
+                for scratch in self.worker_scratch.iter().take(worker_count) {
+                    reserve_expand = reserve_expand.saturating_add(scratch.expand.len());
+                    reserve_prune = reserve_prune.saturating_add(scratch.prune.len());
+                    reserve_changed = reserve_changed.saturating_add(scratch.changed.len());
+                }
+                self.arena.expand_buf.reserve(reserve_expand);
+                self.arena.prune_buf.reserve(reserve_prune);
+                self.arena.changed_list.reserve(reserve_changed);
+
+                for worker_id in 0..worker_count {
+                    let scratch = &mut self.worker_scratch[worker_id];
+                    self.arena.expand_buf.append(&mut scratch.expand);
+                    self.arena.prune_buf.append(&mut scratch.prune);
+                }
 
                 let meta_write_ptr = self.arena.meta.as_mut_ptr();
-                let next_border_read_ptr = next_borders_vec.as_ptr();
-                for &idx in active_set {
-                    let ii = idx.index();
-                    unsafe {
-                        let meta = &mut *meta_write_ptr.add(ii);
-                        let changed = meta.changed();
-                        if changed && !meta.in_changed_list() {
-                            meta.set_in_changed_list(true);
-                            self.arena.changed_list.push(idx);
-                        }
-
-                        let missing = meta.missing_mask;
-                        if missing != 0 {
-                            let live_mask = (*next_border_read_ptr.add(ii)).live_mask;
-                            append_expand_candidates(
-                                &mut self.arena.expand_buf,
-                                idx,
-                                missing,
-                                live_mask,
-                            );
-                        }
-
-                        if !changed && !meta.has_live() {
-                            self.arena.prune_buf.push(idx);
+                for worker_id in 0..worker_count {
+                    let scratch = &mut self.worker_scratch[worker_id];
+                    for idx in scratch.changed.drain(..) {
+                        unsafe {
+                            let meta = &mut *meta_write_ptr.add(idx.index());
+                            if !meta.in_changed_list() {
+                                meta.set_in_changed_list(true);
+                                self.arena.changed_list.push(idx);
+                            }
                         }
                     }
                 }
             } else {
+                let chunk_size = active_len.div_ceil(worker_count);
+
+                macro_rules! parallel_loop_collect {
+                    ($advance:path) => {{
+                        active_set
+                            .par_chunks(chunk_size)
+                            .fold(
+                                || {
+                                    (
+                                        Vec::<TileIdx>::new(),
+                                        Vec::<u64>::new(),
+                                        Vec::<TileIdx>::new(),
+                                    )
+                                },
+                                move |mut acc, chunk| {
+                                    for (ci, &idx) in chunk.iter().enumerate() {
+                                        #[cfg(target_arch = "x86_64")]
+                                        unsafe {
+                                            use super::tile::NO_NEIGHBOR;
+                                            use std::arch::x86_64::*;
+                                            if ci + 2 < chunk.len() {
+                                                let far_ii = chunk[ci + 2].index();
+                                                _mm_prefetch(
+                                                    current_ptr.get().add(far_ii) as *const i8,
+                                                    _MM_HINT_T1,
+                                                );
+                                                _mm_prefetch(
+                                                    next_ptr.get().add(far_ii) as *const i8,
+                                                    _MM_HINT_T1,
+                                                );
+                                            }
+                                            if ci + 1 < chunk.len() {
+                                                let near_ii = chunk[ci + 1].index();
+                                                _mm_prefetch(
+                                                    current_ptr.get().add(near_ii) as *const i8,
+                                                    _MM_HINT_T0,
+                                                );
+                                                _mm_prefetch(
+                                                    next_ptr.get().add(near_ii) as *const i8,
+                                                    _MM_HINT_T0,
+                                                );
+                                                _mm_prefetch(
+                                                    neighbors_ptr.get().add(near_ii) as *const i8,
+                                                    _MM_HINT_T0,
+                                                );
+                                                let nb = &*neighbors_ptr.get().add(near_ii);
+                                                for &ni in nb.iter() {
+                                                    if ni != NO_NEIGHBOR {
+                                                        _mm_prefetch(
+                                                            borders_read_ptr.get().add(ni as usize)
+                                                                as *const i8,
+                                                            _MM_HINT_T0,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        let ii = idx.index();
+                                        let changed = unsafe {
+                                            $advance(
+                                                current_ptr.get(),
+                                                next_ptr.get(),
+                                                meta_ptr.get(),
+                                                next_borders_ptr.get(),
+                                                borders_read_ptr.get(),
+                                                neighbors_ptr.get(),
+                                                ii,
+                                            )
+                                        };
+
+                                        unsafe {
+                                            let meta = &*meta_ptr.get().add(ii);
+                                            let missing = meta.missing_mask;
+                                            if missing != 0 {
+                                                let live_mask =
+                                                    (*next_borders_ptr.get().add(ii)).live_mask;
+                                                append_expand_candidates(
+                                                    &mut acc.1, idx, missing, live_mask,
+                                                );
+                                            }
+                                            if !changed && !meta.has_live() {
+                                                acc.2.push(idx);
+                                            }
+                                        }
+                                        if changed {
+                                            acc.0.push(idx);
+                                        }
+                                    }
+                                    acc
+                                },
+                            )
+                            .reduce(
+                                || {
+                                    (
+                                        Vec::<TileIdx>::new(),
+                                        Vec::<u64>::new(),
+                                        Vec::<TileIdx>::new(),
+                                    )
+                                },
+                                |mut left, mut right| {
+                                    left.0.append(&mut right.0);
+                                    left.1.append(&mut right.1);
+                                    left.2.append(&mut right.2);
+                                    left
+                                },
+                            )
+                    }};
+                }
+
                 let (mut changed_all, mut expand_all, mut prune_all) = match backend {
                     KernelBackend::Scalar => parallel_loop_collect!(advance_tile_fused_scalar),
                     KernelBackend::Avx2 => {
@@ -1057,7 +1207,7 @@ impl TurboLife {
         // Split borrow: take a shared ref to the pool before mutably borrowing self.
         let pool = &self.pool as *const rayon::ThreadPool;
         // SAFETY: `pool` is not modified during `install`, and `step_impl` only
-        // mutates arena/generation/population_cache — never the pool itself.
+        // mutates arena/generation/population_cache - never the pool itself.
         unsafe { &*pool }.install(|| {
             self.step_impl();
         });
