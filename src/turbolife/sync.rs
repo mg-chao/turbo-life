@@ -1,19 +1,10 @@
 //! Ghost zone synchronization for TurboLife.
 //!
-//! Branchless sentinel-based gather: NO_NEIGHBOR indices are remapped to
-//! the sentinel slot (index 0, always zeroed), eliminating all 8 branches
-//! per tile on the hottest path.
+//! Branchless sentinel-based gather: NO_NEIGHBOR is encoded directly as the
+//! sentinel slot index (0, always zeroed), eliminating all 8 branches per tile
+//! on the hottest path.
 
-use super::arena::SENTINEL_IDX;
-use super::tile::{BorderData, GhostZone, NO_NEIGHBOR, Neighbors, TileIdx};
-
-/// Remap NO_NEIGHBOR to the sentinel index.
-#[inline(always)]
-fn sentinel_or(raw: u32) -> usize {
-    debug_assert_eq!(SENTINEL_IDX, 0);
-    let present_mask = (raw != NO_NEIGHBOR) as usize;
-    (raw as usize) & present_mask.wrapping_neg()
-}
+use super::tile::{BorderData, GhostZone, Neighbors, TileIdx};
 
 /// Gather the ghost zone for a single tile using raw pointers.
 ///
@@ -31,14 +22,14 @@ pub unsafe fn gather_ghost_zone_raw(
 
     unsafe {
         let nb = &*neighbors_ptr.add(idx);
-        let north = &*borders_ptr.add(sentinel_or(nb[0]));
-        let south = &*borders_ptr.add(sentinel_or(nb[1]));
-        let west = &*borders_ptr.add(sentinel_or(nb[2]));
-        let east = &*borders_ptr.add(sentinel_or(nb[3]));
-        let nw = &*borders_ptr.add(sentinel_or(nb[4]));
-        let ne = &*borders_ptr.add(sentinel_or(nb[5]));
-        let sw = &*borders_ptr.add(sentinel_or(nb[6]));
-        let se = &*borders_ptr.add(sentinel_or(nb[7]));
+        let north = &*borders_ptr.add(nb[0] as usize);
+        let south = &*borders_ptr.add(nb[1] as usize);
+        let west = &*borders_ptr.add(nb[2] as usize);
+        let east = &*borders_ptr.add(nb[3] as usize);
+        let nw = &*borders_ptr.add(nb[4] as usize);
+        let ne = &*borders_ptr.add(nb[5] as usize);
+        let sw = &*borders_ptr.add(nb[6] as usize);
+        let se = &*borders_ptr.add(nb[7] as usize);
 
         GhostZone {
             north: north.south,

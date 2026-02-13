@@ -11,8 +11,6 @@ use super::tile::{
 };
 use super::tilemap::TileMap;
 
-/// Index of the sentinel slot (always zeroed).
-pub const SENTINEL_IDX: usize = 0;
 const INITIAL_TILE_CAPACITY: usize = 256;
 const MIN_GROW_TILES: usize = 256;
 

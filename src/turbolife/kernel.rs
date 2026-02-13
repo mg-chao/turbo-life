@@ -239,10 +239,9 @@ pub unsafe fn advance_core_avx2(
     ghost: &GhostZone,
 ) -> (bool, BorderData, bool) {
     use std::arch::x86_64::{
-        __m256i, _mm256_and_si256, _mm256_andnot_si256, _mm256_extract_epi64,
-        _mm256_loadu_si256, _mm256_or_si256,
-        _mm256_slli_epi64, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_testz_si256,
-        _mm256_xor_si256,
+        __m256i, _mm256_and_si256, _mm256_andnot_si256, _mm256_extract_epi64, _mm256_loadu_si256,
+        _mm256_or_si256, _mm256_slli_epi64, _mm256_srli_epi64, _mm256_storeu_si256,
+        _mm256_testz_si256, _mm256_xor_si256,
     };
 
     let mut changed = false;
@@ -346,8 +345,12 @@ pub unsafe fn advance_core_avx2(
             | (((lane2 >> 63) & 1) << (row_base + 2))
             | (((lane3 >> 63) & 1) << (row_base + 3));
         // Capture south (row 0) and north (row 63) from registers.
-        if row_base == 0 { border_south = lane0; }
-        if row_base == TILE_SIZE - 4 { border_north = lane3; }
+        if row_base == 0 {
+            border_south = lane0;
+        }
+        if row_base == TILE_SIZE - 4 {
+            border_north = lane3;
+        }
     }
 
     let mut corners = 0u8;
@@ -418,28 +421,16 @@ pub unsafe fn advance_tile_fused(
     idx: usize,
     backend: KernelBackend,
 ) -> bool {
-    use super::arena::SENTINEL_IDX;
-    use super::tile::NO_NEIGHBOR;
-
-    debug_assert_eq!(SENTINEL_IDX, 0);
-
-    // Inline branchless ghost-zone gather (avoids function call + struct construction).
+    // Inline ghost-zone gather (avoids function call + struct construction).
     let nb = unsafe { &*neighbors_ptr.add(idx) };
-
-    #[inline(always)]
-    unsafe fn sentinel_or(raw: u32) -> usize {
-        let present_mask = (raw != NO_NEIGHBOR) as usize;
-        (raw as usize) & present_mask.wrapping_neg()
-    }
-
-    let north_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[0])) };
-    let south_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[1])) };
-    let west_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[2])) };
-    let east_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[3])) };
-    let nw_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[4])) };
-    let ne_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[5])) };
-    let sw_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[6])) };
-    let se_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[7])) };
+    let north_b = unsafe { &*borders_read_ptr.add(nb[0] as usize) };
+    let south_b = unsafe { &*borders_read_ptr.add(nb[1] as usize) };
+    let west_b = unsafe { &*borders_read_ptr.add(nb[2] as usize) };
+    let east_b = unsafe { &*borders_read_ptr.add(nb[3] as usize) };
+    let nw_b = unsafe { &*borders_read_ptr.add(nb[4] as usize) };
+    let ne_b = unsafe { &*borders_read_ptr.add(nb[5] as usize) };
+    let sw_b = unsafe { &*borders_read_ptr.add(nb[6] as usize) };
+    let se_b = unsafe { &*borders_read_ptr.add(nb[7] as usize) };
 
     let ghost = GhostZone {
         north: north_b.south,
@@ -458,23 +449,34 @@ pub unsafe fn advance_tile_fused(
 
     // Ultra-fast path: empty tile + empty ghost zone.
     if ghost.north | ghost.south | ghost.west | ghost.east == 0
-        && !ghost.nw && !ghost.ne && !ghost.sw && !ghost.se
+        && !ghost.nw
+        && !ghost.ne
+        && !ghost.sw
+        && !ghost.se
     {
         let mut any = 0u64;
         let mut i = 0;
         while i < TILE_SIZE {
-            any |= current[i] | current[i+1] | current[i+2] | current[i+3];
-            if any != 0 { break; }
+            any |= current[i] | current[i + 1] | current[i + 2] | current[i + 3];
+            if any != 0 {
+                break;
+            }
             i += 4;
         }
         if any == 0 {
             unsafe {
                 std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
                 *next_borders_ptr.add(idx) = BorderData {
-                    north: 0, south: 0, west: 0, east: 0, corners: 0,
+                    north: 0,
+                    south: 0,
+                    west: 0,
+                    east: 0,
+                    corners: 0,
                 };
             }
             meta.set_changed(false);
+            meta.set_has_live(false);
+            meta.population = 0;
             return false;
         }
     }
@@ -486,9 +488,11 @@ pub unsafe fn advance_tile_fused(
     }
 
     meta.set_changed(changed);
+    meta.set_has_live(has_live);
     if changed {
         meta.population = POPULATION_UNKNOWN;
-        meta.set_has_live(has_live);
+    } else if !has_live {
+        meta.population = 0;
     }
 
     changed
@@ -527,9 +531,11 @@ pub unsafe fn advance_tile_split(
     }
 
     meta.set_changed(changed);
+    meta.set_has_live(has_live);
     if changed {
         meta.population = POPULATION_UNKNOWN;
-        meta.set_has_live(has_live);
+    } else if !has_live {
+        meta.population = 0;
     }
 
     changed

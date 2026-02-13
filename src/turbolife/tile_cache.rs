@@ -1,6 +1,6 @@
 use super::tile::{BorderData, CellBuf, GhostZone, TILE_SIZE};
 
-const CACHE_SIZE: usize = 1 << 16;
+const CACHE_SIZE: usize = 1 << 13;
 const CACHE_MASK: usize = CACHE_SIZE - 1;
 const ADAPT_WINDOW: u32 = 512;
 const MIN_HIT_RATE_PCT: u32 = 20;
@@ -10,7 +10,10 @@ const REPROBE_INTERVAL: u32 = 8;
 #[repr(C, align(64))]
 #[derive(Clone)]
 struct CacheEntry {
-    key: u64,
+    key_lo: u64,
+    key_hi: u64,
+    input_cells: [u64; TILE_SIZE],
+    input_ghost: GhostZone,
     next_cells: [u64; TILE_SIZE],
     border: BorderData,
     changed: bool,
@@ -19,40 +22,98 @@ struct CacheEntry {
 
 impl CacheEntry {
     const EMPTY: Self = Self {
-        key: 0,
+        key_lo: 0,
+        key_hi: 0,
+        input_cells: [0u64; TILE_SIZE],
+        input_ghost: GhostZone {
+            north: 0,
+            south: 0,
+            west: 0,
+            east: 0,
+            nw: false,
+            ne: false,
+            sw: false,
+            se: false,
+        },
         next_cells: [0u64; TILE_SIZE],
-        border: BorderData { north: 0, south: 0, west: 0, east: 0, corners: 0 },
+        border: BorderData {
+            north: 0,
+            south: 0,
+            west: 0,
+            east: 0,
+            corners: 0,
+        },
         changed: false,
         has_live: false,
     };
 }
 
 #[inline(always)]
-fn hash_input(cells: &[u64; TILE_SIZE], ghost: &GhostZone) -> u64 {
+fn ghost_eq(a: &GhostZone, b: &GhostZone) -> bool {
+    a.north == b.north
+        && a.south == b.south
+        && a.west == b.west
+        && a.east == b.east
+        && a.nw == b.nw
+        && a.ne == b.ne
+        && a.sw == b.sw
+        && a.se == b.se
+}
+
+#[inline(always)]
+fn hash_input(cells: &[u64; TILE_SIZE], ghost: &GhostZone) -> (u64, u64) {
     const K0: u64 = 0xa076_1d64_78bd_642f;
     const K1: u64 = 0xe703_7ed1_a0b4_28db;
     const K2: u64 = 0x8ebc_6af0_9c88_c6e3;
     const K3: u64 = 0x5899_65cc_7537_4cc3;
-    let mut h: u64 = 0x9e37_79b9_7f4a_7c15;
+    const K4: u64 = 0x1d8e_4e27_c47d_124f;
+    const K5: u64 = 0x94d0_49bb_1331_11eb;
+    const K6: u64 = 0x2545_f491_4f6c_dd1d;
+    const K7: u64 = 0x9e6c_63d0_676a_9a99;
+    let mut h0: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut h1: u64 = 0xc2b2_ae3d_27d4_eb4f;
     let mut i = 0;
     while i < TILE_SIZE {
-        let lo = (cells[i] ^ K0).wrapping_mul(cells[i + 1] ^ K1);
-        let hi = (cells[i + 2] ^ K2).wrapping_mul(cells[i + 3] ^ K3);
-        h = h ^ lo ^ hi;
-        h = h.wrapping_mul(K0);
+        let a = cells[i];
+        let b = cells[i + 1];
+        let c = cells[i + 2];
+        let d = cells[i + 3];
+
+        let lo0 = (a ^ K0).wrapping_mul(b ^ K1);
+        let hi0 = (c ^ K2).wrapping_mul(d ^ K3);
+        h0 = (h0 ^ lo0 ^ hi0).wrapping_mul(K0);
+
+        let lo1 = (a ^ K4).wrapping_mul(c ^ K5);
+        let hi1 = (b ^ K6).wrapping_mul(d ^ K7);
+        h1 ^= lo1 ^ hi1;
+        h1 = h1.rotate_left(29).wrapping_mul(K4);
         i += 4;
     }
-    h ^= ghost.north.wrapping_mul(K1);
-    h ^= ghost.south.wrapping_mul(K2);
-    h ^= ghost.west.wrapping_mul(K3);
-    h ^= ghost.east.wrapping_mul(K0);
-    let c = (ghost.nw as u64) | ((ghost.ne as u64) << 1)
-        | ((ghost.sw as u64) << 2) | ((ghost.se as u64) << 3);
-    h ^= c.wrapping_mul(K1);
-    h ^= h >> 32;
-    h = h.wrapping_mul(K0);
-    h ^= h >> 29;
-    h | 1
+    h0 ^= ghost.north.wrapping_mul(K1);
+    h0 ^= ghost.south.wrapping_mul(K2);
+    h0 ^= ghost.west.wrapping_mul(K3);
+    h0 ^= ghost.east.wrapping_mul(K0);
+
+    h1 ^= ghost.north.rotate_left(13).wrapping_mul(K5);
+    h1 ^= ghost.south.rotate_left(17).wrapping_mul(K6);
+    h1 ^= ghost.west.rotate_left(23).wrapping_mul(K7);
+    h1 ^= ghost.east.rotate_left(31).wrapping_mul(K4);
+    let c = (ghost.nw as u64)
+        | ((ghost.ne as u64) << 1)
+        | ((ghost.sw as u64) << 2)
+        | ((ghost.se as u64) << 3);
+    h0 ^= c.wrapping_mul(K1);
+    h1 ^= c.wrapping_mul(K6);
+
+    h0 ^= h0 >> 32;
+    h0 = h0.wrapping_mul(K0);
+    h0 ^= h0 >> 29;
+
+    h1 ^= h1 >> 33;
+    h1 = h1.wrapping_mul(K5);
+    h1 ^= h1 >> 31;
+
+    (h0 | 1, h1 | 1)
 }
 
 pub struct TileCache {
@@ -94,13 +155,17 @@ impl TileCache {
     fn record_hit(&mut self) {
         self.window_hits += 1;
         self.window_total += 1;
-        if self.window_total >= ADAPT_WINDOW { self.evaluate_window(); }
+        if self.window_total >= ADAPT_WINDOW {
+            self.evaluate_window();
+        }
     }
 
     #[inline(always)]
     fn record_miss(&mut self) {
         self.window_total += 1;
-        if self.window_total >= ADAPT_WINDOW { self.evaluate_window(); }
+        if self.window_total >= ADAPT_WINDOW {
+            self.evaluate_window();
+        }
     }
 
     #[inline]
@@ -134,31 +199,27 @@ pub unsafe fn advance_tile_cached(
     backend: super::kernel::KernelBackend,
     cache: *mut TileCache,
 ) -> bool {
-    use super::arena::SENTINEL_IDX;
-    use super::tile::{NO_NEIGHBOR, POPULATION_UNKNOWN};
-    debug_assert_eq!(SENTINEL_IDX, 0);
+    use super::tile::POPULATION_UNKNOWN;
 
     let nb = unsafe { &*neighbors_ptr.add(idx) };
-
-    #[inline(always)]
-    unsafe fn sentinel_or(raw: u32) -> usize {
-        let present_mask = (raw != NO_NEIGHBOR) as usize;
-        (raw as usize) & present_mask.wrapping_neg()
-    }
-
-    let north_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[0])) };
-    let south_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[1])) };
-    let west_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[2])) };
-    let east_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[3])) };
-    let nw_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[4])) };
-    let ne_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[5])) };
-    let sw_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[6])) };
-    let se_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[7])) };
+    let north_b = unsafe { &*borders_read_ptr.add(nb[0] as usize) };
+    let south_b = unsafe { &*borders_read_ptr.add(nb[1] as usize) };
+    let west_b = unsafe { &*borders_read_ptr.add(nb[2] as usize) };
+    let east_b = unsafe { &*borders_read_ptr.add(nb[3] as usize) };
+    let nw_b = unsafe { &*borders_read_ptr.add(nb[4] as usize) };
+    let ne_b = unsafe { &*borders_read_ptr.add(nb[5] as usize) };
+    let sw_b = unsafe { &*borders_read_ptr.add(nb[6] as usize) };
+    let se_b = unsafe { &*borders_read_ptr.add(nb[7] as usize) };
 
     let ghost = GhostZone {
-        north: north_b.south, south: south_b.north,
-        west: west_b.east, east: east_b.west,
-        nw: nw_b.se(), ne: ne_b.sw(), sw: sw_b.ne(), se: se_b.nw(),
+        north: north_b.south,
+        south: south_b.north,
+        west: west_b.east,
+        east: east_b.west,
+        nw: nw_b.se(),
+        ne: ne_b.sw(),
+        sw: sw_b.ne(),
+        se: se_b.nw(),
     };
 
     let current = unsafe { &(*current_ptr.add(idx)).0 };
@@ -167,23 +228,34 @@ pub unsafe fn advance_tile_cached(
 
     // Ultra-fast path: empty tile + empty ghost.
     if ghost.north | ghost.south | ghost.west | ghost.east == 0
-        && !ghost.nw && !ghost.ne && !ghost.sw && !ghost.se
+        && !ghost.nw
+        && !ghost.ne
+        && !ghost.sw
+        && !ghost.se
     {
         let mut any = 0u64;
         let mut i = 0;
         while i < TILE_SIZE {
-            any |= current[i] | current[i+1] | current[i+2] | current[i+3];
-            if any != 0 { break; }
+            any |= current[i] | current[i + 1] | current[i + 2] | current[i + 3];
+            if any != 0 {
+                break;
+            }
             i += 4;
         }
         if any == 0 {
             unsafe {
                 std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
                 *next_borders_ptr.add(idx) = BorderData {
-                    north: 0, south: 0, west: 0, east: 0, corners: 0,
+                    north: 0,
+                    south: 0,
+                    west: 0,
+                    east: 0,
+                    corners: 0,
                 };
             }
             meta.set_changed(false);
+            meta.set_has_live(false);
+            meta.population = 0;
             return false;
         }
     }
@@ -191,39 +263,54 @@ pub unsafe fn advance_tile_cached(
     let cr = unsafe { &mut *cache };
 
     if cr.enabled {
-        let key = hash_input(current, &ghost);
-        let slot = key as usize & CACHE_MASK;
+        let (key_lo, key_hi) = hash_input(current, &ghost);
+        let slot = key_lo as usize & CACHE_MASK;
         let entry = unsafe { cr.entries.get_unchecked(slot) };
-        if entry.key == key {
+        if entry.key_lo == key_lo
+            && entry.key_hi == key_hi
+            && entry.input_cells == *current
+            && ghost_eq(&entry.input_ghost, &ghost)
+        {
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    entry.next_cells.as_ptr(), next.as_mut_ptr(), TILE_SIZE,
+                    entry.next_cells.as_ptr(),
+                    next.as_mut_ptr(),
+                    TILE_SIZE,
                 );
                 *next_borders_ptr.add(idx) = entry.border;
             }
             let changed = entry.changed;
             meta.set_changed(changed);
+            meta.set_has_live(entry.has_live);
             if changed {
                 meta.population = POPULATION_UNKNOWN;
-                meta.set_has_live(entry.has_live);
+            } else if !entry.has_live {
+                meta.population = 0;
             }
             cr.record_hit();
             return changed;
         }
         let (changed, border, has_live) =
             super::kernel::advance_core(current, next, &ghost, backend);
-        unsafe { *next_borders_ptr.add(idx) = border; }
+        unsafe {
+            *next_borders_ptr.add(idx) = border;
+        }
         meta.set_changed(changed);
+        meta.set_has_live(has_live);
         if changed {
             meta.population = POPULATION_UNKNOWN;
-            meta.set_has_live(has_live);
+        } else if !has_live {
+            meta.population = 0;
         }
         let em = unsafe { cr.entries.get_unchecked_mut(slot) };
-        em.key = key;
+        em.key_lo = key_lo;
+        em.key_hi = key_hi;
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                next.as_ptr(), em.next_cells.as_mut_ptr(), TILE_SIZE,
-            );
+            std::ptr::copy_nonoverlapping(current.as_ptr(), em.input_cells.as_mut_ptr(), TILE_SIZE);
+        }
+        em.input_ghost = ghost;
+        unsafe {
+            std::ptr::copy_nonoverlapping(next.as_ptr(), em.next_cells.as_mut_ptr(), TILE_SIZE);
         }
         em.border = border;
         em.changed = changed;
@@ -233,13 +320,16 @@ pub unsafe fn advance_tile_cached(
     }
 
     // Cache disabled path.
-    let (changed, border, has_live) =
-        super::kernel::advance_core(current, next, &ghost, backend);
-    unsafe { *next_borders_ptr.add(idx) = border; }
+    let (changed, border, has_live) = super::kernel::advance_core(current, next, &ghost, backend);
+    unsafe {
+        *next_borders_ptr.add(idx) = border;
+    }
     meta.set_changed(changed);
+    meta.set_has_live(has_live);
     if changed {
         meta.population = POPULATION_UNKNOWN;
-        meta.set_has_live(has_live);
+    } else if !has_live {
+        meta.population = 0;
     }
     changed
 }

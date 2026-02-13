@@ -83,7 +83,11 @@ impl Direction {
 }
 
 /// Sentinel value for "no neighbor".
-pub const NO_NEIGHBOR: u32 = u32::MAX;
+///
+/// Index 0 is reserved for the arena sentinel tile, so missing neighbors map
+/// directly to slot 0 without remapping in the hot kernel path.
+pub const NO_NEIGHBOR: u32 = 0;
+const _: [(); 1] = [(); (NO_NEIGHBOR == 0) as usize];
 
 pub type Neighbors = [u32; 8];
 pub const EMPTY_NEIGHBORS: Neighbors = [NO_NEIGHBOR; 8];

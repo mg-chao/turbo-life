@@ -4,9 +4,9 @@ use std::time::Instant;
 
 use super::activity::{prune_and_expand, rebuild_active_set};
 use super::arena::TileArena;
-use super::tile_cache::{TileCache, advance_tile_cached};
 use super::kernel::{KernelBackend, advance_core, advance_tile_fused};
 use super::tile::{self, Direction, NO_NEIGHBOR, POPULATION_UNKNOWN, TileIdx};
+use super::tile_cache::{TileCache, advance_tile_cached};
 
 struct SendPtr<T> {
     inner: *mut T,
@@ -57,6 +57,7 @@ const PARALLEL_KERNEL_MIN_ACTIVE: usize = 128;
 const PARALLEL_KERNEL_TILES_PER_THREAD: usize = 16;
 const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
+const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
 
 static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
 
@@ -553,9 +554,11 @@ impl TurboLife {
             return;
         }
 
-        self.tile_cache.begin_step();
-
         let active_len = self.arena.active_set.len();
+        let use_serial_cache = active_len <= SERIAL_CACHE_MAX_ACTIVE;
+        if use_serial_cache {
+            self.tile_cache.begin_step();
+        }
         let bp = self.arena.border_phase;
         let cp = self.arena.cell_phase;
         let backend = self.backend;
@@ -599,8 +602,8 @@ impl TurboLife {
 
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
-                    use std::arch::x86_64::*;
                     use super::tile::NO_NEIGHBOR;
+                    use std::arch::x86_64::*;
 
                     // Prefetch tile i+2 cell buffers into L2.
                     if i + 2 < active_len {
@@ -620,24 +623,42 @@ impl TurboLife {
                         let nb = &*neighbors_ptr.add(near_ii);
                         for &ni in nb.iter() {
                             if ni != NO_NEIGHBOR {
-                                _mm_prefetch(borders_read_ptr.add(ni as usize) as *const i8, _MM_HINT_T0);
+                                _mm_prefetch(
+                                    borders_read_ptr.add(ni as usize) as *const i8,
+                                    _MM_HINT_T0,
+                                );
                             }
                         }
                     }
                 }
 
-                let changed = unsafe {
-                    advance_tile_cached(
-                        current_ptr,
-                        next_ptr,
-                        meta_ptr,
-                        next_borders_ptr,
-                        borders_read_ptr,
-                        neighbors_ptr,
-                        ii,
-                        backend,
-                        cache_ptr,
-                    )
+                let changed = if use_serial_cache {
+                    unsafe {
+                        advance_tile_cached(
+                            current_ptr,
+                            next_ptr,
+                            meta_ptr,
+                            next_borders_ptr,
+                            borders_read_ptr,
+                            neighbors_ptr,
+                            ii,
+                            backend,
+                            cache_ptr,
+                        )
+                    }
+                } else {
+                    unsafe {
+                        advance_tile_fused(
+                            current_ptr,
+                            next_ptr,
+                            meta_ptr,
+                            next_borders_ptr,
+                            borders_read_ptr,
+                            neighbors_ptr,
+                            ii,
+                            backend,
+                        )
+                    }
                 };
 
                 if changed {
@@ -668,8 +689,8 @@ impl TurboLife {
                 for (ci, &idx) in chunk.iter().enumerate() {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
-                        use std::arch::x86_64::*;
                         use super::tile::NO_NEIGHBOR;
+                        use std::arch::x86_64::*;
                         // Two-level prefetching: L2 far, L1 near.
                         if ci + 2 < chunk.len() {
                             let far_ii = chunk[ci + 2].index();
@@ -680,12 +701,18 @@ impl TurboLife {
                             let near_ii = chunk[ci + 1].index();
                             _mm_prefetch(current_ptr.get().add(near_ii) as *const i8, _MM_HINT_T0);
                             _mm_prefetch(next_ptr.get().add(near_ii) as *const i8, _MM_HINT_T0);
-                            _mm_prefetch(neighbors_ptr.get().add(near_ii) as *const i8, _MM_HINT_T0);
+                            _mm_prefetch(
+                                neighbors_ptr.get().add(near_ii) as *const i8,
+                                _MM_HINT_T0,
+                            );
                             // Prefetch neighbor borders for ghost zone gather.
                             let nb = &*neighbors_ptr.get().add(near_ii);
                             for &ni in nb.iter() {
                                 if ni != NO_NEIGHBOR {
-                                    _mm_prefetch(borders_read_ptr.get().add(ni as usize) as *const i8, _MM_HINT_T0);
+                                    _mm_prefetch(
+                                        borders_read_ptr.get().add(ni as usize) as *const i8,
+                                        _MM_HINT_T0,
+                                    );
                                 }
                             }
                         }

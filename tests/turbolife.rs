@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use rand::Rng;
 use rand::SeedableRng;
-use turbo_life::turbolife::TurboLife;
+use turbo_life::turbolife::{KernelBackend, TurboLife, TurboLifeConfig};
 
 fn set_cells(engine: &mut TurboLife, cells: &[(i64, i64)]) {
     for &(x, y) in cells {
@@ -198,21 +198,18 @@ fn deterministic_across_thread_counts() {
     }
 
     let run = |threads: usize| {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .expect("build thread pool");
-
-        pool.install(|| {
-            let mut engine = TurboLife::new();
-            for &(x, y) in &initial {
-                engine.set_cell(x, y, true);
-            }
-            engine.step_n(12);
-            let pop = engine.population();
-            let live = collect_live(&engine);
-            (pop, live)
-        })
+        let mut engine = TurboLife::with_config(
+            TurboLifeConfig::default()
+                .thread_count(threads)
+                .kernel(KernelBackend::Scalar),
+        );
+        for &(x, y) in &initial {
+            engine.set_cell(x, y, true);
+        }
+        engine.step_n(12);
+        let pop = engine.population();
+        let live = collect_live(&engine);
+        (pop, live)
     };
 
     let (pop1, live1) = run(1);
