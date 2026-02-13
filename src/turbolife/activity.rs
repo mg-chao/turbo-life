@@ -1,15 +1,10 @@
-//! Active set and prune/expand logic for TurboLife.
+//! Active set rebuild and post-kernel prune/expand for TurboLife.
 
 use rayon::prelude::*;
 
 use super::arena::TileArena;
-use super::tile::{BorderData, NO_NEIGHBOR, TileIdx, TileMeta};
+use super::tile::{NO_NEIGHBOR, TileIdx};
 
-const PARALLEL_PRUNE_MIN_ACTIVE: usize = 192;
-const PARALLEL_PRUNE_TILES_PER_THREAD: usize = 24;
-const PARALLEL_PRUNE_MIN_CHUNKS: usize = 2;
-const PRUNE_CHUNK_MIN: usize = 64;
-const PRUNE_CHUNK_MAX: usize = 512;
 const EXPAND_OFFSETS: [(i64, i64); 8] = [
     (0, 1),   // N
     (0, -1),  // S
@@ -20,6 +15,39 @@ const EXPAND_OFFSETS: [(i64, i64); 8] = [
     (-1, -1), // SW
     (1, -1),  // SE
 ];
+const PARALLEL_PRUNE_CANDIDATES_MIN: usize = 256;
+const PRUNE_FILTER_CHUNK_MIN: usize = 64;
+const PRUNE_FILTER_CHUNK_MAX: usize = 512;
+
+struct SendConstPtr<T> {
+    inner: *const T,
+}
+unsafe impl<T> Send for SendConstPtr<T> {}
+unsafe impl<T> Sync for SendConstPtr<T> {}
+impl<T> Copy for SendConstPtr<T> {}
+impl<T> Clone for SendConstPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> SendConstPtr<T> {
+    #[inline(always)]
+    fn new(ptr: *const T) -> Self {
+        Self { inner: ptr }
+    }
+
+    #[inline(always)]
+    fn get(self) -> *const T {
+        self.inner
+    }
+}
+
+#[inline]
+fn prune_filter_chunk_size(candidate_len: usize, threads: usize) -> usize {
+    let target_chunks = threads.saturating_mul(4).max(1);
+    let size = candidate_len.div_ceil(target_chunks);
+    size.clamp(PRUNE_FILTER_CHUNK_MIN, PRUNE_FILTER_CHUNK_MAX)
+}
 
 struct ExpandMaskTable {
     dirs: [[u8; 8]; 256],
@@ -63,51 +91,22 @@ fn unpack_expand_candidate(candidate: u64) -> (TileIdx, usize) {
     )
 }
 
-#[inline]
-fn prune_chunk_size(active_len: usize, threads: usize) -> usize {
-    let target_chunks = threads.saturating_mul(4).max(1);
-    let size = active_len.div_ceil(target_chunks);
-    size.clamp(PRUNE_CHUNK_MIN, PRUNE_CHUNK_MAX)
-}
-
-#[inline]
-fn effective_prune_threads(active_len: usize, thread_count: usize) -> usize {
-    if thread_count <= 1 || active_len < PARALLEL_PRUNE_MIN_ACTIVE {
-        return 1;
+#[inline(always)]
+pub(crate) fn append_expand_candidates(
+    expand: &mut Vec<u64>,
+    idx: TileIdx,
+    missing_mask: u8,
+    live_mask: u8,
+) {
+    let expand_mask = (missing_mask & live_mask) as usize;
+    if expand_mask == 0 {
+        return;
     }
-    let by_work = active_len / PARALLEL_PRUNE_TILES_PER_THREAD;
-    let by_chunks = active_len / PRUNE_CHUNK_MIN;
-    let effective = by_work.min(by_chunks).min(thread_count).max(1);
-    if effective < PARALLEL_PRUNE_MIN_CHUNKS {
-        1
-    } else {
-        effective
+    let dirs = &EXPAND_MASK_TABLE.dirs[expand_mask];
+    let count = EXPAND_MASK_TABLE.len[expand_mask] as usize;
+    for &dir in dirs[..count].iter() {
+        expand.push(pack_expand_candidate(idx, dir as usize));
     }
-}
-
-#[inline]
-fn tuned_prune_threads(active_len: usize, thread_count: usize) -> usize {
-    if thread_count <= 1 {
-        return 1;
-    }
-    let mut effective = effective_prune_threads(active_len, thread_count);
-    if effective <= 1 {
-        return 1;
-    }
-    let cores = thread_count;
-    let tuned_cap = if active_len < 256 {
-        (cores / 4).max(2)
-    } else if active_len < 512 {
-        (cores / 3).max(4)
-    } else if active_len < 1_024 {
-        (cores / 2).max(6)
-    } else if active_len < 4_096 {
-        (cores * 3 / 4).max(8)
-    } else {
-        cores
-    };
-    effective = effective.min(tuned_cap).min(thread_count);
-    effective.max(1)
 }
 
 /// Rebuild the active set from the changed list in O(changed * 9).
@@ -150,10 +149,6 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         return;
     }
 
-    // Hot loop: epoch-stamp changed tiles + their 8 neighbors.
-    // Use raw pointers to eliminate bounds checks on every neighbor access.
-    // Reserve for worst case: each changed tile + up to 8 unique neighbors.
-    // Use 9x estimate (tile + 8 neighbors) to avoid mid-loop reallocation.
     arena
         .active_set
         .reserve(changed_count.saturating_mul(9).min(arena.occupied_count));
@@ -188,165 +183,18 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     }
 
     // Sort active set by index for better cache locality during kernel execution.
-    // The kernel accesses cell_bufs, borders, meta, and neighbors arrays sequentially
-    // by tile index - sorting ensures we walk these arrays in order.
-    // Only sort when the set is small enough that sort cost < cache benefit.
+    // Only sort when the set is small enough that sort cost stays tiny.
     if arena.active_set.len() <= 8192 {
         arena.active_set.sort_unstable_by_key(|idx| idx.0);
     }
 }
 
-#[inline]
-#[allow(dead_code)]
-fn neighbor_has_changed(neighbors: &[[u32; 8]], meta: &[TileMeta], idx: TileIdx) -> bool {
-    let nb = &neighbors[idx.index()];
-    for &ni_raw in nb.iter().take(8) {
-        if ni_raw != NO_NEIGHBOR && meta[ni_raw as usize].changed() {
-            return true;
-        }
-    }
-    false
-}
-
-/// Scan a tile for prune/expand using raw pointers to avoid bounds checks.
-///
-/// # Safety
-/// All pointers must be valid and `idx.index()` must be within bounds.
-/// Neighbor indices in `neighbors_ptr[idx]` must be valid or NO_NEIGHBOR.
-#[inline]
-unsafe fn scan_tile_prune_expand_raw(
-    idx: TileIdx,
-    meta_ptr: *const TileMeta,
-    borders_ptr: *const BorderData,
-    neighbors_ptr: *const [u32; 8],
-    expand: &mut Vec<u64>,
-) -> bool {
-    unsafe {
-        let i_idx = idx.index();
-        let meta = &*meta_ptr.add(i_idx);
-        if !meta.occupied() {
-            return false;
-        }
-
-        let nb = &*neighbors_ptr.add(i_idx);
-        let border = &*borders_ptr.add(i_idx);
-        debug_assert_eq!(
-            border.live_mask,
-            BorderData::compute_live_mask(
-                border.north,
-                border.south,
-                border.west,
-                border.east,
-                border.corners,
-            )
-        );
-
-        // Fast path: when no neighbors are missing, there is no frontier expansion.
-        let missing = meta.missing_mask;
-
-        if missing != 0 {
-            let expand_mask = (missing & border.live_mask) as usize;
-            if expand_mask != 0 {
-                let dirs = &EXPAND_MASK_TABLE.dirs[expand_mask];
-                let count = EXPAND_MASK_TABLE.len[expand_mask] as usize;
-                for &dir in dirs[..count].iter() {
-                    expand.push(pack_expand_candidate(idx, dir as usize));
-                }
-            }
-        }
-
-        if meta.changed() || meta.has_live() {
-            return false;
-        }
-        // Check if any neighbor changed using raw pointer for meta access.
-        for &ni_raw in nb.iter() {
-            if ni_raw != NO_NEIGHBOR && (*meta_ptr.add(ni_raw as usize)).changed() {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-/// Prune dead tiles and expand the frontier.
-pub fn prune_and_expand(arena: &mut TileArena) {
-    arena.expand_buf.clear();
-    arena.prune_buf.clear();
-
-    let bp = arena.border_phase;
-    let active_len = arena.active_set.len();
-    let thread_count = rayon::current_num_threads().max(1);
-
-    if active_len == 0 {
-        return;
-    }
-
-    let effective_threads = tuned_prune_threads(active_len, thread_count);
-    let run_parallel = effective_threads > 1;
-
-    // Get raw pointers for bounds-check-free access in both serial and parallel paths.
-    let meta_ptr = arena.meta.as_ptr();
-    let borders_ptr = arena.borders[bp].as_ptr();
-    let neighbors_ptr = arena.neighbors.as_ptr();
-
-    if !run_parallel {
-        for i in 0..active_len {
-            let idx = arena.active_set[i];
-            let should_prune = unsafe {
-                scan_tile_prune_expand_raw(
-                    idx,
-                    meta_ptr,
-                    borders_ptr,
-                    neighbors_ptr,
-                    &mut arena.expand_buf,
-                )
-            };
-            if should_prune {
-                arena.prune_buf.push(idx);
-            }
-        }
-    } else {
-        // Wrap raw pointers for Send/Sync using usize transmutation.
-        // SAFETY: pointers are valid for the duration of the parallel phase
-        // (arena is not modified during par_chunks).
-        let s_meta = meta_ptr as usize;
-        let s_borders = borders_ptr as usize;
-        let s_neighbors = neighbors_ptr as usize;
-
-        let chunk_size = prune_chunk_size(active_len, effective_threads);
-        let (expand_all, prune_all) = arena
-            .active_set
-            .par_chunks(chunk_size)
-            .fold(
-                || (Vec::new(), Vec::new()),
-                move |mut acc, chunk| {
-                    let mp = s_meta as *const TileMeta;
-                    let bp = s_borders as *const BorderData;
-                    let np = s_neighbors as *const [u32; 8];
-                    for &idx in chunk {
-                        let should_prune =
-                            unsafe { scan_tile_prune_expand_raw(idx, mp, bp, np, &mut acc.0) };
-                        if should_prune {
-                            acc.1.push(idx);
-                        }
-                    }
-                    acc
-                },
-            )
-            .reduce(
-                || (Vec::new(), Vec::new()),
-                |mut left, mut right| {
-                    left.0.append(&mut right.0);
-                    left.1.append(&mut right.1);
-                    left
-                },
-            );
-        arena.expand_buf.extend(expand_all);
-        arena.prune_buf.extend(prune_all);
-    }
+/// Apply expansion and pruning from candidates collected during kernel execution.
+pub fn finalize_prune_and_expand(arena: &mut TileArena) {
     if !arena.expand_buf.is_empty() {
         arena.reserve_additional_tiles(arena.expand_buf.len());
     }
+
     for i in 0..arena.expand_buf.len() {
         let (src_idx, dir) = unpack_expand_candidate(arena.expand_buf[i]);
         let src_i = src_idx.index();
@@ -366,8 +214,82 @@ pub fn prune_and_expand(arena: &mut TileArena) {
         arena.mark_changed(idx);
     }
 
-    for i in 0..arena.prune_buf.len() {
-        let idx = arena.prune_buf[i];
-        arena.release(idx);
+    let prune_len = arena.prune_buf.len();
+    if prune_len == 0 {
+        arena.expand_buf.clear();
+        arena.prune_buf.clear();
+        return;
     }
+
+    let thread_count = rayon::current_num_threads().max(1);
+    let run_parallel = thread_count > 1 && prune_len >= PARALLEL_PRUNE_CANDIDATES_MIN;
+
+    if run_parallel {
+        let chunk_size = prune_filter_chunk_size(prune_len, thread_count);
+        let meta_ptr = SendConstPtr::new(arena.meta.as_ptr());
+        let neighbors_ptr = SendConstPtr::new(arena.neighbors.as_ptr());
+        let prune_candidates = &arena.prune_buf;
+
+        let mut to_prune = prune_candidates
+            .par_chunks(chunk_size)
+            .fold(Vec::new, move |mut acc, chunk| {
+                let mp = meta_ptr.get();
+                let np = neighbors_ptr.get();
+                for &idx in chunk {
+                    let ii = idx.index();
+                    // SAFETY: pointers are stable and only read during this phase.
+                    unsafe {
+                        let meta = *mp.add(ii);
+                        if !meta.occupied() || meta.changed() || meta.has_live() {
+                            continue;
+                        }
+
+                        let nb = *np.add(ii);
+                        let mut neighbor_changed = false;
+                        for &ni_raw in nb.iter() {
+                            if ni_raw != NO_NEIGHBOR && (*mp.add(ni_raw as usize)).changed() {
+                                neighbor_changed = true;
+                                break;
+                            }
+                        }
+                        if !neighbor_changed {
+                            acc.push(idx);
+                        }
+                    }
+                }
+                acc
+            })
+            .reduce(Vec::new, |mut left, mut right| {
+                left.append(&mut right);
+                left
+            });
+
+        for idx in to_prune.drain(..) {
+            arena.release(idx);
+        }
+    } else {
+        for i in 0..prune_len {
+            let idx = arena.prune_buf[i];
+            let ii = idx.index();
+            let meta = arena.meta[ii];
+            if !meta.occupied() || meta.changed() || meta.has_live() {
+                continue;
+            }
+
+            let mut neighbor_changed = false;
+            let nb = arena.neighbors[ii];
+            for &ni_raw in nb.iter() {
+                if ni_raw != NO_NEIGHBOR && arena.meta[ni_raw as usize].changed() {
+                    neighbor_changed = true;
+                    break;
+                }
+            }
+            if !neighbor_changed {
+                arena.release(idx);
+            }
+        }
+    }
+
+    arena.expand_buf.clear();
+    arena.prune_buf.clear();
 }

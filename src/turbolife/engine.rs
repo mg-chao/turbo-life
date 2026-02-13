@@ -2,7 +2,7 @@ use rayon::prelude::*;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use super::activity::{prune_and_expand, rebuild_active_set};
+use super::activity::{append_expand_candidates, finalize_prune_and_expand, rebuild_active_set};
 use super::arena::TileArena;
 #[cfg(target_arch = "x86_64")]
 use super::kernel::advance_tile_fused_avx2;
@@ -62,6 +62,7 @@ const PARALLEL_KERNEL_TILES_PER_THREAD: usize = 16;
 const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
 const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
+const PARALLEL_POST_SCAN_THRESHOLD: usize = 8192;
 
 static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
 
@@ -556,6 +557,8 @@ impl TurboLife {
         }
 
         let active_len = self.arena.active_set.len();
+        self.arena.expand_buf.clear();
+        self.arena.prune_buf.clear();
         let use_serial_cache = active_len <= SERIAL_CACHE_MAX_ACTIVE;
         if use_serial_cache {
             self.tile_cache.begin_step();
@@ -648,13 +651,26 @@ impl TurboLife {
                             )
                         };
 
-                        if changed {
-                            unsafe {
-                                let meta = &mut *meta_ptr.add(ii);
-                                if !meta.in_changed_list() {
-                                    meta.set_in_changed_list(true);
-                                    self.arena.changed_list.push(idx);
-                                }
+                        unsafe {
+                            let meta = &mut *meta_ptr.add(ii);
+                            if changed && !meta.in_changed_list() {
+                                meta.set_in_changed_list(true);
+                                self.arena.changed_list.push(idx);
+                            }
+
+                            let missing = meta.missing_mask;
+                            if missing != 0 {
+                                let live_mask = (*next_borders_ptr.add(ii)).live_mask;
+                                append_expand_candidates(
+                                    &mut self.arena.expand_buf,
+                                    idx,
+                                    missing,
+                                    live_mask,
+                                );
+                            }
+
+                            if !changed && !meta.has_live() {
+                                self.arena.prune_buf.push(idx);
                             }
                         }
                     }
@@ -711,13 +727,26 @@ impl TurboLife {
                             )
                         };
 
-                        if changed {
-                            unsafe {
-                                let meta = &mut *meta_ptr.add(ii);
-                                if !meta.in_changed_list() {
-                                    meta.set_in_changed_list(true);
-                                    self.arena.changed_list.push(idx);
-                                }
+                        unsafe {
+                            let meta = &mut *meta_ptr.add(ii);
+                            if changed && !meta.in_changed_list() {
+                                meta.set_in_changed_list(true);
+                                self.arena.changed_list.push(idx);
+                            }
+
+                            let missing = meta.missing_mask;
+                            if missing != 0 {
+                                let live_mask = (*next_borders_ptr.add(ii)).live_mask;
+                                append_expand_candidates(
+                                    &mut self.arena.expand_buf,
+                                    idx,
+                                    missing,
+                                    live_mask,
+                                );
+                            }
+
+                            if !changed && !meta.has_live() {
+                                self.arena.prune_buf.push(idx);
                             }
                         }
                     }
@@ -767,7 +796,117 @@ impl TurboLife {
             let worker_count = effective_threads.min(active_len);
             let chunk_size = active_len.div_ceil(worker_count);
 
-            macro_rules! parallel_loop_fused {
+            macro_rules! parallel_loop_collect {
+                ($advance:path) => {{
+                    active_set
+                        .par_chunks(chunk_size)
+                        .fold(
+                            || {
+                                (
+                                    Vec::<TileIdx>::new(),
+                                    Vec::<u64>::new(),
+                                    Vec::<TileIdx>::new(),
+                                )
+                            },
+                            move |mut acc, chunk| {
+                                for (ci, &idx) in chunk.iter().enumerate() {
+                                    #[cfg(target_arch = "x86_64")]
+                                    unsafe {
+                                        use super::tile::NO_NEIGHBOR;
+                                        use std::arch::x86_64::*;
+                                        // Two-level prefetching: L2 far, L1 near.
+                                        if ci + 2 < chunk.len() {
+                                            let far_ii = chunk[ci + 2].index();
+                                            _mm_prefetch(
+                                                current_ptr.get().add(far_ii) as *const i8,
+                                                _MM_HINT_T1,
+                                            );
+                                            _mm_prefetch(
+                                                next_ptr.get().add(far_ii) as *const i8,
+                                                _MM_HINT_T1,
+                                            );
+                                        }
+                                        if ci + 1 < chunk.len() {
+                                            let near_ii = chunk[ci + 1].index();
+                                            _mm_prefetch(
+                                                current_ptr.get().add(near_ii) as *const i8,
+                                                _MM_HINT_T0,
+                                            );
+                                            _mm_prefetch(
+                                                next_ptr.get().add(near_ii) as *const i8,
+                                                _MM_HINT_T0,
+                                            );
+                                            _mm_prefetch(
+                                                neighbors_ptr.get().add(near_ii) as *const i8,
+                                                _MM_HINT_T0,
+                                            );
+                                            // Prefetch neighbor borders for ghost zone gather.
+                                            let nb = &*neighbors_ptr.get().add(near_ii);
+                                            for &ni in nb.iter() {
+                                                if ni != NO_NEIGHBOR {
+                                                    _mm_prefetch(
+                                                        borders_read_ptr.get().add(ni as usize)
+                                                            as *const i8,
+                                                        _MM_HINT_T0,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let ii = idx.index();
+                                    let changed = unsafe {
+                                        $advance(
+                                            current_ptr.get(),
+                                            next_ptr.get(),
+                                            meta_ptr.get(),
+                                            next_borders_ptr.get(),
+                                            borders_read_ptr.get(),
+                                            neighbors_ptr.get(),
+                                            ii,
+                                        )
+                                    };
+
+                                    unsafe {
+                                        let meta = &*meta_ptr.get().add(ii);
+                                        let missing = meta.missing_mask;
+                                        if missing != 0 {
+                                            let live_mask =
+                                                (*next_borders_ptr.get().add(ii)).live_mask;
+                                            append_expand_candidates(
+                                                &mut acc.1, idx, missing, live_mask,
+                                            );
+                                        }
+                                        if !changed && !meta.has_live() {
+                                            acc.2.push(idx);
+                                        }
+                                    }
+                                    if changed {
+                                        acc.0.push(idx);
+                                    }
+                                }
+                                acc
+                            },
+                        )
+                        .reduce(
+                            || {
+                                (
+                                    Vec::<TileIdx>::new(),
+                                    Vec::<u64>::new(),
+                                    Vec::<TileIdx>::new(),
+                                )
+                            },
+                            |mut left, mut right| {
+                                left.0.append(&mut right.0);
+                                left.1.append(&mut right.1);
+                                left.2.append(&mut right.2);
+                                left
+                            },
+                        )
+                }};
+            }
+
+            macro_rules! parallel_loop_compute {
                 ($advance:path) => {{
                     active_set.par_chunks(chunk_size).for_each(move |chunk| {
                         for (ci, &idx) in chunk.iter().enumerate() {
@@ -827,32 +966,79 @@ impl TurboLife {
                                 );
                             }
                         }
-                    });
+                    })
                 }};
             }
 
-            match backend {
-                KernelBackend::Scalar => parallel_loop_fused!(advance_tile_fused_scalar),
-                KernelBackend::Avx2 => {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        parallel_loop_fused!(advance_tile_fused_avx2);
-                    }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    {
-                        parallel_loop_fused!(advance_tile_fused_scalar);
+            if active_len >= PARALLEL_POST_SCAN_THRESHOLD {
+                match backend {
+                    KernelBackend::Scalar => parallel_loop_compute!(advance_tile_fused_scalar),
+                    KernelBackend::Avx2 => {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            parallel_loop_compute!(advance_tile_fused_avx2)
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            parallel_loop_compute!(advance_tile_fused_scalar)
+                        }
                     }
                 }
-            }
 
-            // Fast serial scan: only reads meta.flags byte per tile (hot in L1 from kernel).
-            let meta_ptr = self.arena.meta.as_mut_ptr();
-            for &idx in active_set {
-                unsafe {
-                    let meta = &mut *meta_ptr.add(idx.index());
-                    if meta.changed() && !meta.in_changed_list() {
-                        meta.set_in_changed_list(true);
-                        self.arena.changed_list.push(idx);
+                let meta_write_ptr = self.arena.meta.as_mut_ptr();
+                let next_border_read_ptr = next_borders_vec.as_ptr();
+                for &idx in active_set {
+                    let ii = idx.index();
+                    unsafe {
+                        let meta = &mut *meta_write_ptr.add(ii);
+                        let changed = meta.changed();
+                        if changed && !meta.in_changed_list() {
+                            meta.set_in_changed_list(true);
+                            self.arena.changed_list.push(idx);
+                        }
+
+                        let missing = meta.missing_mask;
+                        if missing != 0 {
+                            let live_mask = (*next_border_read_ptr.add(ii)).live_mask;
+                            append_expand_candidates(
+                                &mut self.arena.expand_buf,
+                                idx,
+                                missing,
+                                live_mask,
+                            );
+                        }
+
+                        if !changed && !meta.has_live() {
+                            self.arena.prune_buf.push(idx);
+                        }
+                    }
+                }
+            } else {
+                let (mut changed_all, mut expand_all, mut prune_all) = match backend {
+                    KernelBackend::Scalar => parallel_loop_collect!(advance_tile_fused_scalar),
+                    KernelBackend::Avx2 => {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            parallel_loop_collect!(advance_tile_fused_avx2)
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            parallel_loop_collect!(advance_tile_fused_scalar)
+                        }
+                    }
+                };
+
+                self.arena.expand_buf.append(&mut expand_all);
+                self.arena.prune_buf.append(&mut prune_all);
+
+                let meta_write_ptr = self.arena.meta.as_mut_ptr();
+                for idx in changed_all.drain(..) {
+                    unsafe {
+                        let meta = &mut *meta_write_ptr.add(idx.index());
+                        if !meta.in_changed_list() {
+                            meta.set_in_changed_list(true);
+                            self.arena.changed_list.push(idx);
+                        }
                     }
                 }
             }
@@ -861,7 +1047,7 @@ impl TurboLife {
         self.arena.flip_borders();
         self.arena.flip_cells();
 
-        prune_and_expand(&mut self.arena);
+        finalize_prune_and_expand(&mut self.arena);
 
         self.population_cache = None;
         self.generation += 1;
