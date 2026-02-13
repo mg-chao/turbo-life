@@ -4,8 +4,7 @@ use std::time::Instant;
 
 use super::activity::{prune_and_expand, rebuild_active_set};
 use super::arena::TileArena;
-use super::kernel::{KernelBackend, advance_core, advance_tile_split};
-use super::sync::gather_ghost_zone_raw;
+use super::kernel::{KernelBackend, advance_core, advance_tile_fused};
 use super::tile::{self, Direction, NO_NEIGHBOR, POPULATION_UNKNOWN, TileIdx};
 
 struct SendPtr<T> {
@@ -578,7 +577,9 @@ impl TurboLife {
         debug_assert_eq!(self.arena.meta.len(), self.arena.neighbors.len());
 
         if !run_parallel {
-            // Serial path: use raw pointers to eliminate bounds checks in the hot loop.
+            // Serial path: fused ghost-gather + kernel with multi-level prefetching.
+            // Prefetches cell buffers AND neighbor border data to overlap memory
+            // latency with computation.
             let neighbors_ptr = self.arena.neighbors.as_ptr();
             let borders_read_ptr = borders_read.as_ptr();
             let current_ptr = current_vec.as_ptr();
@@ -591,39 +592,51 @@ impl TurboLife {
                 let idx = unsafe { *active_ptr.add(i) };
                 let ii = idx.index();
 
-                // Prefetch the next tile's cell buffer and neighbors into L2 cache.
-                // This hides memory latency by overlapping fetch with current tile's compute.
-                if i + 1 < active_len {
-                    let next_ii = unsafe { (*active_ptr.add(i + 1)).index() };
-                    unsafe {
-                        let next_current_addr = current_ptr.add(next_ii) as *const u8;
-                        let next_next_addr = next_ptr.add(next_ii) as *const u8;
-                        // Prefetch first cache line of current and next cell buffers.
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            use std::arch::x86_64::*;
-                            _mm_prefetch(next_current_addr as *const i8, _MM_HINT_T1);
-                            _mm_prefetch(next_next_addr as *const i8, _MM_HINT_T1);
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    use std::arch::x86_64::*;
+                    use super::tile::NO_NEIGHBOR;
+
+                    // Prefetch tile i+2 cell buffers into L2.
+                    if i + 2 < active_len {
+                        let far_ii = (*active_ptr.add(i + 2)).index();
+                        _mm_prefetch(current_ptr.add(far_ii) as *const i8, _MM_HINT_T1);
+                        _mm_prefetch(next_ptr.add(far_ii) as *const i8, _MM_HINT_T1);
+                    }
+                    // Prefetch tile i+1: cell buffers into L1, plus neighbor borders
+                    // for ghost zone gather.
+                    if i + 1 < active_len {
+                        let near_ii = (*active_ptr.add(i + 1)).index();
+                        _mm_prefetch(current_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(next_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(neighbors_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
+                        // Prefetch border data for the next tile's 8 neighbors.
+                        // This hides the random-access latency of ghost zone gathering.
+                        let nb = &*neighbors_ptr.add(near_ii);
+                        for &ni in nb.iter() {
+                            if ni != NO_NEIGHBOR {
+                                _mm_prefetch(borders_read_ptr.add(ni as usize) as *const i8, _MM_HINT_T0);
+                            }
                         }
                     }
                 }
 
-                let ghost = unsafe { gather_ghost_zone_raw(ii, borders_read_ptr, neighbors_ptr) };
-
-                let (changed, _border, has_live) = unsafe {
-                    let current = &(*current_ptr.add(ii)).0;
-                    let next = &mut (*next_ptr.add(ii)).0;
-                    let result = advance_core(current, next, &ghost, backend);
-                    *next_borders_ptr.add(ii) = result.1;
-                    result
+                let changed = unsafe {
+                    advance_tile_fused(
+                        current_ptr,
+                        next_ptr,
+                        meta_ptr,
+                        next_borders_ptr,
+                        borders_read_ptr,
+                        neighbors_ptr,
+                        ii,
+                        backend,
+                    )
                 };
 
-                unsafe {
-                    let meta = &mut *meta_ptr.add(ii);
-                    meta.set_changed(changed);
-                    if changed {
-                        meta.population = POPULATION_UNKNOWN;
-                        meta.set_has_live(has_live);
+                if changed {
+                    unsafe {
+                        let meta = &mut *meta_ptr.add(ii);
                         if !meta.in_changed_list() {
                             meta.set_in_changed_list(true);
                             self.arena.changed_list.push(idx);
@@ -632,9 +645,7 @@ impl TurboLife {
                 }
             }
         } else {
-            // Parallel kernel compute with raw pointers (bounds-check-free in
-            // the hot inner loop), followed by a single raw-pointer scan that
-            // harvests changed tiles into `changed_list`.
+            // Parallel kernel compute with fused ghost-gather + two-level prefetching.
             let active_set = &self.arena.active_set;
             let current_ptr = SendConstPtr::new(current_vec.as_ptr());
             let next_ptr = SendPtr::new(next_vec.as_mut_ptr());
@@ -647,43 +658,47 @@ impl TurboLife {
 
             active_set.par_chunks(chunk_size).for_each(move |chunk| {
                 for (ci, &idx) in chunk.iter().enumerate() {
-                    // Prefetch next tile's cell buffers into L2 cache.
-                    if ci + 1 < chunk.len() {
-                        let next_ii = chunk[ci + 1].index();
-                        unsafe {
-                            let next_current_addr = current_ptr.get().add(next_ii) as *const u8;
-                            let next_next_addr = next_ptr.get().add(next_ii) as *const u8;
-                            #[cfg(target_arch = "x86_64")]
-                            {
-                                use std::arch::x86_64::*;
-                                _mm_prefetch(next_current_addr as *const i8, _MM_HINT_T1);
-                                _mm_prefetch(next_next_addr as *const i8, _MM_HINT_T1);
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        use std::arch::x86_64::*;
+                        use super::tile::NO_NEIGHBOR;
+                        // Two-level prefetching: L2 far, L1 near.
+                        if ci + 2 < chunk.len() {
+                            let far_ii = chunk[ci + 2].index();
+                            _mm_prefetch(current_ptr.get().add(far_ii) as *const i8, _MM_HINT_T1);
+                            _mm_prefetch(next_ptr.get().add(far_ii) as *const i8, _MM_HINT_T1);
+                        }
+                        if ci + 1 < chunk.len() {
+                            let near_ii = chunk[ci + 1].index();
+                            _mm_prefetch(current_ptr.get().add(near_ii) as *const i8, _MM_HINT_T0);
+                            _mm_prefetch(next_ptr.get().add(near_ii) as *const i8, _MM_HINT_T0);
+                            _mm_prefetch(neighbors_ptr.get().add(near_ii) as *const i8, _MM_HINT_T0);
+                            // Prefetch neighbor borders for ghost zone gather.
+                            let nb = &*neighbors_ptr.get().add(near_ii);
+                            for &ni in nb.iter() {
+                                if ni != NO_NEIGHBOR {
+                                    _mm_prefetch(borders_read_ptr.get().add(ni as usize) as *const i8, _MM_HINT_T0);
+                                }
                             }
                         }
                     }
-                    let ghost = unsafe {
-                        gather_ghost_zone_raw(
-                            idx.index(),
-                            borders_read_ptr.get(),
-                            neighbors_ptr.get(),
-                        )
-                    };
 
                     unsafe {
-                        advance_tile_split(
+                        advance_tile_fused(
                             current_ptr.get(),
                             next_ptr.get(),
                             meta_ptr.get(),
                             next_borders_ptr.get(),
+                            borders_read_ptr.get(),
+                            neighbors_ptr.get(),
                             idx.index(),
-                            &ghost,
                             backend,
                         );
                     }
                 }
             });
 
-            // Serial scan with raw pointers: branch-light and bounds-check-free.
+            // Fast serial scan: only reads meta.flags byte per tile (hot in L1 from kernel).
             let meta_ptr = self.arena.meta.as_mut_ptr();
             for &idx in active_set {
                 unsafe {

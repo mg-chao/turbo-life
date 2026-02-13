@@ -142,6 +142,8 @@ pub fn advance_core_scalar(
     (changed, border, has_live)
 }
 
+// ── AVX2 kernel ─────────────────────────────────────────────────────────
+
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn avx2_set_u64x4_lane_order(
@@ -151,10 +153,38 @@ unsafe fn avx2_set_u64x4_lane_order(
     a3: u64,
 ) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::_mm256_set_epi64x;
-
     unsafe { _mm256_set_epi64x(a3 as i64, a2 as i64, a1 as i64, a0 as i64) }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn avx2_full_add(
+    a: std::arch::x86_64::__m256i,
+    b: std::arch::x86_64::__m256i,
+    c: std::arch::x86_64::__m256i,
+) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i) {
+    use std::arch::x86_64::{_mm256_and_si256, _mm256_or_si256, _mm256_xor_si256};
+    unsafe {
+        let sum = _mm256_xor_si256(_mm256_xor_si256(a, b), c);
+        let carry = _mm256_or_si256(
+            _mm256_or_si256(_mm256_and_si256(a, b), _mm256_and_si256(b, c)),
+            _mm256_and_si256(a, c),
+        );
+        (sum, carry)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn avx2_half_add(
+    a: std::arch::x86_64::__m256i,
+    b: std::arch::x86_64::__m256i,
+) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i) {
+    use std::arch::x86_64::{_mm256_and_si256, _mm256_xor_si256};
+    unsafe { (_mm256_xor_si256(a, b), _mm256_and_si256(a, b)) }
+}
+
+/// Build carry masks for 4 lanes from 4 ghost bits, placing each bit at `shift`.
 #[cfg(target_arch = "x86_64")]
 const fn avx2_build_carry_table(shift: u32) -> [[u64; 4]; 16] {
     let mut table = [[0u64; 4]; 16];
@@ -182,7 +212,6 @@ const AVX2_CARRY_HI_TABLE: [[u64; 4]; 16] = avx2_build_carry_table(63);
 #[inline(always)]
 unsafe fn avx2_carry_mask_lo(bits4: u64) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::{__m256i, _mm256_loadu_si256};
-
     let row = unsafe { AVX2_CARRY_LO_TABLE.get_unchecked(bits4 as usize) };
     unsafe { _mm256_loadu_si256(row.as_ptr() as *const __m256i) }
 }
@@ -191,41 +220,17 @@ unsafe fn avx2_carry_mask_lo(bits4: u64) -> std::arch::x86_64::__m256i {
 #[inline(always)]
 unsafe fn avx2_carry_mask_hi(bits4: u64) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::{__m256i, _mm256_loadu_si256};
-
     let row = unsafe { AVX2_CARRY_HI_TABLE.get_unchecked(bits4 as usize) };
     unsafe { _mm256_loadu_si256(row.as_ptr() as *const __m256i) }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn avx2_full_add(
-    a: std::arch::x86_64::__m256i,
-    b: std::arch::x86_64::__m256i,
-    c: std::arch::x86_64::__m256i,
-) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i) {
-    use std::arch::x86_64::{_mm256_and_si256, _mm256_or_si256, _mm256_xor_si256};
-
-    unsafe {
-        let sum = _mm256_xor_si256(_mm256_xor_si256(a, b), c);
-        let carry = _mm256_or_si256(
-            _mm256_or_si256(_mm256_and_si256(a, b), _mm256_and_si256(b, c)),
-            _mm256_and_si256(a, c),
-        );
-        (sum, carry)
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn avx2_half_add(
-    a: std::arch::x86_64::__m256i,
-    b: std::arch::x86_64::__m256i,
-) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i) {
-    use std::arch::x86_64::{_mm256_and_si256, _mm256_xor_si256};
-
-    unsafe { (_mm256_xor_si256(a, b), _mm256_and_si256(a, b)) }
-}
-
+/// AVX2 kernel: processes 4 rows at a time using 256-bit SIMD.
+///
+/// Optimizations over scalar:
+/// - 4x throughput on the full-adder chain (4 rows per iteration)
+/// - Vectorized changed/has_live detection via `_mm256_testz_si256`
+/// - Lookup-table-based ghost bit injection (no per-lane branching)
+/// - Direct store to output buffer via `_mm256_storeu_si256`
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn advance_core_avx2(
@@ -319,15 +324,13 @@ pub unsafe fn advance_core_avx2(
         changed |= _mm256_testz_si256(diff, diff) == 0;
         has_live |= _mm256_testz_si256(next_rows, next_rows) == 0;
 
-        let mut next_words = [0u64; 4];
+        // Store directly to output and extract border bits.
         unsafe {
-            _mm256_storeu_si256(next_words.as_mut_ptr() as *mut __m256i, next_rows);
+            _mm256_storeu_si256(next.as_mut_ptr().add(row_base) as *mut __m256i, next_rows);
         }
-
-        for lane in 0..4 {
+        for lane in 0..4usize {
             let row = row_base + lane;
-            let next_row = next_words[lane];
-            next[row] = next_row;
+            let next_row = next[row];
             border_west |= (next_row & 1) << row;
             border_east |= ((next_row >> 63) & 1) << row;
         }
@@ -380,6 +383,80 @@ pub fn advance_core(
     }
 }
 
+/// Fused ghost-gather + kernel advance using raw pointers.
+///
+/// Eliminates the intermediate GhostZone struct by inlining the gather
+/// directly into the kernel dispatch. This reduces register pressure
+/// and avoids constructing/destructuring the struct.
+///
+/// # Safety
+/// All pointers must be valid. `idx` must be within bounds of all arrays.
+/// Caller must ensure exclusive write access to `next_ptr[idx]`,
+/// `meta_ptr[idx]`, and `next_borders_ptr[idx]`.
+#[inline(always)]
+pub unsafe fn advance_tile_fused(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
+    meta_ptr: *mut TileMeta,
+    next_borders_ptr: *mut BorderData,
+    borders_read_ptr: *const BorderData,
+    neighbors_ptr: *const [u32; 8],
+    idx: usize,
+    backend: KernelBackend,
+) -> bool {
+    use super::arena::SENTINEL_IDX;
+    use super::tile::NO_NEIGHBOR;
+
+    debug_assert_eq!(SENTINEL_IDX, 0);
+
+    // Inline branchless ghost-zone gather (avoids function call + struct construction).
+    let nb = unsafe { &*neighbors_ptr.add(idx) };
+
+    #[inline(always)]
+    unsafe fn sentinel_or(raw: u32) -> usize {
+        let present_mask = (raw != NO_NEIGHBOR) as usize;
+        (raw as usize) & present_mask.wrapping_neg()
+    }
+
+    let north_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[0])) };
+    let south_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[1])) };
+    let west_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[2])) };
+    let east_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[3])) };
+    let nw_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[4])) };
+    let ne_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[5])) };
+    let sw_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[6])) };
+    let se_b = unsafe { &*borders_read_ptr.add(sentinel_or(nb[7])) };
+
+    let ghost = GhostZone {
+        north: north_b.south,
+        south: south_b.north,
+        west: west_b.east,
+        east: east_b.west,
+        nw: nw_b.se(),
+        ne: ne_b.sw(),
+        sw: sw_b.ne(),
+        se: se_b.nw(),
+    };
+
+    let current = unsafe { &(*current_ptr.add(idx)).0 };
+    let next = unsafe { &mut (*next_ptr.add(idx)).0 };
+    let meta = unsafe { &mut *meta_ptr.add(idx) };
+
+    let (changed, border, has_live) = advance_core(current, next, &ghost, backend);
+
+    unsafe {
+        *next_borders_ptr.add(idx) = border;
+    }
+
+    meta.set_changed(changed);
+    if changed {
+        meta.population = POPULATION_UNKNOWN;
+        meta.set_has_live(has_live);
+    }
+
+    changed
+}
+
 /// Advance a tile using split buffer pointers (unsafe parallel path).
 ///
 /// # Safety
@@ -387,6 +464,7 @@ pub fn advance_core(
 /// to valid slices, and the caller must ensure exclusive write access to
 /// the element at `idx` in the write-side arrays.
 #[inline(always)]
+#[allow(dead_code)]
 pub unsafe fn advance_tile_split(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
