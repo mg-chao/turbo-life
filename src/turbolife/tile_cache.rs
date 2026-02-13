@@ -1,4 +1,4 @@
-use super::kernel::{ghost_is_empty, tile_is_empty};
+use super::kernel::{ghost_is_empty_from_live_masks, tile_is_empty};
 use super::tile::{BorderData, CellBuf, GhostZone, TILE_SIZE};
 
 const CACHE_SIZE: usize = 1 << 13;
@@ -234,6 +234,37 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
     let sw_b = unsafe { &*borders_read_ptr.add(nb[6] as usize) };
     let se_b = unsafe { &*borders_read_ptr.add(nb[7] as usize) };
 
+    let current = unsafe { &(*current_ptr.add(idx)).0 };
+    let next = unsafe { &mut (*next_ptr.add(idx)).0 };
+    let meta = unsafe { &mut *meta_ptr.add(idx) };
+
+    if !meta.has_live() {
+        // Ultra-fast path: metadata says current tile is empty and halo has no
+        // incoming live cells.
+        let ghost_empty = ghost_is_empty_from_live_masks([
+            north_b.live_mask,
+            south_b.live_mask,
+            west_b.live_mask,
+            east_b.live_mask,
+            nw_b.live_mask,
+            ne_b.live_mask,
+            sw_b.live_mask,
+            se_b.live_mask,
+        ]);
+
+        if ghost_empty {
+            debug_assert!(tile_is_empty(current));
+            unsafe {
+                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                *next_borders_ptr.add(idx) = BorderData::default();
+            }
+            meta.set_changed(false);
+            meta.set_has_live(false);
+            meta.population = 0;
+            return false;
+        }
+    }
+
     let ghost = GhostZone {
         north: north_b.south,
         south: south_b.north,
@@ -244,22 +275,6 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
         sw: sw_b.ne(),
         se: se_b.nw(),
     };
-
-    let current = unsafe { &(*current_ptr.add(idx)).0 };
-    let next = unsafe { &mut (*next_ptr.add(idx)).0 };
-    let meta = unsafe { &mut *meta_ptr.add(idx) };
-
-    // Ultra-fast path: empty tile + empty ghost.
-    if ghost_is_empty(&ghost) && tile_is_empty(current) {
-        unsafe {
-            std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
-            *next_borders_ptr.add(idx) = BorderData::default();
-        }
-        meta.set_changed(false);
-        meta.set_has_live(false);
-        meta.population = 0;
-        return false;
-    }
 
     let cr = unsafe { &mut *cache };
 

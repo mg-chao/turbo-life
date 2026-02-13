@@ -44,12 +44,36 @@ fn corners_from_rows(north: u64, south: u64) -> u8 {
 }
 
 #[inline(always)]
+#[cfg(test)]
 pub(crate) fn ghost_is_empty(ghost: &GhostZone) -> bool {
     let corners = (ghost.nw as u64)
         | ((ghost.ne as u64) << 1)
         | ((ghost.sw as u64) << 2)
         | ((ghost.se as u64) << 3);
     (ghost.north | ghost.south | ghost.west | ghost.east | corners) == 0
+}
+
+#[inline(always)]
+pub(crate) fn ghost_is_empty_from_live_masks(neighbor_live_masks: [u8; 8]) -> bool {
+    const LIVE_N: u8 = 1 << 0;
+    const LIVE_S: u8 = 1 << 1;
+    const LIVE_W: u8 = 1 << 2;
+    const LIVE_E: u8 = 1 << 3;
+    const LIVE_NW: u8 = 1 << 4;
+    const LIVE_NE: u8 = 1 << 5;
+    const LIVE_SW: u8 = 1 << 6;
+    const LIVE_SE: u8 = 1 << 7;
+
+    let [north, south, west, east, nw, ne, sw, se] = neighbor_live_masks;
+    let ghost_activity = (north & LIVE_S)
+        | (south & LIVE_N)
+        | (west & LIVE_E)
+        | (east & LIVE_W)
+        | (nw & LIVE_SE)
+        | (ne & LIVE_SW)
+        | (sw & LIVE_NE)
+        | (se & LIVE_NW);
+    ghost_activity == 0
 }
 
 #[inline(always)]
@@ -460,6 +484,40 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
     let sw_b = unsafe { &*borders_read_ptr.add(nb[6] as usize) };
     let se_b = unsafe { &*borders_read_ptr.add(nb[7] as usize) };
 
+    let current = unsafe { &(*current_ptr.add(idx)).0 };
+    let next = unsafe { &mut (*next_ptr.add(idx)).0 };
+    let meta = unsafe { &mut *meta_ptr.add(idx) };
+
+    if !meta.has_live() {
+        // Ultra-fast path: metadata says current tile is empty and the gathered
+        // ghost halo is empty as well.
+        //
+        // We check halo emptiness via precomputed border live-mask bits instead
+        // of rebuilding it from full edge words.
+        let ghost_empty = ghost_is_empty_from_live_masks([
+            north_b.live_mask,
+            south_b.live_mask,
+            west_b.live_mask,
+            east_b.live_mask,
+            nw_b.live_mask,
+            ne_b.live_mask,
+            sw_b.live_mask,
+            se_b.live_mask,
+        ]);
+
+        if ghost_empty {
+            debug_assert!(tile_is_empty(current));
+            unsafe {
+                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                *next_borders_ptr.add(idx) = BorderData::default();
+            }
+            meta.set_changed(false);
+            meta.set_has_live(false);
+            meta.population = 0;
+            return false;
+        }
+    }
+
     let ghost = GhostZone {
         north: north_b.south,
         south: south_b.north,
@@ -470,22 +528,6 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
         sw: sw_b.ne(),
         se: se_b.nw(),
     };
-
-    let current = unsafe { &(*current_ptr.add(idx)).0 };
-    let next = unsafe { &mut (*next_ptr.add(idx)).0 };
-    let meta = unsafe { &mut *meta_ptr.add(idx) };
-
-    // Ultra-fast path: empty tile + empty ghost zone.
-    if ghost_is_empty(&ghost) && tile_is_empty(current) {
-        unsafe {
-            std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
-            *next_borders_ptr.add(idx) = BorderData::default();
-        }
-        meta.set_changed(false);
-        meta.set_has_live(false);
-        meta.population = 0;
-        return false;
-    }
 
     let (changed, border, has_live) =
         unsafe { advance_core_const::<USE_AVX2>(current, next, &ghost) };
@@ -599,7 +641,7 @@ pub unsafe fn advance_tile_split(
 mod tests {
     use super::{
         BorderData, GhostZone, TILE_SIZE, advance_core_scalar, corners_from_rows, ghost_bit,
-        ghost_is_empty, tile_is_empty,
+        ghost_is_empty, ghost_is_empty_from_live_masks, tile_is_empty,
     };
 
     #[cfg(target_arch = "x86_64")]
@@ -678,6 +720,60 @@ mod tests {
         ghost.west = 0;
         ghost.ne = true;
         assert!(!ghost_is_empty(&ghost));
+    }
+
+    #[test]
+    fn ghost_live_masks_empty_check_matches_ghost_bits() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xCAFE_F00D_1234_5678);
+        for _ in 0..2048 {
+            let ghost = random_ghost(&mut rng);
+
+            let north = BorderData::from_parts(0, ghost.north, 0, 0, 0);
+            let south = BorderData::from_parts(ghost.south, 0, 0, 0, 0);
+            let west = BorderData::from_parts(0, 0, 0, ghost.west, 0);
+            let east = BorderData::from_parts(0, 0, ghost.east, 0, 0);
+            let nw = BorderData::from_parts(
+                0,
+                0,
+                0,
+                0,
+                if ghost.nw { BorderData::CORNER_SE } else { 0 },
+            );
+            let ne = BorderData::from_parts(
+                0,
+                0,
+                0,
+                0,
+                if ghost.ne { BorderData::CORNER_SW } else { 0 },
+            );
+            let sw = BorderData::from_parts(
+                0,
+                0,
+                0,
+                0,
+                if ghost.sw { BorderData::CORNER_NE } else { 0 },
+            );
+            let se = BorderData::from_parts(
+                0,
+                0,
+                0,
+                0,
+                if ghost.se { BorderData::CORNER_NW } else { 0 },
+            );
+
+            let from_masks = ghost_is_empty_from_live_masks([
+                north.live_mask,
+                south.live_mask,
+                west.live_mask,
+                east.live_mask,
+                nw.live_mask,
+                ne.live_mask,
+                sw.live_mask,
+                se.live_mask,
+            ]);
+
+            assert_eq!(from_masks, ghost_is_empty(&ghost));
+        }
     }
 
     #[test]
