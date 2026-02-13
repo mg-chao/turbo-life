@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use super::activity::{prune_and_expand, rebuild_active_set};
 use super::arena::TileArena;
+use super::tile_cache::{TileCache, advance_tile_cached};
 use super::kernel::{KernelBackend, advance_core, advance_tile_fused};
 use super::tile::{self, Direction, NO_NEIGHBOR, POPULATION_UNKNOWN, TileIdx};
 
@@ -274,6 +275,8 @@ pub struct TurboLife {
     /// Reusable per-tile marker for batch dedup in `set_cells`.
     /// Indexed by `TileIdx.index()`, grown on demand.
     touched_flags: Vec<bool>,
+    /// Direct-mapped tile result cache for kernel memoization.
+    tile_cache: TileCache,
 }
 
 impl TurboLife {
@@ -297,6 +300,7 @@ impl TurboLife {
             pool,
             backend,
             touched_flags: Vec::new(),
+            tile_cache: TileCache::new(),
         }
     }
 
@@ -549,6 +553,8 @@ impl TurboLife {
             return;
         }
 
+        self.tile_cache.begin_step();
+
         let active_len = self.arena.active_set.len();
         let bp = self.arena.border_phase;
         let cp = self.arena.cell_phase;
@@ -577,9 +583,7 @@ impl TurboLife {
         debug_assert_eq!(self.arena.meta.len(), self.arena.neighbors.len());
 
         if !run_parallel {
-            // Serial path: fused ghost-gather + kernel with multi-level prefetching.
-            // Prefetches cell buffers AND neighbor border data to overlap memory
-            // latency with computation.
+            // Serial path: cached kernel with multi-level prefetching.
             let neighbors_ptr = self.arena.neighbors.as_ptr();
             let borders_read_ptr = borders_read.as_ptr();
             let current_ptr = current_vec.as_ptr();
@@ -587,6 +591,7 @@ impl TurboLife {
             let next_borders_ptr = next_borders_vec.as_mut_ptr();
             let meta_ptr = self.arena.meta.as_mut_ptr();
             let active_ptr = self.arena.active_set.as_ptr();
+            let cache_ptr = &mut self.tile_cache as *mut TileCache;
 
             for i in 0..active_len {
                 let idx = unsafe { *active_ptr.add(i) };
@@ -622,7 +627,7 @@ impl TurboLife {
                 }
 
                 let changed = unsafe {
-                    advance_tile_fused(
+                    advance_tile_cached(
                         current_ptr,
                         next_ptr,
                         meta_ptr,
@@ -631,6 +636,7 @@ impl TurboLife {
                         neighbors_ptr,
                         ii,
                         backend,
+                        cache_ptr,
                     )
                 };
 
@@ -646,6 +652,8 @@ impl TurboLife {
             }
         } else {
             // Parallel kernel compute with fused ghost-gather + two-level prefetching.
+            // Note: the tile cache is NOT used in the parallel path to avoid
+            // torn reads/writes from concurrent access to the same cache slot.
             let active_set = &self.arena.active_set;
             let current_ptr = SendConstPtr::new(current_vec.as_ptr());
             let next_ptr = SendPtr::new(next_vec.as_mut_ptr());

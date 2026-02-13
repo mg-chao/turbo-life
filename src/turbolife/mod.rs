@@ -6,6 +6,7 @@ mod engine;
 mod kernel;
 mod sync;
 mod tile;
+mod tile_cache;
 pub(crate) mod tilemap;
 
 pub use engine::TurboLife;

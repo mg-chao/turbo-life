@@ -442,6 +442,29 @@ pub unsafe fn advance_tile_fused(
     let next = unsafe { &mut (*next_ptr.add(idx)).0 };
     let meta = unsafe { &mut *meta_ptr.add(idx) };
 
+    // Ultra-fast path: empty tile + empty ghost zone.
+    if ghost.north | ghost.south | ghost.west | ghost.east == 0
+        && !ghost.nw && !ghost.ne && !ghost.sw && !ghost.se
+    {
+        let mut any = 0u64;
+        let mut i = 0;
+        while i < TILE_SIZE {
+            any |= current[i] | current[i+1] | current[i+2] | current[i+3];
+            if any != 0 { break; }
+            i += 4;
+        }
+        if any == 0 {
+            unsafe {
+                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                *next_borders_ptr.add(idx) = BorderData {
+                    north: 0, south: 0, west: 0, east: 0, corners: 0,
+                };
+            }
+            meta.set_changed(false);
+            return false;
+        }
+    }
+
     let (changed, border, has_live) = advance_core(current, next, &ghost, backend);
 
     unsafe {
