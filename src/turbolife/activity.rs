@@ -287,16 +287,8 @@ pub fn prune_and_expand(arena: &mut TileArena) {
                     let np = s_neighbors as *const [u32; 8];
                     let cp = s_coords as *const (i64, i64);
                     for &idx in chunk {
-                        let should_prune = unsafe {
-                            scan_tile_prune_expand_raw(
-                                idx,
-                                mp,
-                                bp,
-                                np,
-                                cp,
-                                &mut acc.0,
-                            )
-                        };
+                        let should_prune =
+                            unsafe { scan_tile_prune_expand_raw(idx, mp, bp, np, cp, &mut acc.0) };
                         if should_prune {
                             acc.1.push(idx);
                         }
@@ -318,6 +310,12 @@ pub fn prune_and_expand(arena: &mut TileArena) {
 
     // Dedup via the tilemap itself: allocate_absent inserts into coord_to_idx,
     // so subsequent idx_at calls for the same coord will find it and skip.
+    // For large frontiers, sort+dedup first to drastically cut redundant
+    // tilemap probes when many active tiles request the same neighbors.
+    if arena.expand_buf.len() > 4096 {
+        arena.expand_buf.sort_unstable();
+        arena.expand_buf.dedup();
+    }
     if !arena.expand_buf.is_empty() {
         arena.reserve_additional_tiles(arena.expand_buf.len());
     }

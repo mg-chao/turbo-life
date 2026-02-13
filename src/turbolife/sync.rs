@@ -10,11 +10,9 @@ use super::tile::{BorderData, GhostZone, NO_NEIGHBOR, Neighbors, TileIdx};
 /// Remap NO_NEIGHBOR to the sentinel index.
 #[inline(always)]
 fn sentinel_or(raw: u32) -> usize {
-    if raw == NO_NEIGHBOR {
-        SENTINEL_IDX
-    } else {
-        raw as usize
-    }
+    debug_assert_eq!(SENTINEL_IDX, 0);
+    let present_mask = (raw != NO_NEIGHBOR) as usize;
+    (raw as usize) & present_mask.wrapping_neg()
 }
 
 /// Gather the ghost zone for a single tile using raw pointers.

@@ -6,7 +6,7 @@ use super::activity::{prune_and_expand, rebuild_active_set};
 use super::arena::TileArena;
 use super::kernel::{KernelBackend, advance_core, advance_tile_split};
 use super::sync::gather_ghost_zone_raw;
-use super::tile::{self, POPULATION_UNKNOWN};
+use super::tile::{self, Direction, NO_NEIGHBOR, POPULATION_UNKNOWN, TileIdx};
 
 struct SendPtr<T> {
     inner: *mut T,
@@ -301,6 +301,52 @@ impl TurboLife {
         }
     }
 
+    #[inline(always)]
+    fn ensure_frontier_neighbors(
+        &mut self,
+        idx: TileIdx,
+        tile_coord: (i64, i64),
+        local_x: usize,
+        local_y: usize,
+    ) {
+        let on_south = local_y == 0;
+        let on_north = local_y == tile::TILE_SIZE - 1;
+        let on_west = local_x == 0;
+        let on_east = local_x == tile::TILE_SIZE - 1;
+
+        if !(on_north || on_south || on_west || on_east) {
+            return;
+        }
+
+        let (tx, ty) = tile_coord;
+        let neighbors = self.arena.neighbors[idx.index()];
+
+        if on_north && neighbors[Direction::North.index()] == NO_NEIGHBOR {
+            self.arena.ensure_neighbor(tx, ty + 1);
+        }
+        if on_south && neighbors[Direction::South.index()] == NO_NEIGHBOR {
+            self.arena.ensure_neighbor(tx, ty - 1);
+        }
+        if on_west && neighbors[Direction::West.index()] == NO_NEIGHBOR {
+            self.arena.ensure_neighbor(tx - 1, ty);
+        }
+        if on_east && neighbors[Direction::East.index()] == NO_NEIGHBOR {
+            self.arena.ensure_neighbor(tx + 1, ty);
+        }
+        if on_north && on_west && neighbors[Direction::NW.index()] == NO_NEIGHBOR {
+            self.arena.ensure_neighbor(tx - 1, ty + 1);
+        }
+        if on_north && on_east && neighbors[Direction::NE.index()] == NO_NEIGHBOR {
+            self.arena.ensure_neighbor(tx + 1, ty + 1);
+        }
+        if on_south && on_west && neighbors[Direction::SW.index()] == NO_NEIGHBOR {
+            self.arena.ensure_neighbor(tx - 1, ty - 1);
+        }
+        if on_south && on_east && neighbors[Direction::SE.index()] == NO_NEIGHBOR {
+            self.arena.ensure_neighbor(tx + 1, ty - 1);
+        }
+    }
+
     pub fn set_cell(&mut self, x: i64, y: i64, alive: bool) {
         let tile_coord = (x.div_euclid(TILE_SIZE_I64), y.div_euclid(TILE_SIZE_I64));
         let local_x = x.rem_euclid(TILE_SIZE_I64) as usize;
@@ -312,50 +358,85 @@ impl TurboLife {
             None => return,
         };
 
-        let buf = self.arena.current_buf_mut(idx);
-        tile::set_local_cell(buf, local_x, local_y, alive);
-        let (border, has_live) = tile::recompute_border_and_has_live(buf);
+        let row_after: u64;
+        let mut has_live_after_clear = true;
 
-        *self.arena.border_mut(idx) = border;
+        {
+            let buf = self.arena.current_buf_mut(idx);
+            let mask = 1u64 << local_x;
+            let row = &mut buf[local_y];
+            let was_alive = (*row & mask) != 0;
+            if was_alive == alive {
+                return;
+            }
+
+            if alive {
+                *row |= mask;
+            } else {
+                *row &= !mask;
+            }
+            row_after = *row;
+
+            if !alive {
+                has_live_after_clear = if row_after != 0 {
+                    true
+                } else {
+                    buf.iter().any(|&r| r != 0)
+                };
+            }
+        }
+
+        {
+            let border = self.arena.border_mut(idx);
+
+            if local_y == 0 {
+                border.south = row_after;
+            }
+            if local_y == tile::TILE_SIZE - 1 {
+                border.north = row_after;
+            }
+
+            if local_x == 0 {
+                let row_bit = 1u64 << local_y;
+                border.west = (border.west & !row_bit) | ((row_after & 1) << local_y);
+            }
+            if local_x == tile::TILE_SIZE - 1 {
+                let row_bit = 1u64 << local_y;
+                border.east = (border.east & !row_bit) | (((row_after >> 63) & 1) << local_y);
+            }
+
+            let corner_mask = match (local_x, local_y) {
+                (0, y) if y == tile::TILE_SIZE - 1 => tile::BorderData::CORNER_NW,
+                (x, y) if x == tile::TILE_SIZE - 1 && y == tile::TILE_SIZE - 1 => {
+                    tile::BorderData::CORNER_NE
+                }
+                (0, 0) => tile::BorderData::CORNER_SW,
+                (x, 0) if x == tile::TILE_SIZE - 1 => tile::BorderData::CORNER_SE,
+                _ => 0,
+            };
+            if corner_mask != 0 {
+                if alive {
+                    border.corners |= corner_mask;
+                } else {
+                    border.corners &= !corner_mask;
+                }
+            }
+        }
+
         {
             let meta = self.arena.meta_mut(idx);
             meta.population = POPULATION_UNKNOWN;
-            meta.set_has_live(has_live);
+            if alive {
+                meta.set_has_live(true);
+            } else {
+                meta.set_has_live(has_live_after_clear);
+            }
         }
         self.population_cache = None;
         self.arena.mark_changed(idx);
 
         if alive {
-            let (tx, ty) = tile_coord;
-            let on_south = local_y == 0;
-            let on_north = local_y == 63;
-            let on_west = local_x == 0;
-            let on_east = local_x == 63;
-
-            if on_north {
-                self.arena.ensure_neighbor(tx, ty + 1);
-            }
-            if on_south {
-                self.arena.ensure_neighbor(tx, ty - 1);
-            }
-            if on_west {
-                self.arena.ensure_neighbor(tx - 1, ty);
-            }
-            if on_east {
-                self.arena.ensure_neighbor(tx + 1, ty);
-            }
-            if on_north && on_west {
-                self.arena.ensure_neighbor(tx - 1, ty + 1);
-            }
-            if on_north && on_east {
-                self.arena.ensure_neighbor(tx + 1, ty + 1);
-            }
-            if on_south && on_west {
-                self.arena.ensure_neighbor(tx - 1, ty - 1);
-            }
-            if on_south && on_east {
-                self.arena.ensure_neighbor(tx + 1, ty - 1);
-            }
+            self.ensure_frontier_neighbors(idx, tile_coord, local_x, local_y);
         }
     }
 
@@ -411,36 +492,7 @@ impl TurboLife {
             }
 
             if alive {
-                let (tx, ty) = tile_coord;
-                let on_south = local_y == 0;
-                let on_north = local_y == 63;
-                let on_west = local_x == 0;
-                let on_east = local_x == 63;
-
-                if on_north {
-                    self.arena.ensure_neighbor(tx, ty + 1);
-                }
-                if on_south {
-                    self.arena.ensure_neighbor(tx, ty - 1);
-                }
-                if on_west {
-                    self.arena.ensure_neighbor(tx - 1, ty);
-                }
-                if on_east {
-                    self.arena.ensure_neighbor(tx + 1, ty);
-                }
-                if on_north && on_west {
-                    self.arena.ensure_neighbor(tx - 1, ty + 1);
-                }
-                if on_north && on_east {
-                    self.arena.ensure_neighbor(tx + 1, ty + 1);
-                }
-                if on_south && on_west {
-                    self.arena.ensure_neighbor(tx - 1, ty - 1);
-                }
-                if on_south && on_east {
-                    self.arena.ensure_neighbor(tx + 1, ty - 1);
-                }
+                self.ensure_frontier_neighbors(idx, tile_coord, local_x, local_y);
             }
         }
 
@@ -537,9 +589,7 @@ impl TurboLife {
             for i in 0..active_len {
                 let idx = self.arena.active_set[i];
                 let ii = idx.index();
-                let ghost = unsafe {
-                    gather_ghost_zone_raw(ii, borders_read_ptr, neighbors_ptr)
-                };
+                let ghost = unsafe { gather_ghost_zone_raw(ii, borders_read_ptr, neighbors_ptr) };
 
                 let (changed, _border, has_live) = unsafe {
                     let current = &(*current_ptr.add(ii)).0;
@@ -563,13 +613,9 @@ impl TurboLife {
                 }
             }
         } else {
-            // === Optimized parallel kernel ===
-            // Instead of per-chunk Vec allocations + reduce + serial merge,
-            // we use a pre-allocated AtomicBool array indexed by tile slot.
-            // Each worker writes its changed flag directly via raw pointer
-            // (advance_tile_split already writes meta), and we set the
-            // atomic flag for changed tiles. After the parallel phase,
-            // a single serial scan of the active set collects changed tiles.
+            // Parallel kernel compute with raw pointers (bounds-check-free in
+            // the hot inner loop), followed by a single raw-pointer scan that
+            // harvests changed tiles into `changed_list`.
             let active_set = &self.arena.active_set;
             let current_ptr = SendConstPtr::new(current_vec.as_ptr());
             let next_ptr = SendPtr::new(next_vec.as_mut_ptr());
@@ -580,39 +626,36 @@ impl TurboLife {
             let worker_count = effective_threads.min(active_len);
             let chunk_size = active_len.div_ceil(worker_count);
 
-            active_set
-                .par_chunks(chunk_size)
-                .for_each(move |chunk| {
-                    for &idx in chunk {
-                        let ghost = unsafe {
-                            gather_ghost_zone_raw(
-                                idx.index(),
-                                borders_read_ptr.get(),
-                                neighbors_ptr.get(),
-                            )
-                        };
+            active_set.par_chunks(chunk_size).for_each(move |chunk| {
+                for &idx in chunk {
+                    let ghost = unsafe {
+                        gather_ghost_zone_raw(
+                            idx.index(),
+                            borders_read_ptr.get(),
+                            neighbors_ptr.get(),
+                        )
+                    };
 
-                        unsafe {
-                            advance_tile_split(
-                                current_ptr.get(),
-                                next_ptr.get(),
-                                meta_ptr.get(),
-                                next_borders_ptr.get(),
-                                idx.index(),
-                                &ghost,
-                                backend,
-                            );
-                        }
+                    unsafe {
+                        advance_tile_split(
+                            current_ptr.get(),
+                            next_ptr.get(),
+                            meta_ptr.get(),
+                            next_borders_ptr.get(),
+                            idx.index(),
+                            &ghost,
+                            backend,
+                        );
                     }
-                });
+                }
+            });
 
-            // Serial scan: advance_tile_split already set meta.changed() for
-            // each tile. We just need to collect those into the changed_list.
-            // This is cheaper than the old approach (Vec alloc per chunk + reduce).
+            // Serial scan with raw pointers: branch-light and bounds-check-free.
+            let meta_ptr = self.arena.meta.as_mut_ptr();
             for &idx in active_set {
-                if self.arena.meta[idx.index()].changed() {
-                    let meta = &mut self.arena.meta[idx.index()];
-                    if !meta.in_changed_list() {
+                unsafe {
+                    let meta = &mut *meta_ptr.add(idx.index());
+                    if meta.changed() && !meta.in_changed_list() {
                         meta.set_in_changed_list(true);
                         self.arena.changed_list.push(idx);
                     }

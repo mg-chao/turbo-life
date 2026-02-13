@@ -304,6 +304,7 @@ pub fn recompute_border(buf: &[u64; TILE_SIZE]) -> BorderData {
 
 /// Set a cell in a buffer.
 #[inline]
+#[allow(dead_code)]
 pub fn set_local_cell(buf: &mut [u64; TILE_SIZE], local_x: usize, local_y: usize, alive: bool) {
     let mask = 1u64 << local_x;
     if alive {

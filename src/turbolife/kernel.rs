@@ -144,22 +144,56 @@ pub fn advance_core_scalar(
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn avx2_set_u64x4(words: [u64; 4]) -> std::arch::x86_64::__m256i {
+unsafe fn avx2_set_u64x4_lane_order(
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::_mm256_set_epi64x;
+
+    unsafe { _mm256_set_epi64x(a3 as i64, a2 as i64, a1 as i64, a0 as i64) }
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn avx2_build_carry_table(shift: u32) -> [[u64; 4]; 16] {
+    let mut table = [[0u64; 4]; 16];
+    let mut bits = 0usize;
+    while bits < 16 {
+        let b = bits as u64;
+        table[bits] = [
+            (b & 1) << shift,
+            ((b >> 1) & 1) << shift,
+            ((b >> 2) & 1) << shift,
+            ((b >> 3) & 1) << shift,
+        ];
+        bits += 1;
+    }
+    table
+}
+
+#[cfg(target_arch = "x86_64")]
+const AVX2_CARRY_LO_TABLE: [[u64; 4]; 16] = avx2_build_carry_table(0);
+
+#[cfg(target_arch = "x86_64")]
+const AVX2_CARRY_HI_TABLE: [[u64; 4]; 16] = avx2_build_carry_table(63);
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn avx2_carry_mask_lo(bits4: u64) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::{__m256i, _mm256_loadu_si256};
 
-    unsafe { _mm256_loadu_si256(words.as_ptr() as *const __m256i) }
+    let row = unsafe { AVX2_CARRY_LO_TABLE.get_unchecked(bits4 as usize) };
+    unsafe { _mm256_loadu_si256(row.as_ptr() as *const __m256i) }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn avx2_store_u64x4(value: std::arch::x86_64::__m256i) -> [u64; 4] {
-    use std::arch::x86_64::_mm256_storeu_si256;
+unsafe fn avx2_carry_mask_hi(bits4: u64) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::{__m256i, _mm256_loadu_si256};
 
-    let mut out = [0u64; 4];
-    unsafe {
-        _mm256_storeu_si256(out.as_mut_ptr() as *mut std::arch::x86_64::__m256i, value);
-    }
-    out
+    let row = unsafe { AVX2_CARRY_HI_TABLE.get_unchecked(bits4 as usize) };
+    unsafe { _mm256_loadu_si256(row.as_ptr() as *const __m256i) }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -193,121 +227,80 @@ unsafe fn avx2_half_add(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn west_neighbor_plane_avx2(
-    word: std::arch::x86_64::__m256i,
-    ghost_w: [bool; 4],
-) -> std::arch::x86_64::__m256i {
-    use std::arch::x86_64::{_mm256_or_si256, _mm256_slli_epi64};
-
-    unsafe {
-        let shifted = _mm256_slli_epi64(word, 1);
-        let carry = avx2_set_u64x4([
-            ghost_w[0] as u64,
-            ghost_w[1] as u64,
-            ghost_w[2] as u64,
-            ghost_w[3] as u64,
-        ]);
-        _mm256_or_si256(shifted, carry)
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn east_neighbor_plane_avx2(
-    word: std::arch::x86_64::__m256i,
-    ghost_e: [bool; 4],
-) -> std::arch::x86_64::__m256i {
-    use std::arch::x86_64::{_mm256_or_si256, _mm256_srli_epi64};
-
-    unsafe {
-        let shifted = _mm256_srli_epi64(word, 1);
-        let carry = avx2_set_u64x4([
-            (ghost_e[0] as u64) << 63,
-            (ghost_e[1] as u64) << 63,
-            (ghost_e[2] as u64) << 63,
-            (ghost_e[3] as u64) << 63,
-        ]);
-        _mm256_or_si256(shifted, carry)
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn advance_core_avx2(
     current: &[u64; TILE_SIZE],
     next: &mut [u64; TILE_SIZE],
     ghost: &GhostZone,
 ) -> (bool, BorderData, bool) {
-    use std::arch::x86_64::{_mm256_and_si256, _mm256_andnot_si256, _mm256_or_si256};
+    use std::arch::x86_64::{
+        __m256i, _mm256_and_si256, _mm256_andnot_si256, _mm256_loadu_si256, _mm256_or_si256,
+        _mm256_slli_epi64, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_testz_si256,
+        _mm256_xor_si256,
+    };
 
     let mut changed = false;
     let mut has_live = false;
     let mut border_west = 0u64;
     let mut border_east = 0u64;
+    let current_ptr = current.as_ptr();
 
     for row_base in (0..TILE_SIZE).step_by(4) {
-        let mut row_above_words = [0u64; 4];
-        let mut row_self_words = [0u64; 4];
-        let mut row_below_words = [0u64; 4];
+        let row_self = unsafe { _mm256_loadu_si256(current_ptr.add(row_base) as *const __m256i) };
+        let row_above = if row_base < TILE_SIZE - 4 {
+            unsafe { _mm256_loadu_si256(current_ptr.add(row_base + 1) as *const __m256i) }
+        } else {
+            unsafe { avx2_set_u64x4_lane_order(current[61], current[62], current[63], ghost.north) }
+        };
+        let row_below = if row_base == 0 {
+            unsafe { avx2_set_u64x4_lane_order(ghost.south, current[0], current[1], current[2]) }
+        } else {
+            unsafe { _mm256_loadu_si256(current_ptr.add(row_base - 1) as *const __m256i) }
+        };
 
-        let mut ghost_w_above = [false; 4];
-        let mut ghost_e_above = [false; 4];
-        let mut ghost_w_self = [false; 4];
-        let mut ghost_e_self = [false; 4];
-        let mut ghost_w_below = [false; 4];
-        let mut ghost_e_below = [false; 4];
+        let ghost_w_self = (ghost.west >> row_base) & 0xF;
+        let ghost_e_self = (ghost.east >> row_base) & 0xF;
+        let ghost_w_above = if row_base < TILE_SIZE - 4 {
+            (ghost.west >> (row_base + 1)) & 0xF
+        } else {
+            ((ghost.west >> 61) & 0x7) | ((ghost.nw as u64) << 3)
+        };
+        let ghost_e_above = if row_base < TILE_SIZE - 4 {
+            (ghost.east >> (row_base + 1)) & 0xF
+        } else {
+            ((ghost.east >> 61) & 0x7) | ((ghost.ne as u64) << 3)
+        };
+        let ghost_w_below = if row_base == 0 {
+            ((ghost.west & 0x7) << 1) | ghost.sw as u64
+        } else {
+            (ghost.west >> (row_base - 1)) & 0xF
+        };
+        let ghost_e_below = if row_base == 0 {
+            ((ghost.east & 0x7) << 1) | ghost.se as u64
+        } else {
+            (ghost.east >> (row_base - 1)) & 0xF
+        };
 
-        for lane in 0..4 {
-            let row = row_base + lane;
-            row_above_words[lane] = if row == TILE_SIZE - 1 {
-                ghost.north
-            } else {
-                current[row + 1]
-            };
-            row_self_words[lane] = current[row];
-            row_below_words[lane] = if row == 0 {
-                ghost.south
-            } else {
-                current[row - 1]
-            };
-
-            ghost_w_above[lane] = if row == TILE_SIZE - 1 {
-                ghost.nw
-            } else {
-                ghost_bit(ghost.west, row + 1)
-            };
-            ghost_e_above[lane] = if row == TILE_SIZE - 1 {
-                ghost.ne
-            } else {
-                ghost_bit(ghost.east, row + 1)
-            };
-            ghost_w_self[lane] = ghost_bit(ghost.west, row);
-            ghost_e_self[lane] = ghost_bit(ghost.east, row);
-            ghost_w_below[lane] = if row == 0 {
-                ghost.sw
-            } else {
-                ghost_bit(ghost.west, row - 1)
-            };
-            ghost_e_below[lane] = if row == 0 {
-                ghost.se
-            } else {
-                ghost_bit(ghost.east, row - 1)
-            };
-        }
-
-        let row_above = unsafe { avx2_set_u64x4(row_above_words) };
-        let row_self = unsafe { avx2_set_u64x4(row_self_words) };
-        let row_below = unsafe { avx2_set_u64x4(row_below_words) };
-
-        let nw = unsafe { west_neighbor_plane_avx2(row_above, ghost_w_above) };
+        let nw = _mm256_or_si256(_mm256_slli_epi64(row_above, 1), unsafe {
+            avx2_carry_mask_lo(ghost_w_above)
+        });
         let n = row_above;
-        let ne = unsafe { east_neighbor_plane_avx2(row_above, ghost_e_above) };
-        let w = unsafe { west_neighbor_plane_avx2(row_self, ghost_w_self) };
-        let e = unsafe { east_neighbor_plane_avx2(row_self, ghost_e_self) };
-        let sw = unsafe { west_neighbor_plane_avx2(row_below, ghost_w_below) };
+        let ne = _mm256_or_si256(_mm256_srli_epi64(row_above, 1), unsafe {
+            avx2_carry_mask_hi(ghost_e_above)
+        });
+        let w = _mm256_or_si256(_mm256_slli_epi64(row_self, 1), unsafe {
+            avx2_carry_mask_lo(ghost_w_self)
+        });
+        let e = _mm256_or_si256(_mm256_srli_epi64(row_self, 1), unsafe {
+            avx2_carry_mask_hi(ghost_e_self)
+        });
+        let sw = _mm256_or_si256(_mm256_slli_epi64(row_below, 1), unsafe {
+            avx2_carry_mask_lo(ghost_w_below)
+        });
         let s = row_below;
-        let se = unsafe { east_neighbor_plane_avx2(row_below, ghost_e_below) };
+        let se = _mm256_or_si256(_mm256_srli_epi64(row_below, 1), unsafe {
+            avx2_carry_mask_hi(ghost_e_below)
+        });
 
         let (a0, a1) = unsafe { avx2_full_add(nw, n, ne) };
         let (s0, s1) = unsafe { avx2_half_add(w, e) };
@@ -322,14 +315,19 @@ pub unsafe fn advance_core_avx2(
         let survive = _mm256_and_si256(_mm256_andnot_si256(t0, alive_mask), row_self);
         let next_rows = _mm256_or_si256(born, survive);
 
-        let next_words = unsafe { avx2_store_u64x4(next_rows) };
+        let diff = _mm256_xor_si256(next_rows, row_self);
+        changed |= _mm256_testz_si256(diff, diff) == 0;
+        has_live |= _mm256_testz_si256(next_rows, next_rows) == 0;
+
+        let mut next_words = [0u64; 4];
+        unsafe {
+            _mm256_storeu_si256(next_words.as_mut_ptr() as *mut __m256i, next_rows);
+        }
 
         for lane in 0..4 {
             let row = row_base + lane;
             let next_row = next_words[lane];
             next[row] = next_row;
-            changed |= next_row != row_self_words[lane];
-            has_live |= next_row != 0;
             border_west |= (next_row & 1) << row;
             border_east |= ((next_row >> 63) & 1) << row;
         }
