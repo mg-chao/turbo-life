@@ -10,6 +10,17 @@ const PARALLEL_PRUNE_TILES_PER_THREAD: usize = 24;
 const PARALLEL_PRUNE_MIN_CHUNKS: usize = 2;
 const PRUNE_CHUNK_MIN: usize = 64;
 const PRUNE_CHUNK_MAX: usize = 512;
+const HASH_DEDUP_THRESHOLD: usize = 1_000_000;
+const EXPAND_OFFSETS: [(i64, i64); 8] = [
+    (0, 1),   // N
+    (0, -1),  // S
+    (-1, 0),  // W
+    (1, 0),   // E
+    (-1, 1),  // NW
+    (1, 1),   // NE
+    (-1, -1), // SW
+    (1, -1),  // SE
+];
 
 #[inline]
 fn prune_chunk_size(active_len: usize, threads: usize) -> usize {
@@ -101,8 +112,10 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     // Hot loop: epoch-stamp changed tiles + their 8 neighbors.
     // Use raw pointers to eliminate bounds checks on every neighbor access.
     // Reserve for worst case: each changed tile + up to 8 unique neighbors.
-    // Use 9× estimate (tile + 8 neighbors) to avoid mid-loop reallocation.
-    arena.active_set.reserve(changed_count.saturating_mul(9).min(arena.occupied_count));
+    // Use 9x estimate (tile + 8 neighbors) to avoid mid-loop reallocation.
+    arena
+        .active_set
+        .reserve(changed_count.saturating_mul(9).min(arena.occupied_count));
     let meta_ptr = arena.meta.as_mut_ptr();
     let neighbors_ptr = arena.neighbors.as_ptr();
     let meta_len = arena.meta.len();
@@ -134,7 +147,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
 
     // Sort active set by index for better cache locality during kernel execution.
     // The kernel accesses cell_bufs, borders, meta, and neighbors arrays sequentially
-    // by tile index — sorting ensures we walk these arrays in order.
+    // by tile index - sorting ensures we walk these arrays in order.
     // Only sort when the set is small enough that sort cost < cache benefit.
     if arena.active_set.len() <= 8192 {
         arena.active_set.sort_unstable_by_key(|idx| idx.0);
@@ -177,9 +190,7 @@ unsafe fn scan_tile_prune_expand_raw(
         let nb = &*neighbors_ptr.add(i_idx);
         let border = &*borders_ptr.add(i_idx);
 
-        // Build a bitmask of which neighbors are missing (1 bit per direction).
-        // This replaces 8 individual NO_NEIGHBOR comparisons with a single
-        // combined check, and uses the bitmask to drive expansion.
+        // Fast path: when no neighbors are missing, there is no frontier expansion.
         let missing: u8 = ((nb[0] == NO_NEIGHBOR) as u8)
             | (((nb[1] == NO_NEIGHBOR) as u8) << 1)
             | (((nb[2] == NO_NEIGHBOR) as u8) << 2)
@@ -191,47 +202,34 @@ unsafe fn scan_tile_prune_expand_raw(
 
         if missing != 0 {
             let (tx, ty) = *coords_ptr.add(i_idx);
+            let live_border: u8 = ((border.north != 0) as u8)
+                | (((border.south != 0) as u8) << 1)
+                | (((border.west != 0) as u8) << 2)
+                | (((border.east != 0) as u8) << 3)
+                | (((border.corners & BorderData::CORNER_NW != 0) as u8) << 4)
+                | (((border.corners & BorderData::CORNER_NE != 0) as u8) << 5)
+                | (((border.corners & BorderData::CORNER_SW != 0) as u8) << 6)
+                | (((border.corners & BorderData::CORNER_SE != 0) as u8) << 7);
 
-            // Build a bitmask of which borders have live cells, matching
-            // the same bit layout as the missing mask.
-            let live_border: u8 = ((border.north != 0) as u8)        // bit 0 = North
-                | (((border.south != 0) as u8) << 1)                 // bit 1 = South
-                | (((border.west != 0) as u8) << 2)                  // bit 2 = West
-                | (((border.east != 0) as u8) << 3)                  // bit 3 = East
-                | (((border.corners & BorderData::CORNER_NW != 0) as u8) << 4) // bit 4 = NW
-                | (((border.corners & BorderData::CORNER_NE != 0) as u8) << 5) // bit 5 = NE
-                | (((border.corners & BorderData::CORNER_SW != 0) as u8) << 6) // bit 6 = SW
-                | (((border.corners & BorderData::CORNER_SE != 0) as u8) << 7); // bit 7 = SE
-
-            // Only expand where both missing AND live border.
-            let need_expand = missing & live_border;
-            if need_expand != 0 {
-                // Direction offsets indexed by bit position (N,S,W,E,NW,NE,SW,SE).
-                const OFFSETS: [(i64, i64); 8] = [
-                    (0, 1), (0, -1), (-1, 0), (1, 0),
-                    (-1, 1), (1, 1), (-1, -1), (1, -1),
-                ];
-                let mut bits = need_expand;
-                while bits != 0 {
-                    let bit = bits.trailing_zeros() as usize;
-                    let (dx, dy) = OFFSETS[bit];
-                    expand.push((tx + dx, ty + dy));
-                    bits &= bits - 1;
-                }
+            let mut bits = missing & live_border;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let (dx, dy) = EXPAND_OFFSETS[bit];
+                expand.push((tx + dx, ty + dy));
+                bits &= bits - 1;
             }
         }
 
-        let changed = meta.changed();
-        if changed {
+        if meta.changed() || meta.has_live() {
             return false;
         }
-        // Check if any neighbor changed — use raw pointer for meta access.
+        // Check if any neighbor changed using raw pointer for meta access.
         for &ni_raw in nb.iter() {
             if ni_raw != NO_NEIGHBOR && (*meta_ptr.add(ni_raw as usize)).changed() {
                 return false;
             }
         }
-        !meta.has_live()
+        true
     }
 }
 
@@ -315,14 +313,26 @@ pub fn prune_and_expand(arena: &mut TileArena) {
         arena.expand_buf.extend(expand_all);
         arena.prune_buf.extend(prune_all);
     }
-
-    // Dedup expand buffer: sort+dedup to eliminate redundant tilemap probes.
-    // Always sort+dedup when there are duplicates — the cost is O(n log n)
-    // but it eliminates O(n) redundant hash lookups which are more expensive
-    // for large expand sets.
     if arena.expand_buf.len() > 1 {
-        arena.expand_buf.sort_unstable();
-        arena.expand_buf.dedup();
+        if arena.expand_buf.len() >= HASH_DEDUP_THRESHOLD {
+            arena.expand_dedup.begin_step();
+            arena.expand_dedup.reserve_for(arena.expand_buf.len());
+
+            let mut write = 0usize;
+            for i in 0..arena.expand_buf.len() {
+                let coord = arena.expand_buf[i];
+                if arena.expand_dedup.insert(coord.0, coord.1) {
+                    if write != i {
+                        arena.expand_buf[write] = coord;
+                    }
+                    write += 1;
+                }
+            }
+            arena.expand_buf.truncate(write);
+        } else {
+            arena.expand_buf.sort_unstable();
+            arena.expand_buf.dedup();
+        }
     }
     if !arena.expand_buf.is_empty() {
         arena.reserve_additional_tiles(arena.expand_buf.len());

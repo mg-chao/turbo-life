@@ -5,9 +5,9 @@
 //! Slot 0 is reserved as a sentinel (all zeros) so ghost-zone gathers
 //! can use unconditional loads — NO_NEIGHBOR maps to the sentinel.
 
+use super::coord_set::CoordSet;
 use super::tile::{
-    BorderData, CellBuf, EMPTY_NEIGHBORS, NO_NEIGHBOR, Neighbors, TILE_SIZE, TileIdx,
-    TileMeta,
+    BorderData, CellBuf, EMPTY_NEIGHBORS, NO_NEIGHBOR, Neighbors, TILE_SIZE, TileIdx, TileMeta,
 };
 use super::tilemap::TileMap;
 
@@ -35,6 +35,7 @@ pub struct TileArena {
     pub active_epoch: u32,
     pub active_set: Vec<TileIdx>,
     pub expand_buf: Vec<(i64, i64)>,
+    pub expand_dedup: CoordSet,
     pub prune_buf: Vec<TileIdx>,
     pub changed_scratch: Vec<TileIdx>,
 }
@@ -79,6 +80,7 @@ impl TileArena {
             active_epoch: 1,
             active_set: Vec::new(),
             expand_buf: Vec::new(),
+            expand_dedup: CoordSet::new(),
             prune_buf: Vec::new(),
             changed_scratch: Vec::new(),
         }
@@ -272,7 +274,8 @@ impl TileArena {
                 if neighbor_raw != NO_NEIGHBOR {
                     // Reverse direction index lookup table.
                     const REV: [usize; 8] = [1, 0, 3, 2, 7, 6, 5, 4];
-                    (*neighbors_ptr.add(neighbor_raw as usize))[REV[dir_idx as usize]] = NO_NEIGHBOR;
+                    (*neighbors_ptr.add(neighbor_raw as usize))[REV[dir_idx as usize]] =
+                        NO_NEIGHBOR;
                 }
             }
             (*neighbors_ptr.add(i)) = EMPTY_NEIGHBORS;
