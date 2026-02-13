@@ -216,6 +216,12 @@ pub struct TileMeta {
 
 impl TileMeta {
     #[inline(always)]
+    fn set_flag(&mut self, flag: u8, v: bool) {
+        let mask = ((v as u8).wrapping_neg()) & flag;
+        self.flags = (self.flags & !flag) | mask;
+    }
+
+    #[inline(always)]
     pub fn changed(self) -> bool {
         self.flags & FLAG_CHANGED != 0
     }
@@ -234,36 +240,20 @@ impl TileMeta {
 
     #[inline(always)]
     pub fn set_changed(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_CHANGED
-        } else {
-            self.flags &= !FLAG_CHANGED
-        }
+        self.set_flag(FLAG_CHANGED, v);
     }
     #[inline(always)]
     #[allow(dead_code)]
     pub fn set_occupied(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_OCCUPIED
-        } else {
-            self.flags &= !FLAG_OCCUPIED
-        }
+        self.set_flag(FLAG_OCCUPIED, v);
     }
     #[inline(always)]
     pub fn set_in_changed_list(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_IN_CHANGED_LIST
-        } else {
-            self.flags &= !FLAG_IN_CHANGED_LIST
-        }
+        self.set_flag(FLAG_IN_CHANGED_LIST, v);
     }
     #[inline(always)]
     pub fn set_has_live(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_HAS_LIVE
-        } else {
-            self.flags &= !FLAG_HAS_LIVE
-        }
+        self.set_flag(FLAG_HAS_LIVE, v);
     }
 
     pub fn empty() -> Self {

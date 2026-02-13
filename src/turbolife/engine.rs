@@ -101,11 +101,19 @@ impl WorkerScratch {
 fn detect_kernel_backend() -> KernelBackend {
     let auto_enabled = std::env::var("TURBOLIFE_AUTO_KERNEL")
         .ok()
-        .map(|v| {
+        .and_then(|v| {
             let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true")
+            if v.is_empty() {
+                None
+            } else if v == "1" || v.eq_ignore_ascii_case("true") {
+                Some(true)
+            } else if v == "0" || v.eq_ignore_ascii_case("false") {
+                Some(false)
+            } else {
+                None
+            }
         })
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     if auto_enabled {
         *AUTO_KERNEL_BACKEND.get_or_init(calibrate_auto_backend)
@@ -293,8 +301,8 @@ pub struct TurboLifeConfig {
     /// `None` means no additional cap beyond `thread_count`.
     pub max_threads: Option<usize>,
     /// Kernel backend selection.
-    /// `None` means scalar by default.
-    /// Set `TURBOLIFE_AUTO_KERNEL=1` to enable startup auto-calibration.
+    /// `None` means auto-detect (calibrated AVX2-vs-scalar on x86_64).
+    /// Set `TURBOLIFE_AUTO_KERNEL=0` to force scalar default policy.
     pub kernel: Option<KernelBackend>,
 }
 

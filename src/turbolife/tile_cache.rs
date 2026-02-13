@@ -1,3 +1,4 @@
+use super::kernel::{ghost_is_empty, tile_is_empty};
 use super::tile::{BorderData, CellBuf, GhostZone, TILE_SIZE};
 
 const CACHE_SIZE: usize = 1 << 13;
@@ -249,31 +250,15 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
     let meta = unsafe { &mut *meta_ptr.add(idx) };
 
     // Ultra-fast path: empty tile + empty ghost.
-    if ghost.north | ghost.south | ghost.west | ghost.east == 0
-        && !ghost.nw
-        && !ghost.ne
-        && !ghost.sw
-        && !ghost.se
-    {
-        let mut any = 0u64;
-        let mut i = 0;
-        while i < TILE_SIZE {
-            any |= current[i] | current[i + 1] | current[i + 2] | current[i + 3];
-            if any != 0 {
-                break;
-            }
-            i += 4;
+    if ghost_is_empty(&ghost) && tile_is_empty(current) {
+        unsafe {
+            std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+            *next_borders_ptr.add(idx) = BorderData::default();
         }
-        if any == 0 {
-            unsafe {
-                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
-                *next_borders_ptr.add(idx) = BorderData::default();
-            }
-            meta.set_changed(false);
-            meta.set_has_live(false);
-            meta.population = 0;
-            return false;
-        }
+        meta.set_changed(false);
+        meta.set_has_live(false);
+        meta.population = 0;
+        return false;
     }
 
     let cr = unsafe { &mut *cache };

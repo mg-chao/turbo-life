@@ -5,6 +5,7 @@
 //! Works with split cell buffers (separate current/next vecs).
 
 use super::tile::{BorderData, CellBuf, GhostZone, POPULATION_UNKNOWN, TILE_SIZE, TileMeta};
+const _: [(); 1] = [(); (TILE_SIZE == 64) as usize];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelBackend {
@@ -25,13 +26,87 @@ fn half_add(a: u64, b: u64) -> (u64, u64) {
 }
 
 #[inline(always)]
-fn west_neighbor_plane(word: u64, ghost_w: bool) -> u64 {
-    (word << 1) | ghost_w as u64
+fn west_neighbor_plane(word: u64, ghost_w: u64) -> u64 {
+    (word << 1) | ghost_w
 }
 
 #[inline(always)]
-fn east_neighbor_plane(word: u64, ghost_e: bool) -> u64 {
-    (word >> 1) | ((ghost_e as u64) << 63)
+fn east_neighbor_plane(word: u64, ghost_e: u64) -> u64 {
+    (word >> 1) | (ghost_e << 63)
+}
+
+#[inline(always)]
+fn corners_from_rows(north: u64, south: u64) -> u8 {
+    ((north & 1 != 0) as u8)
+        | (((north >> 63 != 0) as u8) << 1)
+        | (((south & 1 != 0) as u8) << 2)
+        | (((south >> 63 != 0) as u8) << 3)
+}
+
+#[inline(always)]
+pub(crate) fn ghost_is_empty(ghost: &GhostZone) -> bool {
+    let corners = (ghost.nw as u64)
+        | ((ghost.ne as u64) << 1)
+        | ((ghost.sw as u64) << 2)
+        | ((ghost.se as u64) << 3);
+    (ghost.north | ghost.south | ghost.west | ghost.east | corners) == 0
+}
+
+#[inline(always)]
+pub(crate) fn tile_is_empty(current: &[u64; TILE_SIZE]) -> bool {
+    let mut i = 0;
+    while i < TILE_SIZE {
+        if (current[i] | current[i + 1] | current[i + 2] | current[i + 3]) != 0 {
+            return false;
+        }
+        i += 4;
+    }
+    true
+}
+
+#[derive(Clone, Copy)]
+struct RowGhostBits {
+    west_above: u64,
+    east_above: u64,
+    west_self: u64,
+    east_self: u64,
+    west_below: u64,
+    east_below: u64,
+}
+
+#[inline(always)]
+fn row_ghost_bits_from_windows(west_window: u128, east_window: u128) -> RowGhostBits {
+    RowGhostBits {
+        west_below: (west_window & 1) as u64,
+        west_self: ((west_window >> 1) & 1) as u64,
+        west_above: ((west_window >> 2) & 1) as u64,
+        east_below: (east_window & 1) as u64,
+        east_self: ((east_window >> 1) & 1) as u64,
+        east_above: ((east_window >> 2) & 1) as u64,
+    }
+}
+
+#[inline(always)]
+fn advance_row_scalar(row_above: u64, row_self: u64, row_below: u64, ghost: RowGhostBits) -> u64 {
+    let nw = west_neighbor_plane(row_above, ghost.west_above);
+    let n = row_above;
+    let ne = east_neighbor_plane(row_above, ghost.east_above);
+    let w = west_neighbor_plane(row_self, ghost.west_self);
+    let e = east_neighbor_plane(row_self, ghost.east_self);
+    let sw = west_neighbor_plane(row_below, ghost.west_below);
+    let s = row_below;
+    let se = east_neighbor_plane(row_below, ghost.east_below);
+
+    let (a0, a1) = full_add(nw, n, ne);
+    let (s0, s1) = half_add(w, e);
+    let (b0, b1) = full_add(sw, s, se);
+    let (t0, t0c) = full_add(a0, s0, b0);
+    let (u0, u0c) = full_add(a1, s1, b1);
+    let (t1, t1c) = half_add(u0, t0c);
+    let (t2, _) = half_add(u0c, t1c);
+
+    let alive_mask = !t2 & t1;
+    (alive_mask & t0) | (alive_mask & !t0 & row_self)
 }
 
 #[cfg(test)]
@@ -52,87 +127,45 @@ pub fn advance_core_scalar(
     let mut has_live = false;
     let mut border_west = 0u64;
     let mut border_east = 0u64;
-    let ghost_w = ghost.west;
-    let ghost_e = ghost.east;
+    let mut west_window =
+        (ghost.sw as u128) | ((ghost.west as u128) << 1) | ((ghost.nw as u128) << 65);
+    let mut east_window =
+        (ghost.se as u128) | ((ghost.east as u128) << 1) | ((ghost.ne as u128) << 65);
 
-    for row in 0..TILE_SIZE {
-        let row_above = if row == TILE_SIZE - 1 {
-            ghost.north
-        } else {
-            current[row + 1]
-        };
-        let row_self = current[row];
-        let row_below = if row == 0 {
-            ghost.south
-        } else {
-            current[row - 1]
-        };
+    macro_rules! process_row {
+        ($row:expr, $row_above:expr, $row_self:expr, $row_below:expr) => {{
+            let ghost = row_ghost_bits_from_windows(west_window, east_window);
 
-        let ghost_w_above = if row == TILE_SIZE - 1 {
-            ghost.nw
-        } else {
-            ((ghost_w >> (row + 1)) & 1) != 0
-        };
-        let ghost_e_above = if row == TILE_SIZE - 1 {
-            ghost.ne
-        } else {
-            ((ghost_e >> (row + 1)) & 1) != 0
-        };
-        let ghost_w_self = ((ghost_w >> row) & 1) != 0;
-        let ghost_e_self = ((ghost_e >> row) & 1) != 0;
-        let ghost_w_below = if row == 0 {
-            ghost.sw
-        } else {
-            ((ghost_w >> (row - 1)) & 1) != 0
-        };
-        let ghost_e_below = if row == 0 {
-            ghost.se
-        } else {
-            ((ghost_e >> (row - 1)) & 1) != 0
-        };
+            let next_row = advance_row_scalar($row_above, $row_self, $row_below, ghost);
 
-        let nw = west_neighbor_plane(row_above, ghost_w_above);
-        let n = row_above;
-        let ne = east_neighbor_plane(row_above, ghost_e_above);
-        let w = west_neighbor_plane(row_self, ghost_w_self);
-        let e = east_neighbor_plane(row_self, ghost_e_self);
-        let sw = west_neighbor_plane(row_below, ghost_w_below);
-        let s = row_below;
-        let se = east_neighbor_plane(row_below, ghost_e_below);
-
-        let (a0, a1) = full_add(nw, n, ne);
-        let (s0, s1) = half_add(w, e);
-        let (b0, b1) = full_add(sw, s, se);
-        let (t0, t0c) = full_add(a0, s0, b0);
-        let (u0, u0c) = full_add(a1, s1, b1);
-        let (t1, t1c) = half_add(u0, t0c);
-        let (t2, _) = half_add(u0c, t1c);
-
-        let alive_mask = !t2 & t1;
-        let next_row = (alive_mask & t0) | (alive_mask & !t0 & row_self);
-
-        next[row] = next_row;
-        changed |= next_row != row_self;
-        has_live |= next_row != 0;
-        border_west |= (next_row & 1) << row;
-        border_east |= ((next_row >> 63) & 1) << row;
+            next[$row] = next_row;
+            changed |= next_row != $row_self;
+            has_live |= next_row != 0;
+            border_west |= (next_row & 1) << $row;
+            border_east |= ((next_row >> 63) & 1) << $row;
+        }};
     }
 
-    let mut corners = 0u8;
-    if (next[63] & 1) != 0 {
-        corners |= BorderData::CORNER_NW;
+    process_row!(0, current[1], current[0], ghost.south);
+    west_window >>= 1;
+    east_window >>= 1;
+    for row in 1..(TILE_SIZE - 1) {
+        process_row!(row, current[row + 1], current[row], current[row - 1]);
+        west_window >>= 1;
+        east_window >>= 1;
     }
-    if ((next[63] >> 63) & 1) != 0 {
-        corners |= BorderData::CORNER_NE;
-    }
-    if (next[0] & 1) != 0 {
-        corners |= BorderData::CORNER_SW;
-    }
-    if ((next[0] >> 63) & 1) != 0 {
-        corners |= BorderData::CORNER_SE;
-    }
+    process_row!(
+        TILE_SIZE - 1,
+        ghost.north,
+        current[TILE_SIZE - 1],
+        current[TILE_SIZE - 2]
+    );
 
-    let border = BorderData::from_parts(next[63], next[0], border_west, border_east, corners);
+    let north_row = next[TILE_SIZE - 1];
+    let south_row = next[0];
+    let corners = corners_from_rows(north_row, south_row);
+
+    let border = BorderData::from_parts(north_row, south_row, border_west, border_east, corners);
 
     (changed, border, has_live)
 }
@@ -339,19 +372,7 @@ pub unsafe fn advance_core_avx2(
         east_below_bits >>= 4;
     }
 
-    let mut corners = 0u8;
-    if (border_south & 1) != 0 {
-        corners |= BorderData::CORNER_SW;
-    }
-    if ((border_south >> 63) & 1) != 0 {
-        corners |= BorderData::CORNER_SE;
-    }
-    if (border_north & 1) != 0 {
-        corners |= BorderData::CORNER_NW;
-    }
-    if ((border_north >> 63) & 1) != 0 {
-        corners |= BorderData::CORNER_NE;
-    }
+    let corners = corners_from_rows(border_north, border_south);
 
     let border = BorderData::from_parts(
         border_north,
@@ -455,31 +476,15 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
     let meta = unsafe { &mut *meta_ptr.add(idx) };
 
     // Ultra-fast path: empty tile + empty ghost zone.
-    if ghost.north | ghost.south | ghost.west | ghost.east == 0
-        && !ghost.nw
-        && !ghost.ne
-        && !ghost.sw
-        && !ghost.se
-    {
-        let mut any = 0u64;
-        let mut i = 0;
-        while i < TILE_SIZE {
-            any |= current[i] | current[i + 1] | current[i + 2] | current[i + 3];
-            if any != 0 {
-                break;
-            }
-            i += 4;
+    if ghost_is_empty(&ghost) && tile_is_empty(current) {
+        unsafe {
+            std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+            *next_borders_ptr.add(idx) = BorderData::default();
         }
-        if any == 0 {
-            unsafe {
-                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
-                *next_borders_ptr.add(idx) = BorderData::default();
-            }
-            meta.set_changed(false);
-            meta.set_has_live(false);
-            meta.population = 0;
-            return false;
-        }
+        meta.set_changed(false);
+        meta.set_has_live(false);
+        meta.population = 0;
+        return false;
     }
 
     let (changed, border, has_live) =
@@ -592,7 +597,10 @@ pub unsafe fn advance_tile_split(
 
 #[cfg(test)]
 mod tests {
-    use super::{GhostZone, TILE_SIZE, advance_core_scalar, ghost_bit};
+    use super::{
+        BorderData, GhostZone, TILE_SIZE, advance_core_scalar, corners_from_rows, ghost_bit,
+        ghost_is_empty, tile_is_empty,
+    };
 
     #[cfg(target_arch = "x86_64")]
     use super::advance_core_avx2;
@@ -644,6 +652,41 @@ mod tests {
         assert_eq!(border.east, 0);
         assert_eq!(border.corners, 0);
         assert_eq!(border.live_mask, 0);
+    }
+
+    #[test]
+    fn corners_from_rows_matches_corner_flags() {
+        let corners = corners_from_rows(1 | (1u64 << 63), 1 | (1u64 << 63));
+        assert_eq!(
+            corners,
+            BorderData::CORNER_NW
+                | BorderData::CORNER_NE
+                | BorderData::CORNER_SW
+                | BorderData::CORNER_SE
+        );
+        assert_eq!(corners_from_rows(0, 0), 0);
+    }
+
+    #[test]
+    fn ghost_is_empty_accounts_for_edges_and_corners() {
+        let mut ghost = GhostZone::default();
+        assert!(ghost_is_empty(&ghost));
+
+        ghost.west = 1;
+        assert!(!ghost_is_empty(&ghost));
+
+        ghost.west = 0;
+        ghost.ne = true;
+        assert!(!ghost_is_empty(&ghost));
+    }
+
+    #[test]
+    fn tile_is_empty_detects_live_rows() {
+        let mut tile = [0u64; TILE_SIZE];
+        assert!(tile_is_empty(&tile));
+
+        tile[37] = 1 << 11;
+        assert!(!tile_is_empty(&tile));
     }
 
     #[test]
