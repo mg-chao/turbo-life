@@ -34,6 +34,7 @@ fn east_neighbor_plane(word: u64, ghost_e: bool) -> u64 {
     (word >> 1) | ((ghost_e as u64) << 63)
 }
 
+#[cfg(test)]
 #[inline(always)]
 fn ghost_bit(column: u64, row: usize) -> bool {
     ((column >> row) & 1) != 0
@@ -70,24 +71,24 @@ pub fn advance_core_scalar(
         let ghost_w_above = if row == TILE_SIZE - 1 {
             ghost.nw
         } else {
-            ghost_bit(ghost_w, row + 1)
+            ((ghost_w >> (row + 1)) & 1) != 0
         };
         let ghost_e_above = if row == TILE_SIZE - 1 {
             ghost.ne
         } else {
-            ghost_bit(ghost_e, row + 1)
+            ((ghost_e >> (row + 1)) & 1) != 0
         };
-        let ghost_w_self = ghost_bit(ghost_w, row);
-        let ghost_e_self = ghost_bit(ghost_e, row);
+        let ghost_w_self = ((ghost_w >> row) & 1) != 0;
+        let ghost_e_self = ((ghost_e >> row) & 1) != 0;
         let ghost_w_below = if row == 0 {
             ghost.sw
         } else {
-            ghost_bit(ghost_w, row - 1)
+            ((ghost_w >> (row - 1)) & 1) != 0
         };
         let ghost_e_below = if row == 0 {
             ghost.se
         } else {
-            ghost_bit(ghost_e, row - 1)
+            ((ghost_e >> (row - 1)) & 1) != 0
         };
 
         let nw = west_neighbor_plane(row_above, ghost_w_above);
@@ -131,13 +132,7 @@ pub fn advance_core_scalar(
         corners |= BorderData::CORNER_SE;
     }
 
-    let border = BorderData {
-        north: next[63],
-        south: next[0],
-        west: border_west,
-        east: border_east,
-        corners,
-    };
+    let border = BorderData::from_parts(next[63], next[0], border_west, border_east, corners);
 
     (changed, border, has_live)
 }
@@ -367,13 +362,13 @@ pub unsafe fn advance_core_avx2(
         corners |= BorderData::CORNER_NE;
     }
 
-    let border = BorderData {
-        north: border_north,
-        south: border_south,
-        west: border_west,
-        east: border_east,
+    let border = BorderData::from_parts(
+        border_north,
+        border_south,
+        border_west,
+        border_east,
         corners,
-    };
+    );
 
     (changed, border, has_live)
 }
@@ -400,6 +395,25 @@ pub fn advance_core(
     }
 }
 
+#[inline(always)]
+unsafe fn advance_core_const<const USE_AVX2: bool>(
+    current: &[u64; TILE_SIZE],
+    next: &mut [u64; TILE_SIZE],
+    ghost: &GhostZone,
+) -> (bool, BorderData, bool) {
+    if USE_AVX2 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            return unsafe { advance_core_avx2(current, next, ghost) };
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            unreachable!("AVX2 backend selected on non-x86 target");
+        }
+    }
+    advance_core_scalar(current, next, ghost)
+}
+
 /// Fused ghost-gather + kernel advance using raw pointers.
 ///
 /// Eliminates the intermediate GhostZone struct by inlining the gather
@@ -411,7 +425,7 @@ pub fn advance_core(
 /// Caller must ensure exclusive write access to `next_ptr[idx]`,
 /// `meta_ptr[idx]`, and `next_borders_ptr[idx]`.
 #[inline(always)]
-pub unsafe fn advance_tile_fused(
+unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut TileMeta,
@@ -419,7 +433,6 @@ pub unsafe fn advance_tile_fused(
     borders_read_ptr: *const BorderData,
     neighbors_ptr: *const [u32; 8],
     idx: usize,
-    backend: KernelBackend,
 ) -> bool {
     // Inline ghost-zone gather (avoids function call + struct construction).
     let nb = unsafe { &*neighbors_ptr.add(idx) };
@@ -466,13 +479,7 @@ pub unsafe fn advance_tile_fused(
         if any == 0 {
             unsafe {
                 std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
-                *next_borders_ptr.add(idx) = BorderData {
-                    north: 0,
-                    south: 0,
-                    west: 0,
-                    east: 0,
-                    corners: 0,
-                };
+                *next_borders_ptr.add(idx) = BorderData::default();
             }
             meta.set_changed(false);
             meta.set_has_live(false);
@@ -481,7 +488,8 @@ pub unsafe fn advance_tile_fused(
         }
     }
 
-    let (changed, border, has_live) = advance_core(current, next, &ghost, backend);
+    let (changed, border, has_live) =
+        unsafe { advance_core_const::<USE_AVX2>(current, next, &ghost) };
 
     unsafe {
         *next_borders_ptr.add(idx) = border;
@@ -496,6 +504,53 @@ pub unsafe fn advance_tile_fused(
     }
 
     changed
+}
+
+#[inline(always)]
+pub unsafe fn advance_tile_fused_scalar(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
+    meta_ptr: *mut TileMeta,
+    next_borders_ptr: *mut BorderData,
+    borders_read_ptr: *const BorderData,
+    neighbors_ptr: *const [u32; 8],
+    idx: usize,
+) -> bool {
+    unsafe {
+        advance_tile_fused_impl::<false>(
+            current_ptr,
+            next_ptr,
+            meta_ptr,
+            next_borders_ptr,
+            borders_read_ptr,
+            neighbors_ptr,
+            idx,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn advance_tile_fused_avx2(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
+    meta_ptr: *mut TileMeta,
+    next_borders_ptr: *mut BorderData,
+    borders_read_ptr: *const BorderData,
+    neighbors_ptr: *const [u32; 8],
+    idx: usize,
+) -> bool {
+    unsafe {
+        advance_tile_fused_impl::<true>(
+            current_ptr,
+            next_ptr,
+            meta_ptr,
+            next_borders_ptr,
+            borders_read_ptr,
+            neighbors_ptr,
+            idx,
+        )
+    }
 }
 
 /// Advance a tile using split buffer pointers (unsafe parallel path).
@@ -594,6 +649,7 @@ mod tests {
         assert_eq!(border.west, 0);
         assert_eq!(border.east, 0);
         assert_eq!(border.corners, 0);
+        assert_eq!(border.live_mask, 0);
     }
 
     #[test]
@@ -622,6 +678,7 @@ mod tests {
                 assert_eq!(scalar.1.west, avx.1.west);
                 assert_eq!(scalar.1.east, avx.1.east);
                 assert_eq!(scalar.1.corners, avx.1.corners);
+                assert_eq!(scalar.1.live_mask, avx.1.live_mask);
             }
         }
     }

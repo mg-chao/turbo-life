@@ -21,6 +21,35 @@ const EXPAND_OFFSETS: [(i64, i64); 8] = [
     (1, -1),  // SE
 ];
 
+struct ExpandMaskTable {
+    dirs: [[u8; 8]; 256],
+    len: [u8; 256],
+}
+
+const fn build_expand_mask_table() -> ExpandMaskTable {
+    let mut table = ExpandMaskTable {
+        dirs: [[0u8; 8]; 256],
+        len: [0u8; 256],
+    };
+    let mut mask = 0usize;
+    while mask < 256 {
+        let mut count = 0u8;
+        let mut dir = 0usize;
+        while dir < 8 {
+            if (mask & (1usize << dir)) != 0 {
+                table.dirs[mask][count as usize] = dir as u8;
+                count += 1;
+            }
+            dir += 1;
+        }
+        table.len[mask] = count;
+        mask += 1;
+    }
+    table
+}
+
+const EXPAND_MASK_TABLE: ExpandMaskTable = build_expand_mask_table();
+
 #[inline(always)]
 fn pack_expand_candidate(idx: TileIdx, dir: usize) -> u64 {
     ((idx.0 as u64) << 3) | dir as u64
@@ -201,25 +230,28 @@ unsafe fn scan_tile_prune_expand_raw(
 
         let nb = &*neighbors_ptr.add(i_idx);
         let border = &*borders_ptr.add(i_idx);
+        debug_assert_eq!(
+            border.live_mask,
+            BorderData::compute_live_mask(
+                border.north,
+                border.south,
+                border.west,
+                border.east,
+                border.corners,
+            )
+        );
 
         // Fast path: when no neighbors are missing, there is no frontier expansion.
         let missing = meta.missing_mask;
 
         if missing != 0 {
-            let live_border: u8 = ((border.north != 0) as u8)
-                | (((border.south != 0) as u8) << 1)
-                | (((border.west != 0) as u8) << 2)
-                | (((border.east != 0) as u8) << 3)
-                | (((border.corners & BorderData::CORNER_NW != 0) as u8) << 4)
-                | (((border.corners & BorderData::CORNER_NE != 0) as u8) << 5)
-                | (((border.corners & BorderData::CORNER_SW != 0) as u8) << 6)
-                | (((border.corners & BorderData::CORNER_SE != 0) as u8) << 7);
-
-            let mut bits = missing & live_border;
-            while bits != 0 {
-                let bit = bits.trailing_zeros() as usize;
-                expand.push(pack_expand_candidate(idx, bit));
-                bits &= bits - 1;
+            let expand_mask = (missing & border.live_mask) as usize;
+            if expand_mask != 0 {
+                let dirs = &EXPAND_MASK_TABLE.dirs[expand_mask];
+                let count = EXPAND_MASK_TABLE.len[expand_mask] as usize;
+                for &dir in dirs[..count].iter() {
+                    expand.push(pack_expand_candidate(idx, dir as usize));
+                }
             }
         }
 

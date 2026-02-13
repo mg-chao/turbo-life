@@ -102,6 +102,9 @@ pub struct BorderData {
     pub west: u64,
     pub east: u64,
     pub corners: u8,
+    /// Bitset for fast frontier checks:
+    /// 0=N, 1=S, 2=W, 3=E, 4=NW, 5=NE, 6=SW, 7=SE.
+    pub live_mask: u8,
 }
 
 impl Default for BorderData {
@@ -113,6 +116,7 @@ impl Default for BorderData {
             west: 0,
             east: 0,
             corners: 0,
+            live_mask: 0,
         }
     }
 }
@@ -122,6 +126,42 @@ impl BorderData {
     pub const CORNER_NE: u8 = 1 << 1;
     pub const CORNER_SW: u8 = 1 << 2;
     pub const CORNER_SE: u8 = 1 << 3;
+
+    #[inline(always)]
+    pub const fn compute_live_mask(
+        north: u64,
+        south: u64,
+        west: u64,
+        east: u64,
+        corners: u8,
+    ) -> u8 {
+        ((north != 0) as u8)
+            | (((south != 0) as u8) << 1)
+            | (((west != 0) as u8) << 2)
+            | (((east != 0) as u8) << 3)
+            | (((corners & Self::CORNER_NW != 0) as u8) << 4)
+            | (((corners & Self::CORNER_NE != 0) as u8) << 5)
+            | (((corners & Self::CORNER_SW != 0) as u8) << 6)
+            | (((corners & Self::CORNER_SE != 0) as u8) << 7)
+    }
+
+    #[inline(always)]
+    pub fn refresh_live_mask(&mut self) {
+        self.live_mask =
+            Self::compute_live_mask(self.north, self.south, self.west, self.east, self.corners);
+    }
+
+    #[inline(always)]
+    pub fn from_parts(north: u64, south: u64, west: u64, east: u64, corners: u8) -> Self {
+        Self {
+            north,
+            south,
+            west,
+            east,
+            corners,
+            live_mask: Self::compute_live_mask(north, south, west, east, corners),
+        }
+    }
 
     #[inline(always)]
     pub fn nw(self) -> bool {
@@ -297,13 +337,7 @@ pub fn recompute_border_and_has_live(buf: &[u64; TILE_SIZE]) -> (BorderData, boo
         corners |= BorderData::CORNER_SE;
     }
     (
-        BorderData {
-            north: buf[63],
-            south: buf[0],
-            west,
-            east,
-            corners,
-        },
+        BorderData::from_parts(buf[63], buf[0], west, east, corners),
         any_live != 0,
     )
 }

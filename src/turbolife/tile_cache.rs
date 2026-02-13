@@ -42,6 +42,7 @@ impl CacheEntry {
             west: 0,
             east: 0,
             corners: 0,
+            live_mask: 0,
         },
         changed: false,
         has_live: false,
@@ -188,7 +189,29 @@ impl TileCache {
 /// # Safety
 /// All pointers must be valid. `idx` must be within bounds of all arrays.
 #[inline(always)]
-pub unsafe fn advance_tile_cached(
+unsafe fn advance_core_const<const USE_AVX2: bool>(
+    current: &[u64; TILE_SIZE],
+    next: &mut [u64; TILE_SIZE],
+    ghost: &GhostZone,
+) -> (bool, BorderData, bool) {
+    if USE_AVX2 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            return unsafe { super::kernel::advance_core_avx2(current, next, ghost) };
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            unreachable!("AVX2 backend selected on non-x86 target");
+        }
+    }
+    super::kernel::advance_core_scalar(current, next, ghost)
+}
+
+/// # Safety
+/// All pointers must be valid. `idx` must be within bounds of all arrays.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut super::tile::TileMeta,
@@ -196,7 +219,6 @@ pub unsafe fn advance_tile_cached(
     borders_read_ptr: *const BorderData,
     neighbors_ptr: *const [u32; 8],
     idx: usize,
-    backend: super::kernel::KernelBackend,
     cache: *mut TileCache,
 ) -> bool {
     use super::tile::POPULATION_UNKNOWN;
@@ -245,13 +267,7 @@ pub unsafe fn advance_tile_cached(
         if any == 0 {
             unsafe {
                 std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
-                *next_borders_ptr.add(idx) = BorderData {
-                    north: 0,
-                    south: 0,
-                    west: 0,
-                    east: 0,
-                    corners: 0,
-                };
+                *next_borders_ptr.add(idx) = BorderData::default();
             }
             meta.set_changed(false);
             meta.set_has_live(false);
@@ -291,7 +307,7 @@ pub unsafe fn advance_tile_cached(
             return changed;
         }
         let (changed, border, has_live) =
-            super::kernel::advance_core(current, next, &ghost, backend);
+            unsafe { advance_core_const::<USE_AVX2>(current, next, &ghost) };
         unsafe {
             *next_borders_ptr.add(idx) = border;
         }
@@ -320,7 +336,8 @@ pub unsafe fn advance_tile_cached(
     }
 
     // Cache disabled path.
-    let (changed, border, has_live) = super::kernel::advance_core(current, next, &ghost, backend);
+    let (changed, border, has_live) =
+        unsafe { advance_core_const::<USE_AVX2>(current, next, &ghost) };
     unsafe {
         *next_borders_ptr.add(idx) = border;
     }
@@ -332,4 +349,61 @@ pub unsafe fn advance_tile_cached(
         meta.population = 0;
     }
     changed
+}
+
+/// # Safety
+/// All pointers must be valid. `idx` must be within bounds of all arrays.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn advance_tile_cached_scalar(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
+    meta_ptr: *mut super::tile::TileMeta,
+    next_borders_ptr: *mut BorderData,
+    borders_read_ptr: *const BorderData,
+    neighbors_ptr: *const [u32; 8],
+    idx: usize,
+    cache: *mut TileCache,
+) -> bool {
+    unsafe {
+        advance_tile_cached_impl::<false>(
+            current_ptr,
+            next_ptr,
+            meta_ptr,
+            next_borders_ptr,
+            borders_read_ptr,
+            neighbors_ptr,
+            idx,
+            cache,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+/// # Safety
+/// All pointers must be valid. `idx` must be within bounds of all arrays.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn advance_tile_cached_avx2(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
+    meta_ptr: *mut super::tile::TileMeta,
+    next_borders_ptr: *mut BorderData,
+    borders_read_ptr: *const BorderData,
+    neighbors_ptr: *const [u32; 8],
+    idx: usize,
+    cache: *mut TileCache,
+) -> bool {
+    unsafe {
+        advance_tile_cached_impl::<true>(
+            current_ptr,
+            next_ptr,
+            meta_ptr,
+            next_borders_ptr,
+            borders_read_ptr,
+            neighbors_ptr,
+            idx,
+            cache,
+        )
+    }
 }
