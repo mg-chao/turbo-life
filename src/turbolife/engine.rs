@@ -1,6 +1,5 @@
 use rayon::prelude::*;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use super::activity::{append_expand_candidates, finalize_prune_and_expand, rebuild_active_set};
@@ -63,10 +62,7 @@ const PARALLEL_KERNEL_TILES_PER_THREAD: usize = 16;
 const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
 const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
-const PARALLEL_POST_SCAN_THRESHOLD: usize = 32_768;
-const PARALLEL_WORK_GRAIN_MIN: usize = 64;
-const PARALLEL_WORK_GRAIN_MAX: usize = 512;
-const PARALLEL_WORK_CHUNKS_PER_THREAD: usize = 4;
+const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 32_768;
 
 static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
 static AUTO_KERNEL_BACKEND: OnceLock<KernelBackend> = OnceLock::new();
@@ -255,16 +251,6 @@ fn tuned_parallel_threads(active_len: usize, thread_count: usize) -> usize {
     effective.max(1)
 }
 
-#[inline]
-fn parallel_work_grain(active_len: usize, workers: usize) -> usize {
-    let target_chunks = workers
-        .saturating_mul(PARALLEL_WORK_CHUNKS_PER_THREAD)
-        .max(1);
-    active_len
-        .div_ceil(target_chunks)
-        .clamp(PARALLEL_WORK_GRAIN_MIN, PARALLEL_WORK_GRAIN_MAX)
-}
-
 /// Resolve the thread count from a config, falling back to auto-detect.
 fn resolve_thread_count(config: &TurboLifeConfig) -> usize {
     let mut threads = config
@@ -343,7 +329,7 @@ pub struct TurboLife {
     touched_flags: Vec<bool>,
     /// Direct-mapped tile result cache for kernel memoization.
     tile_cache: TileCache,
-    /// Per-worker scratch buffers used by the lock-free parallel scheduler.
+    /// Per-worker scratch buffers used by the static parallel scheduler.
     worker_scratch: Vec<WorkerScratch>,
 }
 
@@ -742,7 +728,8 @@ impl TurboLife {
 
                         unsafe {
                             let meta = &mut *meta_ptr.add(ii);
-                            if changed && !meta.in_changed_list() {
+                            if changed {
+                                debug_assert!(!meta.in_changed_list());
                                 meta.set_in_changed_list(true);
                                 self.arena.changed_list.push(idx);
                             }
@@ -818,7 +805,8 @@ impl TurboLife {
 
                         unsafe {
                             let meta = &mut *meta_ptr.add(ii);
-                            if changed && !meta.in_changed_list() {
+                            if changed {
+                                debug_assert!(!meta.in_changed_list());
                                 meta.set_in_changed_list(true);
                                 self.arena.changed_list.push(idx);
                             }
@@ -874,8 +862,8 @@ impl TurboLife {
         } else {
             // Parallel kernel compute:
             // - Small/medium active sets keep the existing par_chunks collect path.
-            // - Very large active sets switch to a lock-free scheduler and
-            //   per-worker scratch buffers to parallelize post-scan work.
+            // - Very large active sets switch to a static contiguous scheduler with
+            //   per-worker scratch buffers and fused post-processing.
             let active_set = &self.arena.active_set;
             let active_ptr = SendConstPtr::new(active_set.as_ptr());
             let current_ptr = SendConstPtr::new(current_vec.as_ptr());
@@ -886,11 +874,10 @@ impl TurboLife {
             let borders_read_ptr = SendConstPtr::new(borders_read.as_ptr());
             let worker_count = effective_threads.min(active_len);
 
-            if active_len >= PARALLEL_POST_SCAN_THRESHOLD {
-                let grain = parallel_work_grain(active_len, worker_count);
-
+            if active_len >= PARALLEL_STATIC_SCHEDULE_THRESHOLD {
                 self.prepare_worker_scratch(worker_count, active_len);
                 let scratch_ptr = SendPtr::new(self.worker_scratch.as_mut_ptr());
+                let chunk_size = active_len.div_ceil(worker_count);
 
                 macro_rules! prefetch_for_work_item {
                     ($i:expr, $end:expr) => {
@@ -932,72 +919,50 @@ impl TurboLife {
                     };
                 }
 
-                macro_rules! parallel_kernel_compute_only {
+                macro_rules! parallel_kernel_fused {
                     ($advance:path) => {{
-                        let cursor = AtomicUsize::new(0);
-                        (0..worker_count).into_par_iter().for_each(|_| {
-                            loop {
-                                let start = cursor.fetch_add(grain, Ordering::Relaxed);
-                                if start >= active_len {
-                                    break;
-                                }
-                                let end = (start + grain).min(active_len);
-                                for i in start..end {
-                                    prefetch_for_work_item!(i, end);
-                                    let idx = unsafe { *active_ptr.get().add(i) };
-                                    unsafe {
-                                        $advance(
-                                            current_ptr.get(),
-                                            next_ptr.get(),
-                                            meta_ptr.get(),
-                                            next_borders_ptr.get(),
-                                            borders_read_ptr.get(),
-                                            neighbors_ptr.get(),
-                                            idx.index(),
+                        (0..worker_count).into_par_iter().for_each(|worker_id| {
+                            let start = worker_id.saturating_mul(chunk_size);
+                            if start >= active_len {
+                                return;
+                            }
+                            let end = (start + chunk_size).min(active_len);
+                            let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
+                            for i in start..end {
+                                prefetch_for_work_item!(i, end);
+                                let idx = unsafe { *active_ptr.get().add(i) };
+                                let ii = idx.index();
+                                let changed = unsafe {
+                                    $advance(
+                                        current_ptr.get(),
+                                        next_ptr.get(),
+                                        meta_ptr.get(),
+                                        next_borders_ptr.get(),
+                                        borders_read_ptr.get(),
+                                        neighbors_ptr.get(),
+                                        ii,
+                                    )
+                                };
+
+                                unsafe {
+                                    let meta = &*meta_ptr.get().add(ii);
+                                    if changed {
+                                        scratch.changed.push(idx);
+                                    }
+
+                                    let missing = meta.missing_mask;
+                                    if missing != 0 {
+                                        let live_mask = (*next_borders_ptr.get().add(ii)).live_mask;
+                                        append_expand_candidates(
+                                            &mut scratch.expand,
+                                            idx,
+                                            missing,
+                                            live_mask,
                                         );
                                     }
-                                }
-                            }
-                        });
-                    }};
-                }
 
-                macro_rules! parallel_post_scan {
-                    () => {{
-                        let cursor = AtomicUsize::new(0);
-                        (0..worker_count).into_par_iter().for_each(|worker_id| {
-                            let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
-                            loop {
-                                let start = cursor.fetch_add(grain, Ordering::Relaxed);
-                                if start >= active_len {
-                                    break;
-                                }
-                                let end = (start + grain).min(active_len);
-                                for i in start..end {
-                                    let idx = unsafe { *active_ptr.get().add(i) };
-                                    let ii = idx.index();
-                                    unsafe {
-                                        let meta = &*meta_ptr.get().add(ii);
-                                        let changed = meta.changed();
-                                        if changed {
-                                            scratch.changed.push(idx);
-                                        }
-
-                                        let missing = meta.missing_mask;
-                                        if missing != 0 {
-                                            let live_mask =
-                                                (*next_borders_ptr.get().add(ii)).live_mask;
-                                            append_expand_candidates(
-                                                &mut scratch.expand,
-                                                idx,
-                                                missing,
-                                                live_mask,
-                                            );
-                                        }
-
-                                        if !changed && !meta.has_live() {
-                                            scratch.prune.push(idx);
-                                        }
+                                    if !changed && !meta.has_live() {
+                                        scratch.prune.push(idx);
                                     }
                                 }
                             }
@@ -1006,21 +971,18 @@ impl TurboLife {
                 }
 
                 match backend {
-                    KernelBackend::Scalar => {
-                        parallel_kernel_compute_only!(advance_tile_fused_scalar)
-                    }
+                    KernelBackend::Scalar => parallel_kernel_fused!(advance_tile_fused_scalar),
                     KernelBackend::Avx2 => {
                         #[cfg(target_arch = "x86_64")]
                         {
-                            parallel_kernel_compute_only!(advance_tile_fused_avx2)
+                            parallel_kernel_fused!(advance_tile_fused_avx2)
                         }
                         #[cfg(not(target_arch = "x86_64"))]
                         {
-                            parallel_kernel_compute_only!(advance_tile_fused_scalar)
+                            parallel_kernel_fused!(advance_tile_fused_scalar)
                         }
                     }
                 }
-                parallel_post_scan!();
 
                 let mut reserve_expand = 0usize;
                 let mut reserve_prune = 0usize;
@@ -1046,10 +1008,9 @@ impl TurboLife {
                     for idx in scratch.changed.drain(..) {
                         unsafe {
                             let meta = &mut *meta_write_ptr.add(idx.index());
-                            if !meta.in_changed_list() {
-                                meta.set_in_changed_list(true);
-                                self.arena.changed_list.push(idx);
-                            }
+                            debug_assert!(!meta.in_changed_list());
+                            meta.set_in_changed_list(true);
+                            self.arena.changed_list.push(idx);
                         }
                     }
                 }
@@ -1185,10 +1146,9 @@ impl TurboLife {
                 for idx in changed_all.drain(..) {
                     unsafe {
                         let meta = &mut *meta_write_ptr.add(idx.index());
-                        if !meta.in_changed_list() {
-                            meta.set_in_changed_list(true);
-                            self.arena.changed_list.push(idx);
-                        }
+                        debug_assert!(!meta.in_changed_list());
+                        meta.set_in_changed_list(true);
+                        self.arena.changed_list.push(idx);
                     }
                 }
             }

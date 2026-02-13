@@ -12,6 +12,7 @@ use super::tilemap::TileMap;
 
 const INITIAL_TILE_CAPACITY: usize = 256;
 const MIN_GROW_TILES: usize = 256;
+const ACTIVE_SORT_RADIX_BUCKETS: usize = 1 << 16;
 
 pub struct TileArena {
     /// Two cell buffers: `cell_bufs[phase]` = current (read), `cell_bufs[1-phase]` = next (write).
@@ -31,6 +32,8 @@ pub struct TileArena {
 
     pub active_epoch: u32,
     pub active_set: Vec<TileIdx>,
+    pub active_sort_scratch: Vec<TileIdx>,
+    pub active_sort_counts: Vec<u32>,
     /// Pending directional frontier-expansion candidates.
     /// Packed as `((src_idx as u64) << 3) | dir`.
     pub expand_buf: Vec<u64>,
@@ -77,6 +80,8 @@ impl TileArena {
             occupied_count: 0,
             active_epoch: 1,
             active_set: Vec::new(),
+            active_sort_scratch: Vec::new(),
+            active_sort_counts: vec![0u32; ACTIVE_SORT_RADIX_BUCKETS],
             expand_buf: Vec::new(),
             prune_buf: Vec::new(),
             changed_scratch: Vec::new(),

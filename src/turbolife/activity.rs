@@ -18,6 +18,8 @@ const EXPAND_OFFSETS: [(i64, i64); 8] = [
 const PARALLEL_PRUNE_CANDIDATES_MIN: usize = 256;
 const PRUNE_FILTER_CHUNK_MIN: usize = 64;
 const PRUNE_FILTER_CHUNK_MAX: usize = 512;
+const ACTIVE_SORT_STD_MAX: usize = 8_192;
+const ACTIVE_SORT_RADIX_MIN: usize = 32_768;
 
 struct SendConstPtr<T> {
     inner: *const T,
@@ -47,6 +49,63 @@ fn prune_filter_chunk_size(candidate_len: usize, threads: usize) -> usize {
     let target_chunks = threads.saturating_mul(4).max(1);
     let size = candidate_len.div_ceil(target_chunks);
     size.clamp(PRUNE_FILTER_CHUNK_MIN, PRUNE_FILTER_CHUNK_MAX)
+}
+
+#[inline]
+fn radix_sort_active_set(arena: &mut TileArena) {
+    let len = arena.active_set.len();
+    if len <= 1 {
+        return;
+    }
+
+    debug_assert!(len <= u32::MAX as usize);
+    debug_assert_eq!(arena.active_sort_counts.len(), 1 << 16);
+
+    arena.active_sort_scratch.clear();
+    arena.active_sort_scratch.resize(len, TileIdx(0));
+    let counts = &mut arena.active_sort_counts;
+    counts.fill(0);
+
+    for &idx in arena.active_set.iter() {
+        counts[(idx.0 & 0xFFFF) as usize] += 1;
+    }
+
+    let mut prefix = 0u32;
+    for count in counts.iter_mut() {
+        let next = prefix + *count;
+        *count = prefix;
+        prefix = next;
+    }
+
+    for &idx in arena.active_set.iter() {
+        let bucket = (idx.0 & 0xFFFF) as usize;
+        let dst = counts[bucket] as usize;
+        unsafe {
+            *arena.active_sort_scratch.get_unchecked_mut(dst) = idx;
+        }
+        counts[bucket] += 1;
+    }
+
+    counts.fill(0);
+    for &idx in arena.active_sort_scratch.iter() {
+        counts[(idx.0 >> 16) as usize] += 1;
+    }
+
+    prefix = 0;
+    for count in counts.iter_mut() {
+        let next = prefix + *count;
+        *count = prefix;
+        prefix = next;
+    }
+
+    for &idx in arena.active_sort_scratch.iter() {
+        let bucket = (idx.0 >> 16) as usize;
+        let dst = counts[bucket] as usize;
+        unsafe {
+            *arena.active_set.get_unchecked_mut(dst) = idx;
+        }
+        counts[bucket] += 1;
+    }
 }
 
 struct ExpandMaskTable {
@@ -183,9 +242,13 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     }
 
     // Sort active set by index for better cache locality during kernel execution.
-    // Only sort when the set is small enough that sort cost stays tiny.
-    if arena.active_set.len() <= 8192 {
+    // Small sets use std sort, very large sets use a stable two-pass radix sort.
+    // Mid-sized sets skip sorting to keep rebuild costs bounded.
+    let active_len = arena.active_set.len();
+    if active_len <= ACTIVE_SORT_STD_MAX {
         arena.active_set.sort_unstable_by_key(|idx| idx.0);
+    } else if active_len >= ACTIVE_SORT_RADIX_MIN {
+        radix_sort_active_set(arena);
     }
 }
 
