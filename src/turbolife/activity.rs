@@ -136,7 +136,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     // The kernel accesses cell_bufs, borders, meta, and neighbors arrays sequentially
     // by tile index — sorting ensures we walk these arrays in order.
     // Only sort when the set is small enough that sort cost < cache benefit.
-    if arena.active_set.len() <= 32768 {
+    if arena.active_set.len() <= 8192 {
         arena.active_set.sort_unstable_by_key(|idx| idx.0);
     }
 }

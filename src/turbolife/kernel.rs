@@ -239,7 +239,8 @@ pub unsafe fn advance_core_avx2(
     ghost: &GhostZone,
 ) -> (bool, BorderData, bool) {
     use std::arch::x86_64::{
-        __m256i, _mm256_and_si256, _mm256_andnot_si256, _mm256_loadu_si256, _mm256_or_si256,
+        __m256i, _mm256_and_si256, _mm256_andnot_si256, _mm256_extract_epi64,
+        _mm256_loadu_si256, _mm256_or_si256,
         _mm256_slli_epi64, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_testz_si256,
         _mm256_xor_si256,
     };
@@ -248,6 +249,8 @@ pub unsafe fn advance_core_avx2(
     let mut has_live = false;
     let mut border_west = 0u64;
     let mut border_east = 0u64;
+    let mut border_north = 0u64;
+    let mut border_south = 0u64;
     let current_ptr = current.as_ptr();
 
     for row_base in (0..TILE_SIZE).step_by(4) {
@@ -324,35 +327,46 @@ pub unsafe fn advance_core_avx2(
         changed |= _mm256_testz_si256(diff, diff) == 0;
         has_live |= _mm256_testz_si256(next_rows, next_rows) == 0;
 
-        // Store directly to output and extract border bits.
+        // Store to output and extract border bits directly from register
+        // to avoid store-to-load forwarding stalls.
         unsafe {
             _mm256_storeu_si256(next.as_mut_ptr().add(row_base) as *mut __m256i, next_rows);
         }
-        for lane in 0..4usize {
-            let row = row_base + lane;
-            let next_row = next[row];
-            border_west |= (next_row & 1) << row;
-            border_east |= ((next_row >> 63) & 1) << row;
-        }
+        // Extract lanes directly from the SIMD register.
+        let lane0 = _mm256_extract_epi64(next_rows, 0) as u64;
+        let lane1 = _mm256_extract_epi64(next_rows, 1) as u64;
+        let lane2 = _mm256_extract_epi64(next_rows, 2) as u64;
+        let lane3 = _mm256_extract_epi64(next_rows, 3) as u64;
+        border_west |= (lane0 & 1) << row_base
+            | ((lane1 & 1) << (row_base + 1))
+            | ((lane2 & 1) << (row_base + 2))
+            | ((lane3 & 1) << (row_base + 3));
+        border_east |= (((lane0 >> 63) & 1) << row_base)
+            | (((lane1 >> 63) & 1) << (row_base + 1))
+            | (((lane2 >> 63) & 1) << (row_base + 2))
+            | (((lane3 >> 63) & 1) << (row_base + 3));
+        // Capture south (row 0) and north (row 63) from registers.
+        if row_base == 0 { border_south = lane0; }
+        if row_base == TILE_SIZE - 4 { border_north = lane3; }
     }
 
     let mut corners = 0u8;
-    if (next[63] & 1) != 0 {
-        corners |= BorderData::CORNER_NW;
-    }
-    if ((next[63] >> 63) & 1) != 0 {
-        corners |= BorderData::CORNER_NE;
-    }
-    if (next[0] & 1) != 0 {
+    if (border_south & 1) != 0 {
         corners |= BorderData::CORNER_SW;
     }
-    if ((next[0] >> 63) & 1) != 0 {
+    if ((border_south >> 63) & 1) != 0 {
         corners |= BorderData::CORNER_SE;
+    }
+    if (border_north & 1) != 0 {
+        corners |= BorderData::CORNER_NW;
+    }
+    if ((border_north >> 63) & 1) != 0 {
+        corners |= BorderData::CORNER_NE;
     }
 
     let border = BorderData {
-        north: next[63],
-        south: next[0],
+        north: border_north,
+        south: border_south,
         west: border_west,
         east: border_east,
         corners,
