@@ -585,10 +585,29 @@ impl TurboLife {
             let next_ptr = next_vec.as_mut_ptr();
             let next_borders_ptr = next_borders_vec.as_mut_ptr();
             let meta_ptr = self.arena.meta.as_mut_ptr();
+            let active_ptr = self.arena.active_set.as_ptr();
 
             for i in 0..active_len {
-                let idx = self.arena.active_set[i];
+                let idx = unsafe { *active_ptr.add(i) };
                 let ii = idx.index();
+
+                // Prefetch the next tile's cell buffer and neighbors into L2 cache.
+                // This hides memory latency by overlapping fetch with current tile's compute.
+                if i + 1 < active_len {
+                    let next_ii = unsafe { (*active_ptr.add(i + 1)).index() };
+                    unsafe {
+                        let next_current_addr = current_ptr.add(next_ii) as *const u8;
+                        let next_next_addr = next_ptr.add(next_ii) as *const u8;
+                        // Prefetch first cache line of current and next cell buffers.
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            use std::arch::x86_64::*;
+                            _mm_prefetch(next_current_addr as *const i8, _MM_HINT_T1);
+                            _mm_prefetch(next_next_addr as *const i8, _MM_HINT_T1);
+                        }
+                    }
+                }
+
                 let ghost = unsafe { gather_ghost_zone_raw(ii, borders_read_ptr, neighbors_ptr) };
 
                 let (changed, _border, has_live) = unsafe {
@@ -627,7 +646,21 @@ impl TurboLife {
             let chunk_size = active_len.div_ceil(worker_count);
 
             active_set.par_chunks(chunk_size).for_each(move |chunk| {
-                for &idx in chunk {
+                for (ci, &idx) in chunk.iter().enumerate() {
+                    // Prefetch next tile's cell buffers into L2 cache.
+                    if ci + 1 < chunk.len() {
+                        let next_ii = chunk[ci + 1].index();
+                        unsafe {
+                            let next_current_addr = current_ptr.get().add(next_ii) as *const u8;
+                            let next_next_addr = next_ptr.get().add(next_ii) as *const u8;
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                use std::arch::x86_64::*;
+                                _mm_prefetch(next_current_addr as *const i8, _MM_HINT_T1);
+                                _mm_prefetch(next_next_addr as *const i8, _MM_HINT_T1);
+                            }
+                        }
+                    }
                     let ghost = unsafe {
                         gather_ghost_zone_raw(
                             idx.index(),

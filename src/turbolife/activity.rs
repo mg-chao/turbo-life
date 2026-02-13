@@ -3,7 +3,7 @@
 use rayon::prelude::*;
 
 use super::arena::TileArena;
-use super::tile::{BorderData, Direction, NO_NEIGHBOR, TileIdx, TileMeta};
+use super::tile::{BorderData, NO_NEIGHBOR, TileIdx, TileMeta};
 
 const PARALLEL_PRUNE_MIN_ACTIVE: usize = 192;
 const PARALLEL_PRUNE_TILES_PER_THREAD: usize = 24;
@@ -100,7 +100,9 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
 
     // Hot loop: epoch-stamp changed tiles + their 8 neighbors.
     // Use raw pointers to eliminate bounds checks on every neighbor access.
-    arena.active_set.reserve(changed_count * 4);
+    // Reserve for worst case: each changed tile + up to 8 unique neighbors.
+    // Use 9× estimate (tile + 8 neighbors) to avoid mid-loop reallocation.
+    arena.active_set.reserve(changed_count.saturating_mul(9).min(arena.occupied_count));
     let meta_ptr = arena.meta.as_mut_ptr();
     let neighbors_ptr = arena.neighbors.as_ptr();
     let meta_len = arena.meta.len();
@@ -134,7 +136,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     // The kernel accesses cell_bufs, borders, meta, and neighbors arrays sequentially
     // by tile index — sorting ensures we walk these arrays in order.
     // Only sort when the set is small enough that sort cost < cache benefit.
-    if arena.active_set.len() <= 16384 {
+    if arena.active_set.len() <= 32768 {
         arena.active_set.sort_unstable_by_key(|idx| idx.0);
     }
 }
@@ -172,44 +174,50 @@ unsafe fn scan_tile_prune_expand_raw(
             return false;
         }
 
-        let (tx, ty) = *coords_ptr.add(i_idx);
-        let border = &*borders_ptr.add(i_idx);
         let nb = &*neighbors_ptr.add(i_idx);
+        let border = &*borders_ptr.add(i_idx);
 
-        // Check if any neighbor is missing.
-        let has_missing_neighbor = nb[0] == NO_NEIGHBOR
-            || nb[1] == NO_NEIGHBOR
-            || nb[2] == NO_NEIGHBOR
-            || nb[3] == NO_NEIGHBOR
-            || nb[4] == NO_NEIGHBOR
-            || nb[5] == NO_NEIGHBOR
-            || nb[6] == NO_NEIGHBOR
-            || nb[7] == NO_NEIGHBOR;
+        // Build a bitmask of which neighbors are missing (1 bit per direction).
+        // This replaces 8 individual NO_NEIGHBOR comparisons with a single
+        // combined check, and uses the bitmask to drive expansion.
+        let missing: u8 = ((nb[0] == NO_NEIGHBOR) as u8)
+            | (((nb[1] == NO_NEIGHBOR) as u8) << 1)
+            | (((nb[2] == NO_NEIGHBOR) as u8) << 2)
+            | (((nb[3] == NO_NEIGHBOR) as u8) << 3)
+            | (((nb[4] == NO_NEIGHBOR) as u8) << 4)
+            | (((nb[5] == NO_NEIGHBOR) as u8) << 5)
+            | (((nb[6] == NO_NEIGHBOR) as u8) << 6)
+            | (((nb[7] == NO_NEIGHBOR) as u8) << 7);
 
-        if has_missing_neighbor {
-            if border.north != 0 && nb[Direction::North.index()] == NO_NEIGHBOR {
-                expand.push((tx, ty + 1));
-            }
-            if border.south != 0 && nb[Direction::South.index()] == NO_NEIGHBOR {
-                expand.push((tx, ty - 1));
-            }
-            if border.west != 0 && nb[Direction::West.index()] == NO_NEIGHBOR {
-                expand.push((tx - 1, ty));
-            }
-            if border.east != 0 && nb[Direction::East.index()] == NO_NEIGHBOR {
-                expand.push((tx + 1, ty));
-            }
-            if border.nw() && nb[Direction::NW.index()] == NO_NEIGHBOR {
-                expand.push((tx - 1, ty + 1));
-            }
-            if border.ne() && nb[Direction::NE.index()] == NO_NEIGHBOR {
-                expand.push((tx + 1, ty + 1));
-            }
-            if border.sw() && nb[Direction::SW.index()] == NO_NEIGHBOR {
-                expand.push((tx - 1, ty - 1));
-            }
-            if border.se() && nb[Direction::SE.index()] == NO_NEIGHBOR {
-                expand.push((tx + 1, ty - 1));
+        if missing != 0 {
+            let (tx, ty) = *coords_ptr.add(i_idx);
+
+            // Build a bitmask of which borders have live cells, matching
+            // the same bit layout as the missing mask.
+            let live_border: u8 = ((border.north != 0) as u8)        // bit 0 = North
+                | (((border.south != 0) as u8) << 1)                 // bit 1 = South
+                | (((border.west != 0) as u8) << 2)                  // bit 2 = West
+                | (((border.east != 0) as u8) << 3)                  // bit 3 = East
+                | (((border.corners & BorderData::CORNER_NW != 0) as u8) << 4) // bit 4 = NW
+                | (((border.corners & BorderData::CORNER_NE != 0) as u8) << 5) // bit 5 = NE
+                | (((border.corners & BorderData::CORNER_SW != 0) as u8) << 6) // bit 6 = SW
+                | (((border.corners & BorderData::CORNER_SE != 0) as u8) << 7); // bit 7 = SE
+
+            // Only expand where both missing AND live border.
+            let need_expand = missing & live_border;
+            if need_expand != 0 {
+                // Direction offsets indexed by bit position (N,S,W,E,NW,NE,SW,SE).
+                const OFFSETS: [(i64, i64); 8] = [
+                    (0, 1), (0, -1), (-1, 0), (1, 0),
+                    (-1, 1), (1, 1), (-1, -1), (1, -1),
+                ];
+                let mut bits = need_expand;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    let (dx, dy) = OFFSETS[bit];
+                    expand.push((tx + dx, ty + dy));
+                    bits &= bits - 1;
+                }
             }
         }
 
@@ -308,11 +316,11 @@ pub fn prune_and_expand(arena: &mut TileArena) {
         arena.prune_buf.extend(prune_all);
     }
 
-    // Dedup via the tilemap itself: allocate_absent inserts into coord_to_idx,
-    // so subsequent idx_at calls for the same coord will find it and skip.
-    // For large frontiers, sort+dedup first to drastically cut redundant
-    // tilemap probes when many active tiles request the same neighbors.
-    if arena.expand_buf.len() > 4096 {
+    // Dedup expand buffer: sort+dedup to eliminate redundant tilemap probes.
+    // Always sort+dedup when there are duplicates — the cost is O(n log n)
+    // but it eliminates O(n) redundant hash lookups which are more expensive
+    // for large expand sets.
+    if arena.expand_buf.len() > 1 {
         arena.expand_buf.sort_unstable();
         arena.expand_buf.dedup();
     }

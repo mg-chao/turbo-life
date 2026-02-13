@@ -6,7 +6,7 @@
 //! can use unconditional loads — NO_NEIGHBOR maps to the sentinel.
 
 use super::tile::{
-    BorderData, CellBuf, Direction, EMPTY_NEIGHBORS, NO_NEIGHBOR, Neighbors, TILE_SIZE, TileIdx,
+    BorderData, CellBuf, EMPTY_NEIGHBORS, NO_NEIGHBOR, Neighbors, TILE_SIZE, TileIdx,
     TileMeta,
 };
 use super::tilemap::TileMap;
@@ -182,8 +182,11 @@ impl TileArena {
     fn allocate_slot(&mut self, coord: (i64, i64)) -> TileIdx {
         if let Some(recycled) = self.free_list.pop() {
             let i = recycled.index();
-            self.cell_bufs[0][i] = CellBuf::empty();
-            self.cell_bufs[1][i] = CellBuf::empty();
+            // Use ptr::write_bytes for fast zeroing of cell buffers (512 bytes each).
+            unsafe {
+                std::ptr::write_bytes(self.cell_bufs[0].as_mut_ptr().add(i), 0, 1);
+                std::ptr::write_bytes(self.cell_bufs[1].as_mut_ptr().add(i), 0, 1);
+            }
             self.meta[i] = TileMeta::empty();
             self.neighbors[i] = EMPTY_NEIGHBORS;
             self.coords[i] = coord;
@@ -200,23 +203,36 @@ impl TileArena {
             self.coords.push(coord);
             self.borders[0].push(BorderData::default());
             self.borders[1].push(BorderData::default());
-
-            // Keep sentinel's neighbor mapping valid: NO_NEIGHBOR (u32::MAX)
-            // won't index into our vecs, but sentinel is at index 0 and
-            // all neighbor entries for real tiles pointing to NO_NEIGHBOR
-            // will be remapped to SENTINEL_IDX in the ghost gather.
             idx
         }
     }
 
     #[inline]
     fn link_neighbors(&mut self, idx: TileIdx, coord: (i64, i64)) {
-        for dir in Direction::ALL {
-            let (dx, dy) = dir.offset();
-            let neighbor_coord = (coord.0 + dx, coord.1 + dy);
-            if let Some(neighbor_idx) = self.coord_to_idx.get(neighbor_coord.0, neighbor_coord.1) {
-                self.neighbors[idx.index()][dir.index()] = neighbor_idx.0;
-                self.neighbors[neighbor_idx.index()][dir.reverse().index()] = idx.0;
+        let (cx, cy) = coord;
+        let idx_val = idx.0;
+        let i = idx.index();
+        let neighbors_ptr = self.neighbors.as_mut_ptr();
+
+        // Unrolled direction offsets: (dx, dy, dir_index, reverse_dir_index)
+        const DIRS: [(i64, i64, usize, usize); 8] = [
+            (0, 1, 0, 1),   // North -> reverse South
+            (0, -1, 1, 0),  // South -> reverse North
+            (-1, 0, 2, 3),  // West -> reverse East
+            (1, 0, 3, 2),   // East -> reverse West
+            (-1, 1, 4, 7),  // NW -> reverse SE
+            (1, 1, 5, 6),   // NE -> reverse SW
+            (-1, -1, 6, 5), // SW -> reverse NE
+            (1, -1, 7, 4),  // SE -> reverse NW
+        ];
+
+        for &(dx, dy, dir_idx, rev_idx) in &DIRS {
+            if let Some(neighbor_idx) = self.coord_to_idx.get(cx + dx, cy + dy) {
+                // SAFETY: idx and neighbor_idx are valid arena indices.
+                unsafe {
+                    (*neighbors_ptr.add(i))[dir_idx] = neighbor_idx.0;
+                    (*neighbors_ptr.add(neighbor_idx.index()))[rev_idx] = idx_val;
+                }
             }
         }
     }
@@ -247,19 +263,28 @@ impl TileArena {
             return;
         }
 
-        for dir in Direction::ALL {
-            let neighbor_raw = self.neighbors[i][dir.index()];
-            if neighbor_raw != NO_NEIGHBOR {
-                let neighbor_idx = TileIdx(neighbor_raw);
-                self.neighbors[neighbor_idx.index()][dir.reverse().index()] = NO_NEIGHBOR;
+        // Unlink neighbors using raw pointer access.
+        let neighbors_ptr = self.neighbors.as_mut_ptr();
+        unsafe {
+            let nb = &*neighbors_ptr.add(i);
+            for dir_idx in 0..8u8 {
+                let neighbor_raw = nb[dir_idx as usize];
+                if neighbor_raw != NO_NEIGHBOR {
+                    // Reverse direction index lookup table.
+                    const REV: [usize; 8] = [1, 0, 3, 2, 7, 6, 5, 4];
+                    (*neighbors_ptr.add(neighbor_raw as usize))[REV[dir_idx as usize]] = NO_NEIGHBOR;
+                }
             }
+            (*neighbors_ptr.add(i)) = EMPTY_NEIGHBORS;
         }
-        self.neighbors[i] = EMPTY_NEIGHBORS;
 
         let coord = self.coords[i];
         self.coord_to_idx.remove(coord.0, coord.1);
-        self.cell_bufs[0][i] = CellBuf::empty();
-        self.cell_bufs[1][i] = CellBuf::empty();
+        // Use ptr::write_bytes for fast zeroing of cell buffers.
+        unsafe {
+            std::ptr::write_bytes(self.cell_bufs[0].as_mut_ptr().add(i), 0, 1);
+            std::ptr::write_bytes(self.cell_bufs[1].as_mut_ptr().add(i), 0, 1);
+        }
         self.borders[0][i] = BorderData::default();
         self.borders[1][i] = BorderData::default();
         self.meta[i] = TileMeta::released();

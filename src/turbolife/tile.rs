@@ -34,6 +34,7 @@ pub enum Direction {
 }
 
 impl Direction {
+    #[allow(dead_code)]
     pub const ALL: [Direction; 8] = [
         Direction::North,
         Direction::South,
@@ -46,6 +47,7 @@ impl Direction {
     ];
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub const fn offset(self) -> (i64, i64) {
         match self {
             Direction::North => (0, 1),
@@ -60,6 +62,7 @@ impl Direction {
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub const fn reverse(self) -> Direction {
         match self {
             Direction::North => Direction::South,
