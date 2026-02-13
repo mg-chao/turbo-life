@@ -339,6 +339,8 @@ pub struct TurboLife {
     tile_cache: TileCache,
     /// Per-worker scratch buffers used by the static parallel scheduler.
     worker_scratch: Vec<WorkerScratch>,
+    /// Reusable touched-tile list for `set_cells`.
+    set_cells_scratch: Vec<TileIdx>,
 }
 
 impl Default for TurboLife {
@@ -370,6 +372,7 @@ impl TurboLife {
             touched_flags: Vec::new(),
             tile_cache: TileCache::new(),
             worker_scratch: (0..threads).map(|_| WorkerScratch::default()).collect(),
+            set_cells_scratch: Vec::new(),
         }
     }
 
@@ -534,7 +537,8 @@ impl TurboLife {
     where
         I: IntoIterator<Item = (i64, i64, bool)>,
     {
-        let mut touched_tiles = Vec::new();
+        let mut touched_tiles = std::mem::take(&mut self.set_cells_scratch);
+        touched_tiles.clear();
 
         for (x, y, alive) in cells {
             let tile_coord = (x.div_euclid(TILE_SIZE_I64), y.div_euclid(TILE_SIZE_I64));
@@ -586,6 +590,7 @@ impl TurboLife {
         }
 
         if touched_tiles.is_empty() {
+            self.set_cells_scratch = touched_tiles;
             return;
         }
 
@@ -607,6 +612,8 @@ impl TurboLife {
         }
 
         self.population_cache = None;
+        touched_tiles.clear();
+        self.set_cells_scratch = touched_tiles;
     }
 
     /// Batch-set many live cells.
