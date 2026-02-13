@@ -234,18 +234,26 @@ pub unsafe fn advance_core_avx2(
     ghost: &GhostZone,
 ) -> (bool, BorderData, bool) {
     use std::arch::x86_64::{
-        __m256i, _mm256_and_si256, _mm256_andnot_si256, _mm256_extract_epi64, _mm256_loadu_si256,
-        _mm256_or_si256, _mm256_slli_epi64, _mm256_srli_epi64, _mm256_storeu_si256,
-        _mm256_testz_si256, _mm256_xor_si256,
+        __m256i, _mm256_and_si256, _mm256_andnot_si256, _mm256_castsi256_pd, _mm256_extract_epi64,
+        _mm256_loadu_si256, _mm256_movemask_pd, _mm256_or_si256, _mm256_setzero_si256,
+        _mm256_slli_epi64, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_testz_si256,
+        _mm256_xor_si256,
     };
 
-    let mut changed = false;
-    let mut has_live = false;
+    let mut diff_acc = _mm256_setzero_si256();
+    let mut live_acc = _mm256_setzero_si256();
     let mut border_west = 0u64;
     let mut border_east = 0u64;
     let mut border_north = 0u64;
     let mut border_south = 0u64;
     let current_ptr = current.as_ptr();
+
+    let mut west_self_bits = ghost.west;
+    let mut east_self_bits = ghost.east;
+    let mut west_above_bits = (ghost.west >> 1) | ((ghost.nw as u64) << 63);
+    let mut east_above_bits = (ghost.east >> 1) | ((ghost.ne as u64) << 63);
+    let mut west_below_bits = (ghost.west << 1) | (ghost.sw as u64);
+    let mut east_below_bits = (ghost.east << 1) | (ghost.se as u64);
 
     for row_base in (0..TILE_SIZE).step_by(4) {
         let row_self = unsafe { _mm256_loadu_si256(current_ptr.add(row_base) as *const __m256i) };
@@ -260,28 +268,12 @@ pub unsafe fn advance_core_avx2(
             unsafe { _mm256_loadu_si256(current_ptr.add(row_base - 1) as *const __m256i) }
         };
 
-        let ghost_w_self = (ghost.west >> row_base) & 0xF;
-        let ghost_e_self = (ghost.east >> row_base) & 0xF;
-        let ghost_w_above = if row_base < TILE_SIZE - 4 {
-            (ghost.west >> (row_base + 1)) & 0xF
-        } else {
-            ((ghost.west >> 61) & 0x7) | ((ghost.nw as u64) << 3)
-        };
-        let ghost_e_above = if row_base < TILE_SIZE - 4 {
-            (ghost.east >> (row_base + 1)) & 0xF
-        } else {
-            ((ghost.east >> 61) & 0x7) | ((ghost.ne as u64) << 3)
-        };
-        let ghost_w_below = if row_base == 0 {
-            ((ghost.west & 0x7) << 1) | ghost.sw as u64
-        } else {
-            (ghost.west >> (row_base - 1)) & 0xF
-        };
-        let ghost_e_below = if row_base == 0 {
-            ((ghost.east & 0x7) << 1) | ghost.se as u64
-        } else {
-            (ghost.east >> (row_base - 1)) & 0xF
-        };
+        let ghost_w_self = west_self_bits & 0xF;
+        let ghost_e_self = east_self_bits & 0xF;
+        let ghost_w_above = west_above_bits & 0xF;
+        let ghost_e_above = east_above_bits & 0xF;
+        let ghost_w_below = west_below_bits & 0xF;
+        let ghost_e_below = east_below_bits & 0xF;
 
         let nw = _mm256_or_si256(_mm256_slli_epi64(row_above, 1), unsafe {
             avx2_carry_mask_lo(ghost_w_above)
@@ -318,34 +310,33 @@ pub unsafe fn advance_core_avx2(
         let next_rows = _mm256_or_si256(born, survive);
 
         let diff = _mm256_xor_si256(next_rows, row_self);
-        changed |= _mm256_testz_si256(diff, diff) == 0;
-        has_live |= _mm256_testz_si256(next_rows, next_rows) == 0;
+        diff_acc = _mm256_or_si256(diff_acc, diff);
+        live_acc = _mm256_or_si256(live_acc, next_rows);
 
         // Store to output and extract border bits directly from register
         // to avoid store-to-load forwarding stalls.
         unsafe {
             _mm256_storeu_si256(next.as_mut_ptr().add(row_base) as *mut __m256i, next_rows);
         }
-        // Extract lanes directly from the SIMD register.
-        let lane0 = _mm256_extract_epi64(next_rows, 0) as u64;
-        let lane1 = _mm256_extract_epi64(next_rows, 1) as u64;
-        let lane2 = _mm256_extract_epi64(next_rows, 2) as u64;
-        let lane3 = _mm256_extract_epi64(next_rows, 3) as u64;
-        border_west |= (lane0 & 1) << row_base
-            | ((lane1 & 1) << (row_base + 1))
-            | ((lane2 & 1) << (row_base + 2))
-            | ((lane3 & 1) << (row_base + 3));
-        border_east |= (((lane0 >> 63) & 1) << row_base)
-            | (((lane1 >> 63) & 1) << (row_base + 1))
-            | (((lane2 >> 63) & 1) << (row_base + 2))
-            | (((lane3 >> 63) & 1) << (row_base + 3));
+        let east_mask = _mm256_movemask_pd(_mm256_castsi256_pd(next_rows)) as u64;
+        let west_rows = _mm256_slli_epi64(next_rows, 63);
+        let west_mask = _mm256_movemask_pd(_mm256_castsi256_pd(west_rows)) as u64;
+        border_west |= west_mask << row_base;
+        border_east |= east_mask << row_base;
         // Capture south (row 0) and north (row 63) from registers.
         if row_base == 0 {
-            border_south = lane0;
+            border_south = _mm256_extract_epi64(next_rows, 0) as u64;
         }
         if row_base == TILE_SIZE - 4 {
-            border_north = lane3;
+            border_north = _mm256_extract_epi64(next_rows, 3) as u64;
         }
+
+        west_self_bits >>= 4;
+        east_self_bits >>= 4;
+        west_above_bits >>= 4;
+        east_above_bits >>= 4;
+        west_below_bits >>= 4;
+        east_below_bits >>= 4;
     }
 
     let mut corners = 0u8;
@@ -369,6 +360,9 @@ pub unsafe fn advance_core_avx2(
         border_east,
         corners,
     );
+
+    let changed = _mm256_testz_si256(diff_acc, diff_acc) == 0;
+    let has_live = _mm256_testz_si256(live_acc, live_acc) == 0;
 
     (changed, border, has_live)
 }
