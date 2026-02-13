@@ -5,7 +5,6 @@
 //! Slot 0 is reserved as a sentinel (all zeros) so ghost-zone gathers
 //! can use unconditional loads — NO_NEIGHBOR maps to the sentinel.
 
-use super::coord_set::CoordSet;
 use super::tile::{
     BorderData, CellBuf, EMPTY_NEIGHBORS, NO_NEIGHBOR, Neighbors, TILE_SIZE, TileIdx, TileMeta,
 };
@@ -32,8 +31,9 @@ pub struct TileArena {
 
     pub active_epoch: u32,
     pub active_set: Vec<TileIdx>,
-    pub expand_buf: Vec<(i64, i64)>,
-    pub expand_dedup: CoordSet,
+    /// Pending directional frontier-expansion candidates.
+    /// Packed as `((src_idx as u64) << 3) | dir`.
+    pub expand_buf: Vec<u64>,
     pub prune_buf: Vec<TileIdx>,
     pub changed_scratch: Vec<TileIdx>,
 }
@@ -78,7 +78,6 @@ impl TileArena {
             active_epoch: 1,
             active_set: Vec::new(),
             expand_buf: Vec::new(),
-            expand_dedup: CoordSet::new(),
             prune_buf: Vec::new(),
             changed_scratch: Vec::new(),
         }
@@ -213,6 +212,7 @@ impl TileArena {
         let idx_val = idx.0;
         let i = idx.index();
         let neighbors_ptr = self.neighbors.as_mut_ptr();
+        let meta_ptr = self.meta.as_mut_ptr();
 
         // Unrolled direction offsets: (dx, dy, dir_index, reverse_dir_index)
         const DIRS: [(i64, i64, usize, usize); 8] = [
@@ -228,10 +228,13 @@ impl TileArena {
 
         for &(dx, dy, dir_idx, rev_idx) in &DIRS {
             if let Some(neighbor_idx) = self.coord_to_idx.get(cx + dx, cy + dy) {
+                let ni = neighbor_idx.index();
                 // SAFETY: idx and neighbor_idx are valid arena indices.
                 unsafe {
                     (*neighbors_ptr.add(i))[dir_idx] = neighbor_idx.0;
-                    (*neighbors_ptr.add(neighbor_idx.index()))[rev_idx] = idx_val;
+                    (*neighbors_ptr.add(ni))[rev_idx] = idx_val;
+                    (*meta_ptr.add(i)).missing_mask &= !(1u8 << dir_idx);
+                    (*meta_ptr.add(ni)).missing_mask &= !(1u8 << rev_idx);
                 }
             }
         }
@@ -265,6 +268,7 @@ impl TileArena {
 
         // Unlink neighbors using raw pointer access.
         let neighbors_ptr = self.neighbors.as_mut_ptr();
+        let meta_ptr = self.meta.as_mut_ptr();
         unsafe {
             let nb = &*neighbors_ptr.add(i);
             for dir_idx in 0..8u8 {
@@ -272,8 +276,10 @@ impl TileArena {
                 if neighbor_raw != NO_NEIGHBOR {
                     // Reverse direction index lookup table.
                     const REV: [usize; 8] = [1, 0, 3, 2, 7, 6, 5, 4];
-                    (*neighbors_ptr.add(neighbor_raw as usize))[REV[dir_idx as usize]] =
-                        NO_NEIGHBOR;
+                    let rev = REV[dir_idx as usize];
+                    let ni = neighbor_raw as usize;
+                    (*neighbors_ptr.add(ni))[rev] = NO_NEIGHBOR;
+                    (*meta_ptr.add(ni)).missing_mask |= 1u8 << rev;
                 }
             }
             (*neighbors_ptr.add(i)) = EMPTY_NEIGHBORS;

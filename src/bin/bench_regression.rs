@@ -54,25 +54,78 @@ fn run_scenario(s: &Scenario, threads: Option<usize>) -> (f64, u64) {
 
 fn main() {
     let scenarios = [
-        Scenario { name: "small-sparse",  size: 512,   density: 0.10, warmup: 3, iters: 200, seed: 0xA1 },
-        Scenario { name: "small-dense",   size: 512,   density: 0.42, warmup: 3, iters: 200, seed: 0xB2 },
-        Scenario { name: "medium-sparse", size: 2048,  density: 0.10, warmup: 3, iters: 50,  seed: 0xC3 },
-        Scenario { name: "medium-dense",  size: 2048,  density: 0.42, warmup: 3, iters: 50,  seed: 0xD4 },
-        Scenario { name: "large-sparse",  size: 4096,  density: 0.10, warmup: 3, iters: 30,  seed: 0xE5 },
-        Scenario { name: "large-dense",   size: 4096,  density: 0.42, warmup: 3, iters: 30,  seed: 0xF6 },
-        Scenario { name: "xlarge-dense",  size: 8192,  density: 0.42, warmup: 2, iters: 10,  seed: 0x17 },
+        Scenario {
+            name: "small-sparse",
+            size: 512,
+            density: 0.10,
+            warmup: 3,
+            iters: 200,
+            seed: 0xA1,
+        },
+        Scenario {
+            name: "small-dense",
+            size: 512,
+            density: 0.42,
+            warmup: 3,
+            iters: 200,
+            seed: 0xB2,
+        },
+        Scenario {
+            name: "medium-sparse",
+            size: 2048,
+            density: 0.10,
+            warmup: 3,
+            iters: 50,
+            seed: 0xC3,
+        },
+        Scenario {
+            name: "medium-dense",
+            size: 2048,
+            density: 0.42,
+            warmup: 3,
+            iters: 50,
+            seed: 0xD4,
+        },
+        Scenario {
+            name: "large-sparse",
+            size: 4096,
+            density: 0.10,
+            warmup: 3,
+            iters: 30,
+            seed: 0xE5,
+        },
+        Scenario {
+            name: "large-dense",
+            size: 4096,
+            density: 0.42,
+            warmup: 3,
+            iters: 30,
+            seed: 0xF6,
+        },
+        Scenario {
+            name: "xlarge-dense",
+            size: 8192,
+            density: 0.42,
+            warmup: 2,
+            iters: 10,
+            seed: 0x17,
+        },
     ];
 
-    println!("{:<20} {:>10} {:>10} {:>12} {:>12} {:>10}",
-        "Scenario", "Threads", "Iters", "Total(ms)", "Avg(ms)", "Pop");
+    println!(
+        "{:<20} {:>10} {:>10} {:>12} {:>12} {:>10}",
+        "Scenario", "Threads", "Iters", "Total(ms)", "Avg(ms)", "Pop"
+    );
     println!("{}", "-".repeat(78));
 
     // Run with auto thread count
     for s in &scenarios {
         let (total_ms, pop) = run_scenario(s, None);
         let avg_ms = total_ms / s.iters as f64;
-        println!("{:<20} {:>10} {:>10} {:>12.3} {:>12.6} {:>10}",
-            s.name, "auto", s.iters, total_ms, avg_ms, pop);
+        println!(
+            "{:<20} {:>10} {:>10} {:>12.3} {:>12.6} {:>10}",
+            s.name, "auto", s.iters, total_ms, avg_ms, pop
+        );
     }
 
     println!();
@@ -81,7 +134,9 @@ fn main() {
     for s in &scenarios {
         let (total_ms, pop) = run_scenario(s, Some(1));
         let avg_ms = total_ms / s.iters as f64;
-        println!("{:<20} {:>10} {:>10} {:>12.3} {:>12.6} {:>10}",
-            s.name, "1", s.iters, total_ms, avg_ms, pop);
+        println!(
+            "{:<20} {:>10} {:>10} {:>12.3} {:>12.6} {:>10}",
+            s.name, "1", s.iters, total_ms, avg_ms, pop
+        );
     }
 }

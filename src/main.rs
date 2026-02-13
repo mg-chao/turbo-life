@@ -12,12 +12,16 @@ fn parse_args() -> TurboLifeConfig {
         match args[i].as_str() {
             "--threads" => {
                 i += 1;
-                let n: usize = args[i].parse().expect("--threads requires a positive integer");
+                let n: usize = args[i]
+                    .parse()
+                    .expect("--threads requires a positive integer");
                 config = config.thread_count(n);
             }
             "--max-threads" => {
                 i += 1;
-                let n: usize = args[i].parse().expect("--max-threads requires a positive integer");
+                let n: usize = args[i]
+                    .parse()
+                    .expect("--max-threads requires a positive integer");
                 config = config.max_threads(n);
             }
             "--kernel" => {
@@ -29,7 +33,9 @@ fn parse_args() -> TurboLifeConfig {
                 };
                 config = config.kernel(backend);
             }
-            other => panic!("unknown argument: {other}\nusage: turbo-life [--threads N] [--max-threads N] [--kernel scalar|avx2]"),
+            other => panic!(
+                "unknown argument: {other}\nusage: turbo-life [--threads N] [--max-threads N] [--kernel scalar|avx2]"
+            ),
         }
         i += 1;
     }
@@ -83,7 +89,11 @@ fn main() {
 
         let quick_population = quick.population();
         let turbo_population = turbo.population();
-        let match_status = if quick_population == turbo_population { "MATCH" } else { "MISMATCH" };
+        let match_status = if quick_population == turbo_population {
+            "MATCH"
+        } else {
+            "MISMATCH"
+        };
         println!(
             "Iteration {iteration}: QuickLife pop = {quick_population}, TurboLife pop = {turbo_population} [{match_status}]"
         );

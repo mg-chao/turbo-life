@@ -309,7 +309,9 @@ impl TileMap {
             let candidate = unsafe { *slots_ptr.add(next) };
 
             if candidate.is_empty() {
-                unsafe { *slots_ptr.add(gap) = Slot::EMPTY; }
+                unsafe {
+                    *slots_ptr.add(gap) = Slot::EMPTY;
+                }
                 return;
             }
 
@@ -317,12 +319,16 @@ impl TileMap {
             let home = candidate.hash as usize & mask;
             if home == next {
                 // Candidate is at its home position — doesn't need to shift.
-                unsafe { *slots_ptr.add(gap) = Slot::EMPTY; }
+                unsafe {
+                    *slots_ptr.add(gap) = Slot::EMPTY;
+                }
                 return;
             }
 
             // Shift it back.
-            unsafe { *slots_ptr.add(gap) = candidate; }
+            unsafe {
+                *slots_ptr.add(gap) = candidate;
+            }
             gap = next;
         }
     }

@@ -2,7 +2,6 @@
 
 mod activity;
 mod arena;
-mod coord_set;
 mod engine;
 mod kernel;
 mod sync;

@@ -8,9 +8,9 @@ use std::time::Instant;
 // Instead, we'll duplicate the minimal interface here via the public engine API
 // and measure end-to-end tilemap-heavy workloads.
 
-use turbo_life::turbolife::TurboLife;
 use rand::RngCore;
 use rand::SeedableRng;
+use turbo_life::turbolife::TurboLife;
 
 const WARMUP_STEPS: u64 = 3;
 const BENCH_STEPS: u64 = 30;
@@ -47,10 +47,7 @@ fn bench_step_performance(label: &str, size: i64, density: f64, seed: u64) {
         }
 
         if run == RUNS - 1 {
-            println!(
-                "{:<36} best={:.4} ms/step  pop={}",
-                label, best_avg, pop
-            );
+            println!("{:<36} best={:.4} ms/step  pop={}", label, best_avg, pop);
         }
     }
 }

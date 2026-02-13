@@ -10,7 +10,6 @@ const PARALLEL_PRUNE_TILES_PER_THREAD: usize = 24;
 const PARALLEL_PRUNE_MIN_CHUNKS: usize = 2;
 const PRUNE_CHUNK_MIN: usize = 64;
 const PRUNE_CHUNK_MAX: usize = 512;
-const HASH_DEDUP_THRESHOLD: usize = 1_000_000;
 const EXPAND_OFFSETS: [(i64, i64); 8] = [
     (0, 1),   // N
     (0, -1),  // S
@@ -21,6 +20,19 @@ const EXPAND_OFFSETS: [(i64, i64); 8] = [
     (-1, -1), // SW
     (1, -1),  // SE
 ];
+
+#[inline(always)]
+fn pack_expand_candidate(idx: TileIdx, dir: usize) -> u64 {
+    ((idx.0 as u64) << 3) | dir as u64
+}
+
+#[inline(always)]
+fn unpack_expand_candidate(candidate: u64) -> (TileIdx, usize) {
+    (
+        TileIdx((candidate >> 3) as u32),
+        (candidate & 0b111) as usize,
+    )
+}
 
 #[inline]
 fn prune_chunk_size(active_len: usize, threads: usize) -> usize {
@@ -87,9 +99,6 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     arena.changed_scratch.clear();
     // Swap instead of copy to avoid O(n) memcpy.
     std::mem::swap(&mut arena.changed_scratch, &mut arena.changed_list);
-    for &idx in &arena.changed_scratch {
-        arena.meta[idx.index()].set_in_changed_list(false);
-    }
 
     let changed_count = arena.changed_scratch.len();
     if changed_count == 0 {
@@ -99,6 +108,9 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     let dense_rebuild = arena.occupied_count >= 4096
         && changed_count.saturating_mul(100) >= arena.occupied_count.saturating_mul(95);
     if dense_rebuild {
+        for &idx in &arena.changed_scratch {
+            arena.meta[idx.index()].set_in_changed_list(false);
+        }
         arena.active_set.reserve(arena.occupied_count);
         for i in 1..arena.meta.len() {
             if arena.meta[i].occupied() {
@@ -126,6 +138,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         // SAFETY: i < meta_len guaranteed by arena invariants (idx came from changed_list).
         unsafe {
             let m = &mut *meta_ptr.add(i);
+            m.set_in_changed_list(false);
             if m.occupied() && m.active_epoch != epoch {
                 m.active_epoch = epoch;
                 arena.active_set.push(idx);
@@ -177,8 +190,7 @@ unsafe fn scan_tile_prune_expand_raw(
     meta_ptr: *const TileMeta,
     borders_ptr: *const BorderData,
     neighbors_ptr: *const [u32; 8],
-    coords_ptr: *const (i64, i64),
-    expand: &mut Vec<(i64, i64)>,
+    expand: &mut Vec<u64>,
 ) -> bool {
     unsafe {
         let i_idx = idx.index();
@@ -191,17 +203,9 @@ unsafe fn scan_tile_prune_expand_raw(
         let border = &*borders_ptr.add(i_idx);
 
         // Fast path: when no neighbors are missing, there is no frontier expansion.
-        let missing: u8 = ((nb[0] == NO_NEIGHBOR) as u8)
-            | (((nb[1] == NO_NEIGHBOR) as u8) << 1)
-            | (((nb[2] == NO_NEIGHBOR) as u8) << 2)
-            | (((nb[3] == NO_NEIGHBOR) as u8) << 3)
-            | (((nb[4] == NO_NEIGHBOR) as u8) << 4)
-            | (((nb[5] == NO_NEIGHBOR) as u8) << 5)
-            | (((nb[6] == NO_NEIGHBOR) as u8) << 6)
-            | (((nb[7] == NO_NEIGHBOR) as u8) << 7);
+        let missing = meta.missing_mask;
 
         if missing != 0 {
-            let (tx, ty) = *coords_ptr.add(i_idx);
             let live_border: u8 = ((border.north != 0) as u8)
                 | (((border.south != 0) as u8) << 1)
                 | (((border.west != 0) as u8) << 2)
@@ -214,8 +218,7 @@ unsafe fn scan_tile_prune_expand_raw(
             let mut bits = missing & live_border;
             while bits != 0 {
                 let bit = bits.trailing_zeros() as usize;
-                let (dx, dy) = EXPAND_OFFSETS[bit];
-                expand.push((tx + dx, ty + dy));
+                expand.push(pack_expand_candidate(idx, bit));
                 bits &= bits - 1;
             }
         }
@@ -253,7 +256,6 @@ pub fn prune_and_expand(arena: &mut TileArena) {
     let meta_ptr = arena.meta.as_ptr();
     let borders_ptr = arena.borders[bp].as_ptr();
     let neighbors_ptr = arena.neighbors.as_ptr();
-    let coords_ptr = arena.coords.as_ptr();
 
     if !run_parallel {
         for i in 0..active_len {
@@ -264,7 +266,6 @@ pub fn prune_and_expand(arena: &mut TileArena) {
                     meta_ptr,
                     borders_ptr,
                     neighbors_ptr,
-                    coords_ptr,
                     &mut arena.expand_buf,
                 )
             };
@@ -279,7 +280,6 @@ pub fn prune_and_expand(arena: &mut TileArena) {
         let s_meta = meta_ptr as usize;
         let s_borders = borders_ptr as usize;
         let s_neighbors = neighbors_ptr as usize;
-        let s_coords = coords_ptr as usize;
 
         let chunk_size = prune_chunk_size(active_len, effective_threads);
         let (expand_all, prune_all) = arena
@@ -291,10 +291,9 @@ pub fn prune_and_expand(arena: &mut TileArena) {
                     let mp = s_meta as *const TileMeta;
                     let bp = s_borders as *const BorderData;
                     let np = s_neighbors as *const [u32; 8];
-                    let cp = s_coords as *const (i64, i64);
                     for &idx in chunk {
                         let should_prune =
-                            unsafe { scan_tile_prune_expand_raw(idx, mp, bp, np, cp, &mut acc.0) };
+                            unsafe { scan_tile_prune_expand_raw(idx, mp, bp, np, &mut acc.0) };
                         if should_prune {
                             acc.1.push(idx);
                         }
@@ -313,35 +312,21 @@ pub fn prune_and_expand(arena: &mut TileArena) {
         arena.expand_buf.extend(expand_all);
         arena.prune_buf.extend(prune_all);
     }
-    if arena.expand_buf.len() > 1 {
-        if arena.expand_buf.len() >= HASH_DEDUP_THRESHOLD {
-            arena.expand_dedup.begin_step();
-            arena.expand_dedup.reserve_for(arena.expand_buf.len());
-
-            let mut write = 0usize;
-            for i in 0..arena.expand_buf.len() {
-                let coord = arena.expand_buf[i];
-                if arena.expand_dedup.insert(coord.0, coord.1) {
-                    if write != i {
-                        arena.expand_buf[write] = coord;
-                    }
-                    write += 1;
-                }
-            }
-            arena.expand_buf.truncate(write);
-        } else {
-            arena.expand_buf.sort_unstable();
-            arena.expand_buf.dedup();
-        }
-    }
     if !arena.expand_buf.is_empty() {
         arena.reserve_additional_tiles(arena.expand_buf.len());
     }
     for i in 0..arena.expand_buf.len() {
-        let coord = arena.expand_buf[i];
-        if arena.idx_at(coord).is_some() {
+        let (src_idx, dir) = unpack_expand_candidate(arena.expand_buf[i]);
+        let src_i = src_idx.index();
+        if !arena.meta[src_i].occupied() {
             continue;
         }
+        if arena.neighbors[src_i][dir] != NO_NEIGHBOR {
+            continue;
+        }
+        let (tx, ty) = arena.coords[src_i];
+        let (dx, dy) = EXPAND_OFFSETS[dir];
+        let coord = (tx + dx, ty + dy);
         let idx = arena.allocate_absent(coord);
         arena.meta[idx.index()].set_changed(true);
         arena.meta[idx.index()].active_epoch = 0;

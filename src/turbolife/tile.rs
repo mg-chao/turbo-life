@@ -160,6 +160,7 @@ const FLAG_CHANGED: u8 = 1 << 0;
 const FLAG_OCCUPIED: u8 = 1 << 1;
 const FLAG_IN_CHANGED_LIST: u8 = 1 << 2;
 const FLAG_HAS_LIVE: u8 = 1 << 3;
+pub const MISSING_ALL_NEIGHBORS: u8 = 0xFF;
 
 /// Per-tile metadata with flags packed into a single byte.
 #[derive(Clone, Copy, Debug)]
@@ -167,6 +168,9 @@ const FLAG_HAS_LIVE: u8 = 1 << 3;
 pub struct TileMeta {
     pub population: u32,
     pub active_epoch: u32,
+    /// Bit i = 1 means neighbor direction i is currently missing.
+    /// Direction layout matches `Neighbors` / `Direction` indices.
+    pub missing_mask: u8,
     pub flags: u8,
 }
 
@@ -226,6 +230,7 @@ impl TileMeta {
         Self {
             population: 0,
             active_epoch: 0,
+            missing_mask: MISSING_ALL_NEIGHBORS,
             flags: FLAG_CHANGED | FLAG_OCCUPIED,
         }
     }
@@ -234,6 +239,7 @@ impl TileMeta {
         Self {
             population: 0,
             active_epoch: 0,
+            missing_mask: MISSING_ALL_NEIGHBORS,
             flags: 0,
         }
     }
