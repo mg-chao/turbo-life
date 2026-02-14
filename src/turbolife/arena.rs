@@ -305,10 +305,32 @@ impl TileArena {
     }
 
     #[inline(always)]
+    pub(crate) fn begin_active_rebuild_with_capacity(&mut self, required_slots: usize) {
+        self.begin_active_rebuild();
+        if self.active_tags.len() < required_slots {
+            self.active_tags.resize(required_slots, 0);
+        }
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
     pub(crate) fn active_test_and_set(&mut self, idx: usize) -> bool {
         self.ensure_active_tag_capacity(idx);
         let epoch = self.active_epoch;
         let tag = &mut self.active_tags[idx];
+        if *tag == epoch {
+            true
+        } else {
+            *tag = epoch;
+            false
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn active_test_and_set_unchecked(&mut self, idx: usize) -> bool {
+        debug_assert!(idx < self.active_tags.len());
+        let epoch = self.active_epoch;
+        let tag = unsafe { self.active_tags.get_unchecked_mut(idx) };
         if *tag == epoch {
             true
         } else {

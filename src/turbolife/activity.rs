@@ -198,8 +198,8 @@ fn pack_expand_candidate(idx: TileIdx, dir: usize) -> u32 {
 }
 
 #[inline(always)]
-fn unpack_expand_candidate(candidate: u32) -> (TileIdx, usize) {
-    (TileIdx(candidate >> 3), (candidate & 0b111) as usize)
+fn prune_candidate_invalid(meta: super::tile::TileMeta) -> bool {
+    !meta.occupied() || meta.has_live()
 }
 
 #[inline(always)]
@@ -241,7 +241,8 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
             arena.clear_changed_mark(idx.index());
         }
     }
-    arena.begin_active_rebuild();
+    let meta_len = arena.meta.len();
+    arena.begin_active_rebuild_with_capacity(meta_len);
 
     let dense_rebuild = arena.occupied_count >= 4096
         && changed_count.saturating_mul(100) >= arena.occupied_count.saturating_mul(95);
@@ -274,17 +275,16 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     arena
         .active_set
         .reserve(changed_count.saturating_mul(9).min(arena.occupied_count));
-    let meta_ptr = arena.meta.as_ptr();
     let neighbors_ptr = arena.neighbors.as_ptr();
-    let meta_len = arena.meta.len();
+    let meta_ptr = arena.meta.as_ptr();
 
     let changed_ptr = arena.changed_scratch.as_ptr();
     for changed_i in 0..changed_count {
         let idx = unsafe { *changed_ptr.add(changed_i) };
         let i = idx.index();
         debug_assert!(i < meta_len);
-        let occupied = unsafe { (*meta_ptr.add(i)).occupied() };
-        if occupied && !arena.active_test_and_set(i) {
+        debug_assert!(unsafe { (*meta_ptr.add(i)).occupied() });
+        if unsafe { !arena.active_test_and_set_unchecked(i) } {
             arena.active_set.push(idx);
         }
         // SAFETY: i < meta_len guaranteed by arena invariants (idx came from changed_list).
@@ -296,8 +296,8 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                 }
                 let ni_i = ni_raw as usize;
                 debug_assert!(ni_i < meta_len);
-                let neighbor_occupied = (*meta_ptr.add(ni_i)).occupied();
-                if neighbor_occupied && !arena.active_test_and_set(ni_i) {
+                debug_assert!((*meta_ptr.add(ni_i)).occupied());
+                if !arena.active_test_and_set_unchecked(ni_i) {
                     arena.active_set.push(TileIdx(ni_raw));
                 }
             }
@@ -327,25 +327,20 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
 pub fn finalize_prune_and_expand(arena: &mut TileArena) {
     if !arena.expand_buf.is_empty() {
         arena.reserve_additional_tiles(arena.expand_buf.len());
-    }
-
-    for i in 0..arena.expand_buf.len() {
-        let (src_idx, dir) = unpack_expand_candidate(arena.expand_buf[i]);
-        let src_i = src_idx.index();
-        let src_meta = arena.meta[src_i];
-        debug_assert!(src_meta.occupied());
-        if !src_meta.occupied() {
-            continue;
+        for i in 0..arena.expand_buf.len() {
+            let candidate = arena.expand_buf[i];
+            let src_i = (candidate >> 3) as usize;
+            let dir = (candidate & 0b111) as usize;
+            debug_assert!(arena.meta[src_i].occupied());
+            if arena.neighbors[src_i][dir] != NO_NEIGHBOR {
+                continue;
+            }
+            let (tx, ty) = arena.coords[src_i];
+            let (dx, dy) = EXPAND_OFFSETS[dir];
+            let idx = arena.allocate_absent((tx + dx, ty + dy));
+            arena.meta[idx.index()].population = 0;
+            arena.mark_changed_new_unique(idx);
         }
-        if arena.neighbors[src_i][dir] != NO_NEIGHBOR {
-            continue;
-        }
-        let (tx, ty) = arena.coords[src_i];
-        let (dx, dy) = EXPAND_OFFSETS[dir];
-        let idx = arena.allocate_absent((tx + dx, ty + dy));
-        let meta = &mut arena.meta[idx.index()];
-        meta.population = 0;
-        arena.mark_changed_new_unique(idx);
     }
 
     let prune_len = arena.prune_buf.len();
@@ -355,17 +350,21 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
         return;
     }
 
+    let border_phase = arena.border_phase;
     let thread_count = rayon::current_num_threads().max(1);
     let run_parallel = thread_count > 1 && prune_len >= PARALLEL_PRUNE_CANDIDATES_MIN;
-    let live_masks = &arena.border_live_masks[arena.border_phase];
-    debug_assert_eq!(live_masks.len(), arena.borders[arena.border_phase].len());
-    arena.prune_marks.resize(prune_len, 0);
+    let live_masks_ptr = arena.border_live_masks[border_phase].as_ptr();
+    debug_assert_eq!(
+        arena.border_live_masks[border_phase].len(),
+        arena.borders[border_phase].len()
+    );
 
     if run_parallel {
+        arena.prune_marks.resize(prune_len, 0);
         let chunk_size = prune_filter_chunk_size(prune_len, thread_count);
         let meta_ptr = SendConstPtr::new(arena.meta.as_ptr());
         let neighbors_ptr = SendConstPtr::new(arena.neighbors.as_ptr());
-        let live_masks_ptr = SendConstPtr::new(live_masks.as_ptr());
+        let live_masks_ptr = SendConstPtr::new(live_masks_ptr);
         let prune_candidates = &arena.prune_buf;
         let prune_marks = &mut arena.prune_marks;
         prune_candidates
@@ -380,16 +379,12 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                     // SAFETY: pointers are valid for the entire prune phase.
                     let should_prune = unsafe {
                         let meta = *mp.add(ii);
-                        if !meta.occupied() || meta.has_live() {
+                        if prune_candidate_invalid(meta) {
                             false
                         } else {
                             let missing_mask = meta.missing_mask;
-                            if missing_mask == MISSING_ALL_NEIGHBORS {
-                                true
-                            } else {
-                                let nb = *np.add(ii);
-                                ghost_is_empty_from_live_masks_ptr(lp, &nb)
-                            }
+                            missing_mask == MISSING_ALL_NEIGHBORS
+                                || ghost_is_empty_from_live_masks_ptr(lp, &*np.add(ii))
                         }
                     };
                     *mark = should_prune as u8;
@@ -400,21 +395,20 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
             let idx = arena.prune_buf[i];
             let ii = idx.index();
             let meta = arena.meta[ii];
-            let should_prune = if !meta.occupied() || meta.has_live() {
-                0
-            } else {
-                let missing_mask = meta.missing_mask;
-                if missing_mask == MISSING_ALL_NEIGHBORS {
-                    1
-                } else {
-                    let nb = arena.neighbors[ii];
-                    let ghost_empty =
-                        unsafe { ghost_is_empty_from_live_masks_ptr(live_masks.as_ptr(), &nb) };
-                    ghost_empty as u8
-                }
-            };
-            arena.prune_marks[i] = should_prune;
+            if prune_candidate_invalid(meta) {
+                continue;
+            }
+            let should_prune = meta.missing_mask == MISSING_ALL_NEIGHBORS
+                || unsafe {
+                    ghost_is_empty_from_live_masks_ptr(live_masks_ptr, &arena.neighbors[ii])
+                };
+            if should_prune {
+                arena.release(idx);
+            }
         }
+        arena.expand_buf.clear();
+        arena.prune_buf.clear();
+        return;
     }
 
     for i in 0..prune_len {
