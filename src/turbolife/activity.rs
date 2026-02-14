@@ -3,6 +3,7 @@
 use rayon::prelude::*;
 
 use super::arena::TileArena;
+use super::kernel::ghost_is_empty_from_live_masks;
 use super::tile::{NO_NEIGHBOR, TileIdx};
 
 const EXPAND_OFFSETS: [(i64, i64); 8] = [
@@ -261,7 +262,9 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
     for i in 0..arena.expand_buf.len() {
         let (src_idx, dir) = unpack_expand_candidate(arena.expand_buf[i]);
         let src_i = src_idx.index();
-        if !arena.meta[src_i].occupied() {
+        let src_meta = arena.meta[src_i];
+        debug_assert!(src_meta.occupied());
+        if !src_meta.occupied() {
             continue;
         }
         if arena.neighbors[src_i][dir] != NO_NEIGHBOR {
@@ -286,18 +289,20 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
 
     let thread_count = rayon::current_num_threads().max(1);
     let run_parallel = thread_count > 1 && prune_len >= PARALLEL_PRUNE_CANDIDATES_MIN;
+    let borders = &arena.borders[arena.border_phase];
 
-    if run_parallel {
+    let mut to_prune = if run_parallel {
         let chunk_size = prune_filter_chunk_size(prune_len, thread_count);
         let meta_ptr = SendConstPtr::new(arena.meta.as_ptr());
         let neighbors_ptr = SendConstPtr::new(arena.neighbors.as_ptr());
+        let borders_ptr = SendConstPtr::new(borders.as_ptr());
         let prune_candidates = &arena.prune_buf;
-
-        let mut to_prune = prune_candidates
+        prune_candidates
             .par_chunks(chunk_size)
             .fold(Vec::new, move |mut acc, chunk| {
                 let mp = meta_ptr.get();
                 let np = neighbors_ptr.get();
+                let bp = borders_ptr.get();
                 for &idx in chunk {
                     let ii = idx.index();
                     // SAFETY: pointers are stable and only read during this phase.
@@ -308,14 +313,17 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                         }
 
                         let nb = *np.add(ii);
-                        let mut neighbor_changed = false;
-                        for &ni_raw in nb.iter() {
-                            if ni_raw != NO_NEIGHBOR && (*mp.add(ni_raw as usize)).changed() {
-                                neighbor_changed = true;
-                                break;
-                            }
-                        }
-                        if !neighbor_changed {
+                        let ghost_empty = ghost_is_empty_from_live_masks([
+                            (*bp.add(nb[0] as usize)).live_mask,
+                            (*bp.add(nb[1] as usize)).live_mask,
+                            (*bp.add(nb[2] as usize)).live_mask,
+                            (*bp.add(nb[3] as usize)).live_mask,
+                            (*bp.add(nb[4] as usize)).live_mask,
+                            (*bp.add(nb[5] as usize)).live_mask,
+                            (*bp.add(nb[6] as usize)).live_mask,
+                            (*bp.add(nb[7] as usize)).live_mask,
+                        ]);
+                        if ghost_empty {
                             acc.push(idx);
                         }
                     }
@@ -325,12 +333,9 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
             .reduce(Vec::new, |mut left, mut right| {
                 left.append(&mut right);
                 left
-            });
-
-        for idx in to_prune.drain(..) {
-            arena.release(idx);
-        }
+            })
     } else {
+        let mut serial = Vec::with_capacity(prune_len);
         for i in 0..prune_len {
             let idx = arena.prune_buf[i];
             let ii = idx.index();
@@ -339,18 +344,26 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                 continue;
             }
 
-            let mut neighbor_changed = false;
             let nb = arena.neighbors[ii];
-            for &ni_raw in nb.iter() {
-                if ni_raw != NO_NEIGHBOR && arena.meta[ni_raw as usize].changed() {
-                    neighbor_changed = true;
-                    break;
-                }
-            }
-            if !neighbor_changed {
-                arena.release(idx);
+            let ghost_empty = ghost_is_empty_from_live_masks([
+                borders[nb[0] as usize].live_mask,
+                borders[nb[1] as usize].live_mask,
+                borders[nb[2] as usize].live_mask,
+                borders[nb[3] as usize].live_mask,
+                borders[nb[4] as usize].live_mask,
+                borders[nb[5] as usize].live_mask,
+                borders[nb[6] as usize].live_mask,
+                borders[nb[7] as usize].live_mask,
+            ]);
+            if ghost_empty {
+                serial.push(idx);
             }
         }
+        serial
+    };
+
+    for idx in to_prune.drain(..) {
+        arena.release(idx);
     }
 
     arena.expand_buf.clear();
