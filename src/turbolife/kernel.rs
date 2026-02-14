@@ -4,7 +4,7 @@
 //! Border extraction is fused into the main loop.
 //! Works with split cell buffers (separate current/next vecs).
 
-use super::tile::{BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, TILE_SIZE, TileMeta};
+use super::tile::{BorderData, CellBuf, GhostZone, TileMeta, MISSING_ALL_NEIGHBORS, TILE_SIZE};
 const _: [(); 1] = [(); (TILE_SIZE == 64) as usize];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +123,15 @@ pub(crate) fn tile_is_empty(current: &[u64; TILE_SIZE]) -> bool {
     true
 }
 
+#[inline(always)]
+pub(crate) fn clear_tile_if_needed(next: &mut [u64; TILE_SIZE]) {
+    if !tile_is_empty(next) {
+        unsafe {
+            std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RowGhostBits {
     west_above: u64,
@@ -225,6 +234,83 @@ pub fn advance_core_scalar(
     let border = BorderData::from_edges(north_row, south_row, border_west, border_east);
 
     (changed, border, has_live)
+}
+
+#[inline(always)]
+fn birth_from_count5(a: u64, b: u64, c: u64, d: u64, e: u64) -> u64 {
+    ((a + b + c + d + e) == 3) as u64
+}
+
+/// Specialized core for tiles whose current buffer is entirely dead.
+///
+/// Only boundary cells can be born from halo activity, so this bypasses
+/// the full 64-row adder pipeline and writes a sparse edge-only result.
+#[inline(always)]
+pub(crate) fn advance_core_empty(
+    next: &mut [u64; TILE_SIZE],
+    ghost: &GhostZone,
+) -> (bool, BorderData, bool) {
+    let south_trip = (ghost.south << 1) & ghost.south & (ghost.south >> 1);
+    let north_trip = (ghost.north << 1) & ghost.north & (ghost.north >> 1);
+    let west_trip = (ghost.west << 1) & ghost.west & (ghost.west >> 1);
+    let east_trip = (ghost.east << 1) & ghost.east & (ghost.east >> 1);
+
+    let sw_birth = birth_from_count5(
+        ghost.south & 1,
+        (ghost.south >> 1) & 1,
+        ghost.west & 1,
+        (ghost.west >> 1) & 1,
+        ghost.sw as u64,
+    );
+    let se_birth = birth_from_count5(
+        (ghost.south >> 63) & 1,
+        (ghost.south >> 62) & 1,
+        ghost.east & 1,
+        (ghost.east >> 1) & 1,
+        ghost.se as u64,
+    );
+    let nw_birth = birth_from_count5(
+        ghost.north & 1,
+        (ghost.north >> 1) & 1,
+        (ghost.west >> 63) & 1,
+        (ghost.west >> 62) & 1,
+        ghost.nw as u64,
+    );
+    let ne_birth = birth_from_count5(
+        (ghost.north >> 63) & 1,
+        (ghost.north >> 62) & 1,
+        (ghost.east >> 63) & 1,
+        (ghost.east >> 62) & 1,
+        ghost.ne as u64,
+    );
+
+    let south_row = south_trip | sw_birth | (se_birth << 63);
+    let north_row = north_trip | nw_birth | (ne_birth << 63);
+    let border_west = west_trip | sw_birth | (nw_birth << 63);
+    let border_east = east_trip | se_birth | (ne_birth << 63);
+
+    clear_tile_if_needed(next);
+    next[0] = south_row;
+    next[TILE_SIZE - 1] = north_row;
+
+    let mut west_bits = west_trip;
+    while west_bits != 0 {
+        let row = west_bits.trailing_zeros() as usize;
+        next[row] |= 1;
+        west_bits &= west_bits - 1;
+    }
+
+    let mut east_bits = east_trip;
+    while east_bits != 0 {
+        let row = east_bits.trailing_zeros() as usize;
+        next[row] |= 1u64 << 63;
+        east_bits &= east_bits - 1;
+    }
+
+    let has_live = (south_row | north_row | border_west | border_east) != 0;
+    let border = BorderData::from_edges(north_row, south_row, border_west, border_east);
+
+    (has_live, border, has_live)
 }
 
 // ── AVX2 kernel ─────────────────────────────────────────────────────────
@@ -517,12 +603,13 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
     let next = unsafe { &mut (*next_ptr.add(idx)).0 };
     let meta = unsafe { &mut *meta_ptr.add(idx) };
     let missing_mask = meta.missing_mask;
+    let tile_has_live = meta.has_live();
 
-    if !meta.has_live() {
+    if !tile_has_live {
         if missing_mask == MISSING_ALL_NEIGHBORS {
             debug_assert!(tile_is_empty(current));
             unsafe {
-                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                clear_tile_if_needed(next);
                 *next_borders_ptr.add(idx) = BorderData::default();
                 *next_live_masks_ptr.add(idx) = 0;
             }
@@ -537,7 +624,7 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
         if ghost_empty {
             debug_assert!(tile_is_empty(current));
             unsafe {
-                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                clear_tile_if_needed(next);
                 *next_borders_ptr.add(idx) = BorderData::default();
                 *next_live_masks_ptr.add(idx) = 0;
             }
@@ -567,8 +654,12 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
         se: se_b.nw(),
     };
 
-    let (changed, border, has_live) =
-        unsafe { advance_core_const::<USE_AVX2>(current, next, &ghost) };
+    let (changed, border, has_live) = if tile_has_live {
+        unsafe { advance_core_const::<USE_AVX2>(current, next, &ghost) }
+    } else {
+        debug_assert!(tile_is_empty(current));
+        advance_core_empty(next, &ghost)
+    };
     let live_mask = border.live_mask();
 
     unsafe {
@@ -678,8 +769,9 @@ pub unsafe fn advance_tile_split(
 #[cfg(test)]
 mod tests {
     use super::{
-        BorderData, GhostZone, TILE_SIZE, advance_core_scalar, ghost_bit, ghost_is_empty,
+        advance_core_empty, advance_core_scalar, ghost_bit, ghost_is_empty,
         ghost_is_empty_from_live_masks, ghost_is_empty_from_live_masks_ptr, tile_is_empty,
+        BorderData, GhostZone, TILE_SIZE,
     };
 
     #[cfg(target_arch = "x86_64")]
@@ -731,6 +823,50 @@ mod tests {
         assert_eq!(border.west, 0);
         assert_eq!(border.east, 0);
         assert_eq!(border.live_mask(), 0);
+    }
+
+    #[test]
+    fn empty_core_matches_scalar_for_random_ghosts() {
+        let current = [0u64; TILE_SIZE];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xFACE_B00C_5566_7788);
+
+        for _ in 0..4096 {
+            let ghost = random_ghost(&mut rng);
+            let mut next_scalar = [0u64; TILE_SIZE];
+            let mut next_empty = [0u64; TILE_SIZE];
+
+            let scalar = advance_core_scalar(&current, &mut next_scalar, &ghost);
+            let empty = advance_core_empty(&mut next_empty, &ghost);
+
+            assert_eq!(next_scalar, next_empty);
+            assert_eq!(scalar.0, empty.0);
+            assert_eq!(scalar.2, empty.2);
+            assert_eq!(scalar.1.north, empty.1.north);
+            assert_eq!(scalar.1.south, empty.1.south);
+            assert_eq!(scalar.1.west, empty.1.west);
+            assert_eq!(scalar.1.east, empty.1.east);
+            assert_eq!(scalar.1.live_mask(), empty.1.live_mask());
+        }
+    }
+
+    #[test]
+    fn empty_core_clears_stale_next_buffer_rows() {
+        let current = [0u64; TILE_SIZE];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x0DDC_0FFE_EE12_34AA);
+
+        for _ in 0..1024 {
+            let ghost = random_ghost(&mut rng);
+            let mut next_scalar = random_tile(&mut rng);
+            let mut next_empty = random_tile(&mut rng);
+
+            let scalar = advance_core_scalar(&current, &mut next_scalar, &ghost);
+            let empty = advance_core_empty(&mut next_empty, &ghost);
+
+            assert_eq!(next_scalar, next_empty);
+            assert_eq!(scalar.0, empty.0);
+            assert_eq!(scalar.2, empty.2);
+            assert_eq!(scalar.1.live_mask(), empty.1.live_mask());
+        }
     }
 
     #[test]

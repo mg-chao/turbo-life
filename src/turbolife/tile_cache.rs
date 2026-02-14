@@ -1,5 +1,7 @@
 use super::kernel::TileAdvanceResult;
-use super::kernel::{ghost_is_empty_from_live_masks_ptr, tile_is_empty};
+use super::kernel::{
+    advance_core_empty, clear_tile_if_needed, ghost_is_empty_from_live_masks_ptr, tile_is_empty,
+};
 use super::tile::{BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, TILE_SIZE};
 
 const CACHE_SIZE: usize = 1 << 13;
@@ -230,12 +232,13 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
     let next = unsafe { &mut (*next_ptr.add(idx)).0 };
     let meta = unsafe { &mut *meta_ptr.add(idx) };
     let missing_mask = meta.missing_mask;
+    let tile_has_live = meta.has_live();
 
-    if !meta.has_live() {
+    if !tile_has_live {
         if missing_mask == MISSING_ALL_NEIGHBORS {
             debug_assert!(tile_is_empty(current));
             unsafe {
-                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                clear_tile_if_needed(next);
                 *next_borders_ptr.add(idx) = BorderData::default();
                 *next_live_masks_ptr.add(idx) = 0;
             }
@@ -250,7 +253,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
         if ghost_empty {
             debug_assert!(tile_is_empty(current));
             unsafe {
-                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                clear_tile_if_needed(next);
                 *next_borders_ptr.add(idx) = BorderData::default();
                 *next_live_masks_ptr.add(idx) = 0;
             }
@@ -278,6 +281,18 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
         sw: sw_b.ne(),
         se: se_b.nw(),
     };
+
+    if !tile_has_live {
+        debug_assert!(tile_is_empty(current));
+        let (changed, border, has_live) = advance_core_empty(next, &ghost);
+        let live_mask = border.live_mask();
+        unsafe {
+            *next_borders_ptr.add(idx) = border;
+            *next_live_masks_ptr.add(idx) = live_mask;
+        }
+        meta.update_after_step(changed, has_live);
+        return TileAdvanceResult::new(changed, has_live, missing_mask, live_mask);
+    }
 
     let cr = unsafe { &mut *cache };
 
