@@ -4,7 +4,7 @@ use rayon::prelude::*;
 
 use super::arena::TileArena;
 use super::kernel::ghost_is_empty_from_live_masks_ptr;
-use super::tile::{MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
+use super::tile::{TileIdx, MISSING_ALL_NEIGHBORS, NO_NEIGHBOR};
 
 const EXPAND_OFFSETS: [(i64, i64); 8] = [
     (0, 1),   // N
@@ -241,15 +241,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
             arena.clear_changed_mark(idx.index());
         }
     }
-
-    arena.active_epoch = arena.active_epoch.wrapping_add(1);
-    if arena.active_epoch == 0 {
-        arena.active_epoch = 1;
-        for m in arena.meta.iter_mut() {
-            m.active_epoch = 0;
-        }
-    }
-    let epoch = arena.active_epoch;
+    arena.begin_active_rebuild();
 
     let dense_rebuild = arena.occupied_count >= 4096
         && changed_count.saturating_mul(100) >= arena.occupied_count.saturating_mul(95);
@@ -282,30 +274,31 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     arena
         .active_set
         .reserve(changed_count.saturating_mul(9).min(arena.occupied_count));
-    let meta_ptr = arena.meta.as_mut_ptr();
+    let meta_ptr = arena.meta.as_ptr();
     let neighbors_ptr = arena.neighbors.as_ptr();
     let meta_len = arena.meta.len();
 
-    for &idx in &arena.changed_scratch {
+    let changed_ptr = arena.changed_scratch.as_ptr();
+    for changed_i in 0..changed_count {
+        let idx = unsafe { *changed_ptr.add(changed_i) };
         let i = idx.index();
         debug_assert!(i < meta_len);
+        let occupied = unsafe { (*meta_ptr.add(i)).occupied() };
+        if occupied && !arena.active_test_and_set(i) {
+            arena.active_set.push(idx);
+        }
         // SAFETY: i < meta_len guaranteed by arena invariants (idx came from changed_list).
         unsafe {
-            let m = &mut *meta_ptr.add(i);
-            if m.occupied() && m.active_epoch != epoch {
-                m.active_epoch = epoch;
-                arena.active_set.push(idx);
-            }
-            let nb = &*neighbors_ptr.add(i);
+            let nb = *neighbors_ptr.add(i);
             for &ni_raw in nb.iter() {
-                if ni_raw != NO_NEIGHBOR {
-                    let ni_i = ni_raw as usize;
-                    debug_assert!(ni_i < meta_len);
-                    let nm = &mut *meta_ptr.add(ni_i);
-                    if nm.occupied() && nm.active_epoch != epoch {
-                        nm.active_epoch = epoch;
-                        arena.active_set.push(TileIdx(ni_raw));
-                    }
+                if ni_raw == NO_NEIGHBOR {
+                    continue;
+                }
+                let ni_i = ni_raw as usize;
+                debug_assert!(ni_i < meta_len);
+                let neighbor_occupied = (*meta_ptr.add(ni_i)).occupied();
+                if neighbor_occupied && !arena.active_test_and_set(ni_i) {
+                    arena.active_set.push(TileIdx(ni_raw));
                 }
             }
         }
@@ -351,7 +344,6 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
         let (dx, dy) = EXPAND_OFFSETS[dir];
         let idx = arena.allocate_absent((tx + dx, ty + dy));
         let meta = &mut arena.meta[idx.index()];
-        meta.active_epoch = 0;
         meta.population = 0;
         arena.mark_changed_new_unique(idx);
     }
@@ -439,35 +431,34 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
 #[cfg(test)]
 mod tests {
     use super::{
-        TileArena, active_set_is_sorted, finalize_prune_and_expand, rebuild_active_set,
-        should_probe_std_active_sort, should_skip_std_active_sort,
+        active_set_is_sorted, finalize_prune_and_expand, rebuild_active_set,
+        should_probe_std_active_sort, should_skip_std_active_sort, TileArena,
     };
     use crate::turbolife::tile::TileIdx;
 
     #[test]
-    fn rebuild_active_set_does_not_advance_epoch_without_changes() {
+    fn rebuild_active_set_stays_empty_without_changes() {
         let mut arena = TileArena::new();
-        arena.active_epoch = u16::MAX;
-        arena.meta[0].active_epoch = 42;
 
         rebuild_active_set(&mut arena);
 
-        assert_eq!(arena.active_epoch, u16::MAX);
-        assert_eq!(arena.meta[0].active_epoch, 42);
         assert!(arena.active_set.is_empty());
     }
 
     #[test]
-    fn rebuild_active_set_wraps_epoch_when_changes_exist() {
+    fn rebuild_active_set_clears_active_tags_between_generations() {
         let mut arena = TileArena::new();
         let idx = arena.allocate((0, 0));
         arena.mark_changed(idx);
-        arena.active_epoch = u16::MAX;
 
         rebuild_active_set(&mut arena);
+        assert_eq!(arena.active_set, vec![idx]);
 
-        assert_eq!(arena.active_epoch, 1);
-        assert_eq!(arena.meta[idx.index()].active_epoch, 1);
+        rebuild_active_set(&mut arena);
+        assert!(arena.active_set.is_empty());
+
+        arena.mark_changed(idx);
+        rebuild_active_set(&mut arena);
         assert_eq!(arena.active_set, vec![idx]);
     }
 

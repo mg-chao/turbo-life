@@ -6,8 +6,7 @@
 //! can use unconditional loads — NO_NEIGHBOR maps to the sentinel.
 
 use super::tile::{
-    ActiveEpoch, BorderData, CellBuf, EMPTY_NEIGHBORS, NO_NEIGHBOR, Neighbors, TILE_SIZE, TileIdx,
-    TileMeta,
+    BorderData, CellBuf, Neighbors, TileIdx, TileMeta, EMPTY_NEIGHBORS, NO_NEIGHBOR, TILE_SIZE,
 };
 use super::tilemap::TileMap;
 
@@ -36,8 +35,9 @@ pub struct TileArena {
     pub occupied_count: usize,
     pub occupied_bits: Vec<u64>,
 
-    pub active_epoch: ActiveEpoch,
     pub active_set: Vec<TileIdx>,
+    active_epoch: u16,
+    active_tags: Vec<u16>,
     pub active_sort_scratch: Vec<TileIdx>,
     pub active_sort_counts: Vec<u32>,
     /// Pending directional frontier-expansion candidates.
@@ -93,8 +93,9 @@ impl TileArena {
             changed_bitmap_synced: true,
             occupied_count: 0,
             occupied_bits: vec![0],
-            active_epoch: 1,
             active_set: Vec::new(),
+            active_epoch: 1,
+            active_tags: vec![0],
             active_sort_scratch: Vec::new(),
             active_sort_counts: vec![0u32; ACTIVE_SORT_RADIX_BUCKETS],
             expand_buf: Vec::new(),
@@ -239,6 +240,10 @@ impl TileArena {
             self.changed_bits
                 .reserve(target_words - self.changed_bits.len());
         }
+        if self.active_tags.len() < target_slots {
+            self.active_tags
+                .reserve(target_slots - self.active_tags.len());
+        }
     }
 
     #[inline(always)]
@@ -281,6 +286,35 @@ impl TileArena {
             return;
         }
         self.changed_bits[word] &= !(1u64 << (idx & 63));
+    }
+
+    #[inline(always)]
+    fn ensure_active_tag_capacity(&mut self, idx: usize) {
+        if idx >= self.active_tags.len() {
+            self.active_tags.resize(idx + 1, 0);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn begin_active_rebuild(&mut self) {
+        self.active_epoch = self.active_epoch.wrapping_add(1);
+        if self.active_epoch == 0 {
+            self.active_epoch = 1;
+            self.active_tags.fill(0);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn active_test_and_set(&mut self, idx: usize) -> bool {
+        self.ensure_active_tag_capacity(idx);
+        let epoch = self.active_epoch;
+        let tag = &mut self.active_tags[idx];
+        if *tag == epoch {
+            true
+        } else {
+            *tag = epoch;
+            false
+        }
     }
 
     #[inline]
@@ -335,6 +369,8 @@ impl TileArena {
             self.border_live_masks[0][i] = 0;
             self.border_live_masks[1][i] = 0;
             self.set_occupied_bit(i);
+            self.ensure_active_tag_capacity(i);
+            self.active_tags[i] = 0;
             recycled
         } else {
             self.ensure_growth_capacity();
@@ -348,6 +384,7 @@ impl TileArena {
             self.borders[1].push(BorderData::default());
             self.border_live_masks[0].push(0);
             self.border_live_masks[1].push(0);
+            self.active_tags.push(0);
             self.set_occupied_bit(idx.index());
             idx
         }
@@ -414,6 +451,8 @@ impl TileArena {
         }
         self.clear_occupied_bit(i);
         self.clear_changed_mark(i);
+        self.ensure_active_tag_capacity(i);
+        self.active_tags[i] = 0;
 
         // Unlink neighbors using raw pointer access.
         let neighbors_ptr = self.neighbors.as_mut_ptr();
@@ -493,5 +532,36 @@ mod tests {
 
         arena.mark_changed(idx);
         assert_eq!(arena.changed_list.len(), 1);
+    }
+
+    #[test]
+    fn active_tags_wrap_epoch_and_reset() {
+        let mut arena = TileArena::new();
+        let idx = arena.allocate((0, 0));
+        let i = idx.index();
+
+        arena.active_epoch = u16::MAX;
+        arena.active_tags[i] = u16::MAX;
+
+        arena.begin_active_rebuild();
+        assert_eq!(arena.active_epoch, 1);
+        assert_eq!(arena.active_tags[i], 0);
+        assert!(!arena.active_test_and_set(i));
+        assert!(arena.active_test_and_set(i));
+    }
+
+    #[test]
+    fn release_clears_active_tag_before_recycling_slot() {
+        let mut arena = TileArena::new();
+        let idx = arena.allocate((0, 0));
+        let i = idx.index();
+
+        arena.active_epoch = 9;
+        arena.active_tags[i] = 9;
+        arena.release(idx);
+        let recycled = arena.allocate((1, 0));
+
+        assert_eq!(recycled, idx);
+        assert_eq!(arena.active_tags[recycled.index()], 0);
     }
 }

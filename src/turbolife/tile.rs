@@ -8,7 +8,6 @@
 
 pub const TILE_SIZE: usize = 64;
 pub const POPULATION_UNKNOWN: u16 = u16::MAX;
-pub type ActiveEpoch = u16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TileIdx(pub u32);
@@ -185,7 +184,6 @@ pub const MISSING_ALL_NEIGHBORS: u8 = 0xFF;
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct TileMeta {
-    pub active_epoch: ActiveEpoch,
     pub population: u16,
     /// Bit i = 1 means neighbor direction i is currently missing.
     /// Direction layout matches `Neighbors` / `Direction` indices.
@@ -229,7 +227,6 @@ impl TileMeta {
 
     pub fn empty() -> Self {
         Self {
-            active_epoch: 0,
             population: 0,
             missing_mask: MISSING_ALL_NEIGHBORS,
             flags: FLAG_OCCUPIED,
@@ -238,7 +235,6 @@ impl TileMeta {
 
     pub fn released() -> Self {
         Self {
-            active_epoch: 0,
             population: 0,
             missing_mask: MISSING_ALL_NEIGHBORS,
             flags: 0,
@@ -323,7 +319,7 @@ mod tests {
 
     #[test]
     fn tile_meta_is_compact() {
-        assert_eq!(std::mem::size_of::<TileMeta>(), 6);
+        assert_eq!(std::mem::size_of::<TileMeta>(), 4);
     }
 
     #[test]
