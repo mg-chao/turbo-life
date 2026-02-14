@@ -1,5 +1,5 @@
 use super::kernel::{ghost_is_empty_from_live_masks, tile_is_empty};
-use super::tile::{BorderData, CellBuf, GhostZone, TILE_SIZE};
+use super::tile::{BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, TILE_SIZE};
 
 const CACHE_SIZE: usize = 1 << 13;
 const CACHE_MASK: usize = CACHE_SIZE - 1;
@@ -219,10 +219,53 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
     next_borders_ptr: *mut BorderData,
     borders_read_ptr: *const BorderData,
     neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
     idx: usize,
     cache: *mut TileCache,
 ) -> bool {
     let nb = unsafe { &*neighbors_ptr.add(idx) };
+    let current = unsafe { &(*current_ptr.add(idx)).0 };
+    let next = unsafe { &mut (*next_ptr.add(idx)).0 };
+    let meta = unsafe { &mut *meta_ptr.add(idx) };
+
+    if !meta.has_live() {
+        if meta.missing_mask == MISSING_ALL_NEIGHBORS {
+            debug_assert!(tile_is_empty(current));
+            unsafe {
+                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                *next_borders_ptr.add(idx) = BorderData::default();
+                *next_live_masks_ptr.add(idx) = 0;
+            }
+            meta.update_after_step(false, false);
+            return false;
+        }
+
+        // Ultra-fast path: metadata says current tile is empty and halo has no
+        // incoming live cells.
+        let ghost_empty = ghost_is_empty_from_live_masks([
+            unsafe { *live_masks_read_ptr.add(nb[0] as usize) },
+            unsafe { *live_masks_read_ptr.add(nb[1] as usize) },
+            unsafe { *live_masks_read_ptr.add(nb[2] as usize) },
+            unsafe { *live_masks_read_ptr.add(nb[3] as usize) },
+            unsafe { *live_masks_read_ptr.add(nb[4] as usize) },
+            unsafe { *live_masks_read_ptr.add(nb[5] as usize) },
+            unsafe { *live_masks_read_ptr.add(nb[6] as usize) },
+            unsafe { *live_masks_read_ptr.add(nb[7] as usize) },
+        ]);
+
+        if ghost_empty {
+            debug_assert!(tile_is_empty(current));
+            unsafe {
+                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                *next_borders_ptr.add(idx) = BorderData::default();
+                *next_live_masks_ptr.add(idx) = 0;
+            }
+            meta.update_after_step(false, false);
+            return false;
+        }
+    }
+
     let north_b = unsafe { &*borders_read_ptr.add(nb[0] as usize) };
     let south_b = unsafe { &*borders_read_ptr.add(nb[1] as usize) };
     let west_b = unsafe { &*borders_read_ptr.add(nb[2] as usize) };
@@ -231,35 +274,6 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
     let ne_b = unsafe { &*borders_read_ptr.add(nb[5] as usize) };
     let sw_b = unsafe { &*borders_read_ptr.add(nb[6] as usize) };
     let se_b = unsafe { &*borders_read_ptr.add(nb[7] as usize) };
-
-    let current = unsafe { &(*current_ptr.add(idx)).0 };
-    let next = unsafe { &mut (*next_ptr.add(idx)).0 };
-    let meta = unsafe { &mut *meta_ptr.add(idx) };
-
-    if !meta.has_live() {
-        // Ultra-fast path: metadata says current tile is empty and halo has no
-        // incoming live cells.
-        let ghost_empty = ghost_is_empty_from_live_masks([
-            north_b.live_mask,
-            south_b.live_mask,
-            west_b.live_mask,
-            east_b.live_mask,
-            nw_b.live_mask,
-            ne_b.live_mask,
-            sw_b.live_mask,
-            se_b.live_mask,
-        ]);
-
-        if ghost_empty {
-            debug_assert!(tile_is_empty(current));
-            unsafe {
-                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
-                *next_borders_ptr.add(idx) = BorderData::default();
-            }
-            meta.update_after_step(false, false);
-            return false;
-        }
-    }
 
     let ghost = GhostZone {
         north: north_b.south,
@@ -290,6 +304,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
                     TILE_SIZE,
                 );
                 *next_borders_ptr.add(idx) = entry.border;
+                *next_live_masks_ptr.add(idx) = entry.border.live_mask;
             }
             let changed = entry.changed;
             meta.update_after_step(changed, entry.has_live);
@@ -300,6 +315,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
             unsafe { advance_core_const::<USE_AVX2>(current, next, &ghost) };
         unsafe {
             *next_borders_ptr.add(idx) = border;
+            *next_live_masks_ptr.add(idx) = border.live_mask;
         }
         meta.update_after_step(changed, has_live);
         let em = unsafe { cr.entries.get_unchecked_mut(slot) };
@@ -324,6 +340,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
         unsafe { advance_core_const::<USE_AVX2>(current, next, &ghost) };
     unsafe {
         *next_borders_ptr.add(idx) = border;
+        *next_live_masks_ptr.add(idx) = border.live_mask;
     }
     meta.update_after_step(changed, has_live);
     changed
@@ -340,6 +357,8 @@ pub unsafe fn advance_tile_cached_scalar(
     next_borders_ptr: *mut BorderData,
     borders_read_ptr: *const BorderData,
     neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
     idx: usize,
     cache: *mut TileCache,
 ) -> bool {
@@ -351,6 +370,8 @@ pub unsafe fn advance_tile_cached_scalar(
             next_borders_ptr,
             borders_read_ptr,
             neighbors_ptr,
+            live_masks_read_ptr,
+            next_live_masks_ptr,
             idx,
             cache,
         )
@@ -369,6 +390,8 @@ pub unsafe fn advance_tile_cached_avx2(
     next_borders_ptr: *mut BorderData,
     borders_read_ptr: *const BorderData,
     neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
     idx: usize,
     cache: *mut TileCache,
 ) -> bool {
@@ -380,6 +403,8 @@ pub unsafe fn advance_tile_cached_avx2(
             next_borders_ptr,
             borders_read_ptr,
             neighbors_ptr,
+            live_masks_read_ptr,
+            next_live_masks_ptr,
             idx,
             cache,
         )

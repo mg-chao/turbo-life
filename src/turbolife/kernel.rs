@@ -4,7 +4,7 @@
 //! Border extraction is fused into the main loop.
 //! Works with split cell buffers (separate current/next vecs).
 
-use super::tile::{BorderData, CellBuf, GhostZone, TILE_SIZE, TileMeta};
+use super::tile::{BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, TILE_SIZE, TileMeta};
 const _: [(); 1] = [(); (TILE_SIZE == 64) as usize];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -460,8 +460,9 @@ unsafe fn advance_core_const<const USE_AVX2: bool>(
 /// # Safety
 /// All pointers must be valid. `idx` must be within bounds of all arrays.
 /// Caller must ensure exclusive write access to `next_ptr[idx]`,
-/// `meta_ptr[idx]`, and `next_borders_ptr[idx]`.
+/// `meta_ptr[idx]`, `next_borders_ptr[idx]`, and `next_live_masks_ptr[idx]`.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
@@ -469,10 +470,53 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
     next_borders_ptr: *mut BorderData,
     borders_read_ptr: *const BorderData,
     neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
     idx: usize,
 ) -> bool {
-    // Inline ghost-zone gather (avoids function call + struct construction).
     let nb = unsafe { &*neighbors_ptr.add(idx) };
+    let current = unsafe { &(*current_ptr.add(idx)).0 };
+    let next = unsafe { &mut (*next_ptr.add(idx)).0 };
+    let meta = unsafe { &mut *meta_ptr.add(idx) };
+
+    if !meta.has_live() {
+        if meta.missing_mask == MISSING_ALL_NEIGHBORS {
+            debug_assert!(tile_is_empty(current));
+            unsafe {
+                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                *next_borders_ptr.add(idx) = BorderData::default();
+                *next_live_masks_ptr.add(idx) = 0;
+            }
+            meta.update_after_step(false, false);
+            return false;
+        }
+
+        // Ultra-fast path: metadata says current tile is empty and halo has no
+        // incoming live activity.
+        let ghost_empty = ghost_is_empty_from_live_masks([
+            unsafe { *live_masks_read_ptr.add(nb[0] as usize) },
+            unsafe { *live_masks_read_ptr.add(nb[1] as usize) },
+            unsafe { *live_masks_read_ptr.add(nb[2] as usize) },
+            unsafe { *live_masks_read_ptr.add(nb[3] as usize) },
+            unsafe { *live_masks_read_ptr.add(nb[4] as usize) },
+            unsafe { *live_masks_read_ptr.add(nb[5] as usize) },
+            unsafe { *live_masks_read_ptr.add(nb[6] as usize) },
+            unsafe { *live_masks_read_ptr.add(nb[7] as usize) },
+        ]);
+
+        if ghost_empty {
+            debug_assert!(tile_is_empty(current));
+            unsafe {
+                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                *next_borders_ptr.add(idx) = BorderData::default();
+                *next_live_masks_ptr.add(idx) = 0;
+            }
+            meta.update_after_step(false, false);
+            return false;
+        }
+    }
+
+    // Inline ghost-zone gather (avoids function call + struct construction).
     let north_b = unsafe { &*borders_read_ptr.add(nb[0] as usize) };
     let south_b = unsafe { &*borders_read_ptr.add(nb[1] as usize) };
     let west_b = unsafe { &*borders_read_ptr.add(nb[2] as usize) };
@@ -481,38 +525,6 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
     let ne_b = unsafe { &*borders_read_ptr.add(nb[5] as usize) };
     let sw_b = unsafe { &*borders_read_ptr.add(nb[6] as usize) };
     let se_b = unsafe { &*borders_read_ptr.add(nb[7] as usize) };
-
-    let current = unsafe { &(*current_ptr.add(idx)).0 };
-    let next = unsafe { &mut (*next_ptr.add(idx)).0 };
-    let meta = unsafe { &mut *meta_ptr.add(idx) };
-
-    if !meta.has_live() {
-        // Ultra-fast path: metadata says current tile is empty and the gathered
-        // ghost halo is empty as well.
-        //
-        // We check halo emptiness via precomputed border live-mask bits instead
-        // of rebuilding it from full edge words.
-        let ghost_empty = ghost_is_empty_from_live_masks([
-            north_b.live_mask,
-            south_b.live_mask,
-            west_b.live_mask,
-            east_b.live_mask,
-            nw_b.live_mask,
-            ne_b.live_mask,
-            sw_b.live_mask,
-            se_b.live_mask,
-        ]);
-
-        if ghost_empty {
-            debug_assert!(tile_is_empty(current));
-            unsafe {
-                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
-                *next_borders_ptr.add(idx) = BorderData::default();
-            }
-            meta.update_after_step(false, false);
-            return false;
-        }
-    }
 
     let ghost = GhostZone {
         north: north_b.south,
@@ -530,6 +542,7 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
 
     unsafe {
         *next_borders_ptr.add(idx) = border;
+        *next_live_masks_ptr.add(idx) = border.live_mask;
     }
 
     meta.update_after_step(changed, has_live);
@@ -538,6 +551,7 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn advance_tile_fused_scalar(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
@@ -545,6 +559,8 @@ pub unsafe fn advance_tile_fused_scalar(
     next_borders_ptr: *mut BorderData,
     borders_read_ptr: *const BorderData,
     neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
     idx: usize,
 ) -> bool {
     unsafe {
@@ -555,6 +571,8 @@ pub unsafe fn advance_tile_fused_scalar(
             next_borders_ptr,
             borders_read_ptr,
             neighbors_ptr,
+            live_masks_read_ptr,
+            next_live_masks_ptr,
             idx,
         )
     }
@@ -562,6 +580,7 @@ pub unsafe fn advance_tile_fused_scalar(
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn advance_tile_fused_avx2(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
@@ -569,6 +588,8 @@ pub unsafe fn advance_tile_fused_avx2(
     next_borders_ptr: *mut BorderData,
     borders_read_ptr: *const BorderData,
     neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
     idx: usize,
 ) -> bool {
     unsafe {
@@ -579,6 +600,8 @@ pub unsafe fn advance_tile_fused_avx2(
             next_borders_ptr,
             borders_read_ptr,
             neighbors_ptr,
+            live_masks_read_ptr,
+            next_live_masks_ptr,
             idx,
         )
     }

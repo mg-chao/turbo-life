@@ -24,6 +24,9 @@ const ACTIVE_SORT_RADIX_MIN: usize = 32_768;
 const ACTIVE_SORT_LOW_CHURN_PCT: usize = 20;
 const ACTIVE_SORT_SKIP_MIN: usize = 2_048;
 const ACTIVE_SORT_SKIP_MAX: usize = 4_096;
+const _: [(); 1] = [(); (ACTIVE_SORT_SKIP_MIN <= ACTIVE_SORT_SKIP_MAX) as usize];
+const _: [(); 1] = [(); (ACTIVE_SORT_SKIP_MAX <= ACTIVE_SORT_STD_MAX) as usize];
+const _: [(); 1] = [(); (ACTIVE_SORT_LOW_CHURN_PCT <= 100) as usize];
 
 struct SendConstPtr<T> {
     inner: *const T,
@@ -57,10 +60,6 @@ fn prune_filter_chunk_size(candidate_len: usize, threads: usize) -> usize {
 
 #[inline(always)]
 fn should_skip_std_active_sort(active_len: usize, changed_count: usize) -> bool {
-    debug_assert!(ACTIVE_SORT_SKIP_MIN <= ACTIVE_SORT_SKIP_MAX);
-    debug_assert!(ACTIVE_SORT_SKIP_MAX <= ACTIVE_SORT_STD_MAX);
-    debug_assert!(ACTIVE_SORT_LOW_CHURN_PCT <= 100);
-
     let in_skip_window = (ACTIVE_SORT_SKIP_MIN..=ACTIVE_SORT_SKIP_MAX).contains(&active_len);
     if !in_skip_window {
         return false;
@@ -323,20 +322,21 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
 
     let thread_count = rayon::current_num_threads().max(1);
     let run_parallel = thread_count > 1 && prune_len >= PARALLEL_PRUNE_CANDIDATES_MIN;
-    let borders = &arena.borders[arena.border_phase];
+    let live_masks = &arena.border_live_masks[arena.border_phase];
+    debug_assert_eq!(live_masks.len(), arena.borders[arena.border_phase].len());
 
     let mut to_prune = if run_parallel {
         let chunk_size = prune_filter_chunk_size(prune_len, thread_count);
         let meta_ptr = SendConstPtr::new(arena.meta.as_ptr());
         let neighbors_ptr = SendConstPtr::new(arena.neighbors.as_ptr());
-        let borders_ptr = SendConstPtr::new(borders.as_ptr());
+        let live_masks_ptr = SendConstPtr::new(live_masks.as_ptr());
         let prune_candidates = &arena.prune_buf;
         prune_candidates
             .par_chunks(chunk_size)
             .fold(Vec::new, move |mut acc, chunk| {
                 let mp = meta_ptr.get();
                 let np = neighbors_ptr.get();
-                let bp = borders_ptr.get();
+                let lp = live_masks_ptr.get();
                 for &idx in chunk {
                     let ii = idx.index();
                     // SAFETY: pointers are stable and only read during this phase.
@@ -352,14 +352,14 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                         }
                         let nb = *np.add(ii);
                         let ghost_empty = ghost_is_empty_from_live_masks([
-                            (*bp.add(nb[0] as usize)).live_mask,
-                            (*bp.add(nb[1] as usize)).live_mask,
-                            (*bp.add(nb[2] as usize)).live_mask,
-                            (*bp.add(nb[3] as usize)).live_mask,
-                            (*bp.add(nb[4] as usize)).live_mask,
-                            (*bp.add(nb[5] as usize)).live_mask,
-                            (*bp.add(nb[6] as usize)).live_mask,
-                            (*bp.add(nb[7] as usize)).live_mask,
+                            *lp.add(nb[0] as usize),
+                            *lp.add(nb[1] as usize),
+                            *lp.add(nb[2] as usize),
+                            *lp.add(nb[3] as usize),
+                            *lp.add(nb[4] as usize),
+                            *lp.add(nb[5] as usize),
+                            *lp.add(nb[6] as usize),
+                            *lp.add(nb[7] as usize),
                         ]);
                         if ghost_empty {
                             acc.push(idx);
@@ -388,14 +388,14 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
             }
             let nb = arena.neighbors[ii];
             let ghost_empty = ghost_is_empty_from_live_masks([
-                borders[nb[0] as usize].live_mask,
-                borders[nb[1] as usize].live_mask,
-                borders[nb[2] as usize].live_mask,
-                borders[nb[3] as usize].live_mask,
-                borders[nb[4] as usize].live_mask,
-                borders[nb[5] as usize].live_mask,
-                borders[nb[6] as usize].live_mask,
-                borders[nb[7] as usize].live_mask,
+                live_masks[nb[0] as usize],
+                live_masks[nb[1] as usize],
+                live_masks[nb[2] as usize],
+                live_masks[nb[3] as usize],
+                live_masks[nb[4] as usize],
+                live_masks[nb[5] as usize],
+                live_masks[nb[6] as usize],
+                live_masks[nb[7] as usize],
             ]);
             if ghost_empty {
                 serial.push(idx);

@@ -570,6 +570,7 @@ impl TurboLife {
             }
             border.refresh_live_mask();
         }
+        self.arena.sync_current_border_live_mask(idx);
 
         {
             let meta = self.arena.meta_mut(idx);
@@ -648,7 +649,7 @@ impl TurboLife {
             let buf = self.arena.current_buf(*idx);
             let (border, has_live) = tile::recompute_border_and_has_live(buf);
 
-            *self.arena.border_mut(*idx) = border;
+            self.arena.set_current_border(*idx, border);
             {
                 let meta = self.arena.meta_mut(*idx);
                 meta.population = POPULATION_UNKNOWN;
@@ -722,20 +723,30 @@ impl TurboLife {
         } else {
             (bd_hi[0].as_slice(), &mut bd_lo[0])
         };
+        let (lm_lo, lm_hi) = self.arena.border_live_masks.split_at_mut(1);
+        let (live_masks_read, next_live_masks_vec) = if bp == 0 {
+            (lm_lo[0].as_slice(), &mut lm_hi[0])
+        } else {
+            (lm_hi[0].as_slice(), &mut lm_lo[0])
+        };
 
         debug_assert_eq!(self.arena.meta.len(), current_vec.len());
         debug_assert_eq!(self.arena.meta.len(), next_vec.len());
         debug_assert_eq!(self.arena.meta.len(), borders_read.len());
         debug_assert_eq!(self.arena.meta.len(), next_borders_vec.len());
+        debug_assert_eq!(self.arena.meta.len(), live_masks_read.len());
+        debug_assert_eq!(self.arena.meta.len(), next_live_masks_vec.len());
         debug_assert_eq!(self.arena.meta.len(), self.arena.neighbors.len());
 
         if !run_parallel {
             // Serial path: cached kernel with multi-level prefetching.
             let neighbors_ptr = self.arena.neighbors.as_ptr();
             let borders_read_ptr = borders_read.as_ptr();
+            let live_masks_read_ptr = live_masks_read.as_ptr();
             let current_ptr = current_vec.as_ptr();
             let next_ptr = next_vec.as_mut_ptr();
             let next_borders_ptr = next_borders_vec.as_mut_ptr();
+            let next_live_masks_ptr = next_live_masks_vec.as_mut_ptr();
             let meta_ptr = self.arena.meta.as_mut_ptr();
             let active_ptr = self.arena.active_set.as_ptr();
             let cache_ptr = &mut self.tile_cache as *mut TileCache;
@@ -786,6 +797,8 @@ impl TurboLife {
                                 next_borders_ptr,
                                 borders_read_ptr,
                                 neighbors_ptr,
+                                live_masks_read_ptr,
+                                next_live_masks_ptr,
                                 ii,
                                 cache_ptr,
                             )
@@ -800,7 +813,7 @@ impl TurboLife {
 
                             let missing = meta.missing_mask;
                             if missing != 0 {
-                                let live_mask = (*next_borders_ptr.add(ii)).live_mask;
+                                let live_mask = *next_live_masks_ptr.add(ii);
                                 append_expand_candidates(
                                     &mut self.arena.expand_buf,
                                     idx,
@@ -863,6 +876,8 @@ impl TurboLife {
                                 next_borders_ptr,
                                 borders_read_ptr,
                                 neighbors_ptr,
+                                live_masks_read_ptr,
+                                next_live_masks_ptr,
                                 ii,
                             )
                         };
@@ -876,7 +891,7 @@ impl TurboLife {
 
                             let missing = meta.missing_mask;
                             if missing != 0 {
-                                let live_mask = (*next_borders_ptr.add(ii)).live_mask;
+                                let live_mask = *next_live_masks_ptr.add(ii);
                                 append_expand_candidates(
                                     &mut self.arena.expand_buf,
                                     idx,
@@ -935,6 +950,8 @@ impl TurboLife {
             let neighbors_ptr = SendConstPtr::new(self.arena.neighbors.as_ptr());
             let next_borders_ptr = SendPtr::new(next_borders_vec.as_mut_ptr());
             let borders_read_ptr = SendConstPtr::new(borders_read.as_ptr());
+            let live_masks_read_ptr = SendConstPtr::new(live_masks_read.as_ptr());
+            let next_live_masks_ptr = SendPtr::new(next_live_masks_vec.as_mut_ptr());
             let worker_count = effective_threads.min(active_len);
             let use_static_schedule =
                 active_len >= PARALLEL_STATIC_SCHEDULE_THRESHOLD || worker_count < thread_count;
@@ -988,6 +1005,8 @@ impl TurboLife {
                             next_borders_ptr.get(),
                             borders_read_ptr.get(),
                             neighbors_ptr.get(),
+                            live_masks_read_ptr.get(),
+                            next_live_masks_ptr.get(),
                             ii,
                         )
                     };
@@ -1003,7 +1022,7 @@ impl TurboLife {
 
                         let missing = meta_snapshot.missing_mask;
                         if missing != 0 {
-                            let live_mask = (*next_borders_ptr.get().add(ii)).live_mask;
+                            let live_mask = *next_live_masks_ptr.get().add(ii);
                             append_expand_candidates(
                                 &mut ($scratch).expand,
                                 idx,
@@ -1291,6 +1310,22 @@ mod tests {
         (pop, hasher.finish())
     }
 
+    fn assert_border_live_mask_cache_sync(engine: &TurboLife) {
+        for phase in 0..2 {
+            assert_eq!(
+                engine.arena.borders[phase].len(),
+                engine.arena.border_live_masks[phase].len()
+            );
+            for i in 0..engine.arena.borders[phase].len() {
+                assert_eq!(
+                    engine.arena.border_live_masks[phase][i],
+                    engine.arena.borders[phase][i].live_mask,
+                    "phase={phase} idx={i}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn memory_parallel_cap_stays_monotonic() {
         let mut prev = 0usize;
@@ -1385,6 +1420,28 @@ mod tests {
             changed_before + 1,
             "set_cell should requeue a stable tile even after unrelated steps"
         );
+    }
+
+    #[test]
+    fn border_live_mask_cache_stays_synced_across_mutations_and_steps() {
+        let mut engine = TurboLife::new();
+        assert_border_live_mask_cache_sync(&engine);
+
+        engine.set_cells_alive([(0, 0), (63, 63), (64, 0), (64, 1), (128, 128)]);
+        assert_border_live_mask_cache_sync(&engine);
+
+        engine.set_cell(63, 63, false);
+        engine.set_cell(1, 1, true);
+        assert_border_live_mask_cache_sync(&engine);
+
+        engine.step();
+        assert_border_live_mask_cache_sync(&engine);
+
+        engine.step_n(3);
+        assert_border_live_mask_cache_sync(&engine);
+
+        engine.set_cells([(0, 0, false), (127, 127, true), (190, -5, true)]);
+        assert_border_live_mask_cache_sync(&engine);
     }
 
     #[test]

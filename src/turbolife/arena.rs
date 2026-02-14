@@ -25,6 +25,8 @@ pub struct TileArena {
     pub coords: Vec<(i64, i64)>,
     /// Double-buffered borders. `borders[border_phase]` = current gen (read).
     pub borders: [Vec<BorderData>; 2],
+    /// Cached `BorderData::live_mask` for each border phase.
+    pub border_live_masks: [Vec<u8>; 2],
     pub border_phase: usize,
     pub coord_to_idx: TileMap,
     pub free_list: Vec<TileIdx>,
@@ -59,6 +61,8 @@ impl TileArena {
         let mut coords = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
         let mut borders0 = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
         let mut borders1 = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
+        let mut border_live_masks0 = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
+        let mut border_live_masks1 = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
 
         cell_bufs0.push(sentinel_cells.clone());
         cell_bufs1.push(sentinel_cells);
@@ -67,6 +71,8 @@ impl TileArena {
         coords.push(sentinel_coord);
         borders0.push(sentinel_border);
         borders1.push(sentinel_border);
+        border_live_masks0.push(0);
+        border_live_masks1.push(0);
 
         Self {
             cell_bufs: [cell_bufs0, cell_bufs1],
@@ -75,6 +81,7 @@ impl TileArena {
             neighbors,
             coords,
             borders: [borders0, borders1],
+            border_live_masks: [border_live_masks0, border_live_masks1],
             border_phase: 0,
             coord_to_idx: TileMap::with_capacity(INITIAL_TILE_CAPACITY),
             free_list: Vec::new(),
@@ -129,6 +136,21 @@ impl TileArena {
         &mut self.borders[self.border_phase][idx.index()]
     }
 
+    /// Write current-gen border and keep cached live-mask in sync.
+    #[inline(always)]
+    pub fn set_current_border(&mut self, idx: TileIdx, border: BorderData) {
+        let i = idx.index();
+        self.borders[self.border_phase][i] = border;
+        self.border_live_masks[self.border_phase][i] = border.live_mask;
+    }
+
+    /// Refresh cached live-mask from current-gen border after in-place edits.
+    #[inline(always)]
+    pub fn sync_current_border_live_mask(&mut self, idx: TileIdx) {
+        let i = idx.index();
+        self.border_live_masks[self.border_phase][i] = self.borders[self.border_phase][i].live_mask;
+    }
+
     /// Flip border phase.
     #[inline(always)]
     pub fn flip_borders(&mut self) {
@@ -179,6 +201,8 @@ impl TileArena {
         self.coords.reserve(additional);
         self.borders[0].reserve(additional);
         self.borders[1].reserve(additional);
+        self.border_live_masks[0].reserve(additional);
+        self.border_live_masks[1].reserve(additional);
         self.coord_to_idx.reserve(additional);
         let target_slots = self.meta.len().saturating_add(additional);
         let target_words = target_slots.div_ceil(64);
@@ -230,6 +254,8 @@ impl TileArena {
             self.coords[i] = coord;
             self.borders[0][i] = BorderData::default();
             self.borders[1][i] = BorderData::default();
+            self.border_live_masks[0][i] = 0;
+            self.border_live_masks[1][i] = 0;
             self.set_occupied_bit(i);
             recycled
         } else {
@@ -242,6 +268,8 @@ impl TileArena {
             self.coords.push(coord);
             self.borders[0].push(BorderData::default());
             self.borders[1].push(BorderData::default());
+            self.border_live_masks[0].push(0);
+            self.border_live_masks[1].push(0);
             self.set_occupied_bit(idx.index());
             idx
         }
@@ -336,6 +364,8 @@ impl TileArena {
         }
         self.borders[0][i] = BorderData::default();
         self.borders[1][i] = BorderData::default();
+        self.border_live_masks[0][i] = 0;
+        self.border_live_masks[1][i] = 0;
         self.meta[i] = TileMeta::released();
         self.free_list.push(idx);
         self.occupied_count = self.occupied_count.saturating_sub(1);
