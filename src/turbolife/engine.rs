@@ -232,7 +232,7 @@ fn memory_parallel_cap(thread_count: usize) -> usize {
     if thread_count <= 8 {
         thread_count
     } else {
-        thread_count.saturating_mul(2).div_ceil(3).max(8)
+        thread_count.div_ceil(2).max(8)
     }
 }
 
@@ -1282,7 +1282,34 @@ impl TurboLife {
 
 #[cfg(test)]
 mod tests {
-    use super::TurboLife;
+    use super::{TurboLife, memory_parallel_cap};
+
+    #[test]
+    fn memory_parallel_cap_stays_monotonic() {
+        let mut prev = 0usize;
+        for thread_count in 1..=128 {
+            let capped = memory_parallel_cap(thread_count);
+            assert!(
+                capped <= thread_count,
+                "cap should never exceed the requested threads: {thread_count} -> {capped}"
+            );
+            assert!(
+                capped >= prev,
+                "cap should be monotonic with thread count: {thread_count} -> {capped}, prev={prev}"
+            );
+            prev = capped;
+        }
+    }
+
+    #[test]
+    fn memory_parallel_cap_keeps_high_core_boundary() {
+        assert_eq!(memory_parallel_cap(8), 8);
+        assert_eq!(memory_parallel_cap(9), 8);
+        assert_eq!(memory_parallel_cap(10), 8);
+        assert_eq!(memory_parallel_cap(11), 8);
+        assert_eq!(memory_parallel_cap(12), 8);
+        assert_eq!(memory_parallel_cap(16), 8);
+    }
 
     #[test]
     fn empty_universe_advances_generation() {
