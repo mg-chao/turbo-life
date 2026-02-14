@@ -35,7 +35,7 @@ const _: [(); 1] = [(); (ACTIVE_SORT_SKIP_MIN <= ACTIVE_SORT_SKIP_MAX) as usize]
 const _: [(); 1] = [(); (ACTIVE_SORT_SKIP_MAX <= ACTIVE_SORT_STD_MAX) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_LOW_CHURN_PCT <= 100) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_PROBE_CHURN_PCT <= 100) as usize];
-const _: [(); 1] = [(); (ACTIVE_SORT_LOW_CHURN_PCT <= ACTIVE_SORT_PROBE_CHURN_PCT) as usize];
+const _: [(); 1] = [(); (ACTIVE_SORT_LOW_CHURN_PCT < ACTIVE_SORT_PROBE_CHURN_PCT) as usize];
 const _: [(); 1] = [(); (DIRECTIONAL_FILTER_ALWAYS_ON_MAX_CHANGED
     <= DIRECTIONAL_FILTER_PROBE_MAX_CHANGED) as usize];
 const _: [(); 1] =
@@ -706,6 +706,7 @@ mod tests {
 
     #[test]
     fn low_churn_skip_window_extends_to_std_sort_limit() {
+        assert!(!should_skip_std_active_sort(2_047, 300));
         assert!(should_skip_std_active_sort(8_192, 1_638));
         assert!(!should_skip_std_active_sort(8_192, 1_639));
         assert!(!should_skip_std_active_sort(8_193, 1_000));
@@ -718,6 +719,7 @@ mod tests {
         assert!(!should_probe_std_active_sort(2_048, 820));
         assert!(should_probe_std_active_sort(8_192, 3_276));
         assert!(!should_probe_std_active_sort(8_192, 3_277));
+        assert!(!should_probe_std_active_sort(8_193, 100));
     }
 
     #[test]
