@@ -191,15 +191,6 @@ pub(crate) fn append_expand_candidates(
 /// Uses unsafe raw pointer access to meta/neighbors for the hot inner loop
 /// to eliminate bounds checks on every neighbor lookup.
 pub fn rebuild_active_set(arena: &mut TileArena) {
-    arena.active_epoch = arena.active_epoch.wrapping_add(1);
-    if arena.active_epoch == 0 {
-        arena.active_epoch = 1;
-        for m in arena.meta.iter_mut() {
-            m.active_epoch = 0;
-        }
-    }
-    let epoch = arena.active_epoch;
-
     arena.active_set.clear();
     arena.changed_scratch.clear();
     // Swap instead of copy to avoid O(n) memcpy.
@@ -209,6 +200,15 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     if changed_count == 0 {
         return;
     }
+
+    arena.active_epoch = arena.active_epoch.wrapping_add(1);
+    if arena.active_epoch == 0 {
+        arena.active_epoch = 1;
+        for m in arena.meta.iter_mut() {
+            m.active_epoch = 0;
+        }
+    }
+    let epoch = arena.active_epoch;
 
     let dense_rebuild = arena.occupied_count >= 4096
         && changed_count.saturating_mul(100) >= arena.occupied_count.saturating_mul(95);
@@ -221,7 +221,6 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         if arena.free_list.is_empty() && arena.occupied_count + 1 == arena.meta.len() {
             for i in 1..arena.meta.len() {
                 if arena.meta[i].occupied() {
-                    arena.meta[i].active_epoch = epoch;
                     arena.active_set.push(TileIdx(i as u32));
                 }
             }
@@ -235,7 +234,6 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                         bits &= bits - 1;
                         continue;
                     }
-                    arena.meta[i].active_epoch = epoch;
                     arena.active_set.push(TileIdx(i as u32));
                     bits &= bits - 1;
                 }
@@ -413,4 +411,36 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
 
     arena.expand_buf.clear();
     arena.prune_buf.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TileArena, rebuild_active_set};
+
+    #[test]
+    fn rebuild_active_set_does_not_advance_epoch_without_changes() {
+        let mut arena = TileArena::new();
+        arena.active_epoch = u16::MAX;
+        arena.meta[0].active_epoch = 42;
+
+        rebuild_active_set(&mut arena);
+
+        assert_eq!(arena.active_epoch, u16::MAX);
+        assert_eq!(arena.meta[0].active_epoch, 42);
+        assert!(arena.active_set.is_empty());
+    }
+
+    #[test]
+    fn rebuild_active_set_wraps_epoch_when_changes_exist() {
+        let mut arena = TileArena::new();
+        let idx = arena.allocate((0, 0));
+        arena.mark_changed(idx);
+        arena.active_epoch = u16::MAX;
+
+        rebuild_active_set(&mut arena);
+
+        assert_eq!(arena.active_epoch, 1);
+        assert_eq!(arena.meta[idx.index()].active_epoch, 1);
+        assert_eq!(arena.active_set, vec![idx]);
+    }
 }
