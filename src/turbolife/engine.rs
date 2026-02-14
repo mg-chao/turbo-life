@@ -348,8 +348,8 @@ pub struct TurboLife {
     pool: rayon::ThreadPool,
     backend: KernelBackend,
     /// Reusable per-tile marker for batch dedup in `set_cells`.
-    /// Indexed by `TileIdx.index()`, grown on demand.
-    touched_flags: Vec<bool>,
+    /// Packed bitset indexed by `TileIdx.index()`, grown on demand.
+    touched_bitmap: Vec<u64>,
     /// Direct-mapped tile result cache for kernel memoization.
     tile_cache: TileCache,
     /// Per-worker scratch buffers used by the static parallel scheduler.
@@ -384,7 +384,7 @@ impl TurboLife {
             population_cache: Some(0),
             pool,
             backend,
-            touched_flags: Vec::new(),
+            touched_bitmap: Vec::new(),
             tile_cache: TileCache::new(),
             worker_scratch: (0..threads).map(|_| WorkerScratch::default()).collect(),
             set_cells_scratch: Vec::new(),
@@ -405,6 +405,33 @@ impl TurboLife {
             scratch.clear();
             scratch.reserve_for_chunk(chunk_len);
         }
+    }
+
+    #[inline(always)]
+    fn ensure_touched_capacity(&mut self, idx: usize) {
+        let word = idx >> 6;
+        if word < self.touched_bitmap.len() {
+            return;
+        }
+        let target_words = self.arena.meta.len().div_ceil(64);
+        self.touched_bitmap.resize(target_words.max(word + 1), 0);
+    }
+
+    #[inline(always)]
+    fn touched_test_and_set(&mut self, idx: usize) -> bool {
+        self.ensure_touched_capacity(idx);
+        let word = idx >> 6;
+        let bit = 1u64 << (idx & 63);
+        let old = self.touched_bitmap[word];
+        self.touched_bitmap[word] = old | bit;
+        (old & bit) != 0
+    }
+
+    #[inline(always)]
+    fn touched_clear(&mut self, idx: usize) {
+        let word = idx >> 6;
+        let bit = 1u64 << (idx & 63);
+        self.touched_bitmap[word] &= !bit;
     }
 
     #[inline(always)]
@@ -587,14 +614,8 @@ impl TurboLife {
                 continue;
             }
 
-            // O(1) dedup via direct-indexed flag array - no hashing needed.
-            // Grow the flags vec on demand to cover any newly allocated tiles.
             let i = idx.index();
-            if i >= self.touched_flags.len() {
-                self.touched_flags.resize(self.arena.meta.len(), false);
-            }
-            if !self.touched_flags[i] {
-                self.touched_flags[i] = true;
+            if !self.touched_test_and_set(i) {
                 touched_tiles.push(idx);
                 self.arena.mark_changed(idx);
             }
@@ -623,7 +644,7 @@ impl TurboLife {
 
         // Clear touched flags for reuse (O(touched) not O(arena)).
         for idx in &touched_tiles {
-            self.touched_flags[idx.index()] = false;
+            self.touched_clear(idx.index());
         }
 
         self.population_cache = None;
@@ -756,13 +777,12 @@ impl TurboLife {
                             )
                         };
 
+                        if changed {
+                            self.arena.mark_changed(idx);
+                        }
+
                         unsafe {
-                            let meta = &mut *meta_ptr.add(ii);
-                            if changed {
-                                debug_assert!(!meta.in_changed_list());
-                                meta.set_in_changed_list(true);
-                                self.arena.changed_list.push(idx);
-                            }
+                            let meta = &*meta_ptr.add(ii);
 
                             let missing = meta.missing_mask;
                             if missing != 0 {
@@ -833,13 +853,12 @@ impl TurboLife {
                             )
                         };
 
+                        if changed {
+                            self.arena.mark_changed(idx);
+                        }
+
                         unsafe {
-                            let meta = &mut *meta_ptr.add(ii);
-                            if changed {
-                                debug_assert!(!meta.in_changed_list());
-                                meta.set_in_changed_list(true);
-                                self.arena.changed_list.push(idx);
-                            }
+                            let meta = &*meta_ptr.add(ii);
 
                             let missing = meta.missing_mask;
                             if missing != 0 {
@@ -1035,16 +1054,10 @@ impl TurboLife {
                     self.arena.prune_buf.append(&mut scratch.prune);
                 }
 
-                let meta_write_ptr = self.arena.meta.as_mut_ptr();
                 for worker_id in 0..worker_count {
                     let scratch = &mut self.worker_scratch[worker_id];
                     for idx in scratch.changed.drain(..) {
-                        unsafe {
-                            let meta = &mut *meta_write_ptr.add(idx.index());
-                            debug_assert!(!meta.in_changed_list());
-                            meta.set_in_changed_list(true);
-                            self.arena.changed_list.push(idx);
-                        }
+                        self.arena.mark_changed(idx);
                     }
                 }
             } else {
@@ -1175,14 +1188,8 @@ impl TurboLife {
                 self.arena.expand_buf.append(&mut expand_all);
                 self.arena.prune_buf.append(&mut prune_all);
 
-                let meta_write_ptr = self.arena.meta.as_mut_ptr();
                 for idx in changed_all.drain(..) {
-                    unsafe {
-                        let meta = &mut *meta_write_ptr.add(idx.index());
-                        debug_assert!(!meta.in_changed_list());
-                        meta.set_in_changed_list(true);
-                        self.arena.changed_list.push(idx);
-                    }
+                    self.arena.mark_changed(idx);
                 }
             }
         }
@@ -1222,25 +1229,33 @@ impl TurboLife {
 
         let cp = self.arena.cell_phase;
         let mut total = 0u64;
-        for (buf, meta) in self.arena.cell_bufs[cp]
-            .iter()
-            .zip(self.arena.meta.iter_mut())
-        {
-            if !meta.occupied() {
-                continue;
+        let occupied_bits = &self.arena.occupied_bits;
+        let cell_vec = &self.arena.cell_bufs[cp];
+        let meta_vec = &mut self.arena.meta;
+        for (word_idx, &word) in occupied_bits.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let i = (word_idx << 6) + bit;
+                if i == 0 || i >= meta_vec.len() {
+                    bits &= bits - 1;
+                    continue;
+                }
+                let meta = &mut meta_vec[i];
+                if !meta.has_live() {
+                    meta.population = 0;
+                } else {
+                    let pop = if meta.population != POPULATION_UNKNOWN {
+                        meta.population
+                    } else {
+                        let computed = tile::compute_population(&cell_vec[i].0);
+                        meta.population = computed;
+                        computed
+                    };
+                    total += pop as u64;
+                }
+                bits &= bits - 1;
             }
-            if !meta.has_live() {
-                meta.population = 0;
-                continue;
-            }
-            let pop = if meta.population != POPULATION_UNKNOWN {
-                meta.population
-            } else {
-                let computed = tile::compute_population(&buf.0);
-                meta.population = computed;
-                computed
-            };
-            total += pop as u64;
         }
 
         self.population_cache = Some(total);
@@ -1271,24 +1286,29 @@ impl TurboLife {
 
     pub fn for_each_live<F: FnMut(i64, i64)>(&self, mut f: F) {
         let cp = self.arena.cell_phase;
-        for i in 0..self.arena.cell_bufs[cp].len() {
-            let meta = &self.arena.meta[i];
-            if !meta.occupied() {
-                continue;
-            }
-
-            let current = &self.arena.cell_bufs[cp][i].0;
-            let coord = self.arena.coords[i];
-            let base_x = coord.0 * TILE_SIZE_I64;
-            let base_y = coord.1 * TILE_SIZE_I64;
-
-            for (row_index, &row) in current.iter().enumerate() {
-                let mut bits = row;
-                while bits != 0 {
-                    let bit = bits.trailing_zeros() as i64;
-                    f(base_x + bit, base_y + row_index as i64);
+        for (word_idx, &word) in self.arena.occupied_bits.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let i = (word_idx << 6) + bit;
+                if i == 0 || i >= self.arena.meta.len() {
                     bits &= bits - 1;
+                    continue;
                 }
+                let current = &self.arena.cell_bufs[cp][i].0;
+                let coord = self.arena.coords[i];
+                let base_x = coord.0 * TILE_SIZE_I64;
+                let base_y = coord.1 * TILE_SIZE_I64;
+
+                for (row_index, &row) in current.iter().enumerate() {
+                    let mut row_bits = row;
+                    while row_bits != 0 {
+                        let col = row_bits.trailing_zeros() as i64;
+                        f(base_x + col, base_y + row_index as i64);
+                        row_bits &= row_bits - 1;
+                    }
+                }
+                bits &= bits - 1;
             }
         }
     }
@@ -1355,5 +1375,24 @@ mod tests {
         engine.step();
         assert_eq!(engine.generation(), 1);
         assert_eq!(engine.population(), 0);
+    }
+
+    #[test]
+    fn step_changed_tiles_are_deduped_for_followup_mutation() {
+        let mut engine = TurboLife::new();
+        engine.set_cells_alive([(10, 10), (11, 10), (12, 10)]);
+        engine.step();
+
+        assert!(!engine.get_cell(10, 10));
+        let changed_before = engine.arena.changed_list.len();
+        assert!(changed_before > 0);
+
+        engine.set_cell(10, 10, true);
+        let changed_after = engine.arena.changed_list.len();
+
+        assert_eq!(
+            changed_after, changed_before,
+            "set_cell should not duplicate tiles already queued in changed_list"
+        );
     }
 }

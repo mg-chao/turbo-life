@@ -29,6 +29,7 @@ pub struct TileArena {
     pub free_list: Vec<TileIdx>,
     pub changed_list: Vec<TileIdx>,
     pub occupied_count: usize,
+    pub occupied_bits: Vec<u64>,
 
     pub active_epoch: u32,
     pub active_set: Vec<TileIdx>,
@@ -78,6 +79,7 @@ impl TileArena {
             free_list: Vec::new(),
             changed_list: Vec::new(),
             occupied_count: 0,
+            occupied_bits: vec![0],
             active_epoch: 1,
             active_set: Vec::new(),
             active_sort_scratch: Vec::new(),
@@ -170,6 +172,12 @@ impl TileArena {
         self.borders[0].reserve(additional);
         self.borders[1].reserve(additional);
         self.coord_to_idx.reserve(additional);
+        let target_slots = self.meta.len().saturating_add(additional);
+        let target_words = target_slots.div_ceil(64);
+        if self.occupied_bits.len() < target_words {
+            self.occupied_bits
+                .reserve(target_words - self.occupied_bits.len());
+        }
     }
 
     #[inline]
@@ -180,6 +188,24 @@ impl TileArena {
         }
         let grow_by = (len / 2).max(MIN_GROW_TILES);
         self.reserve_additional_tiles(grow_by);
+    }
+
+    #[inline(always)]
+    fn set_occupied_bit(&mut self, idx: usize) {
+        let word = idx >> 6;
+        if word >= self.occupied_bits.len() {
+            self.occupied_bits.resize(word + 1, 0);
+        }
+        self.occupied_bits[word] |= 1u64 << (idx & 63);
+    }
+
+    #[inline(always)]
+    fn clear_occupied_bit(&mut self, idx: usize) {
+        let word = idx >> 6;
+        debug_assert!(word < self.occupied_bits.len());
+        if let Some(bits) = self.occupied_bits.get_mut(word) {
+            *bits &= !(1u64 << (idx & 63));
+        }
     }
 
     #[inline]
@@ -196,6 +222,7 @@ impl TileArena {
             self.coords[i] = coord;
             self.borders[0][i] = BorderData::default();
             self.borders[1][i] = BorderData::default();
+            self.set_occupied_bit(i);
             recycled
         } else {
             self.ensure_growth_capacity();
@@ -207,6 +234,7 @@ impl TileArena {
             self.coords.push(coord);
             self.borders[0].push(BorderData::default());
             self.borders[1].push(BorderData::default());
+            self.set_occupied_bit(idx.index());
             idx
         }
     }
@@ -270,6 +298,7 @@ impl TileArena {
         if !self.meta[i].occupied() {
             return;
         }
+        self.clear_occupied_bit(i);
 
         // Unlink neighbors using raw pointer access.
         let neighbors_ptr = self.neighbors.as_mut_ptr();

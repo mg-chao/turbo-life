@@ -7,7 +7,7 @@
 //! - `BorderData`: corners packed into a u8 bitfield
 
 pub const TILE_SIZE: usize = 64;
-pub const POPULATION_UNKNOWN: u32 = u32::MAX;
+pub const POPULATION_UNKNOWN: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TileIdx(pub u32);
@@ -206,8 +206,8 @@ pub const MISSING_ALL_NEIGHBORS: u8 = 0xFF;
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct TileMeta {
-    pub population: u32,
     pub active_epoch: u32,
+    pub population: u16,
     /// Bit i = 1 means neighbor direction i is currently missing.
     /// Direction layout matches `Neighbors` / `Direction` indices.
     pub missing_mask: u8,
@@ -258,8 +258,8 @@ impl TileMeta {
 
     pub fn empty() -> Self {
         Self {
-            population: 0,
             active_epoch: 0,
+            population: 0,
             missing_mask: MISSING_ALL_NEIGHBORS,
             flags: FLAG_CHANGED | FLAG_OCCUPIED,
         }
@@ -267,8 +267,8 @@ impl TileMeta {
 
     pub fn released() -> Self {
         Self {
-            population: 0,
             active_epoch: 0,
+            population: 0,
             missing_mask: MISSING_ALL_NEIGHBORS,
             flags: 0,
         }
@@ -297,8 +297,10 @@ impl Default for CellBuf {
 
 /// Compute population of a cell buffer.
 #[inline]
-pub fn compute_population(buf: &[u64; TILE_SIZE]) -> u32 {
-    buf.iter().map(|row| row.count_ones()).sum()
+pub fn compute_population(buf: &[u64; TILE_SIZE]) -> u16 {
+    let pop: u32 = buf.iter().map(|row| row.count_ones()).sum();
+    debug_assert!(pop <= u16::MAX as u32);
+    pop as u16
 }
 
 /// Recompute border data from a cell buffer.
@@ -355,4 +357,14 @@ pub fn set_local_cell(buf: &mut [u64; TILE_SIZE], local_x: usize, local_y: usize
 #[inline(always)]
 pub fn get_local_cell(buf: &[u64; TILE_SIZE], local_x: usize, local_y: usize) -> bool {
     (buf[local_y] >> local_x) & 1 == 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TileMeta;
+
+    #[test]
+    fn tile_meta_is_compact() {
+        assert_eq!(std::mem::size_of::<TileMeta>(), 8);
+    }
 }

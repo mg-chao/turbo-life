@@ -197,13 +197,33 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         && changed_count.saturating_mul(100) >= arena.occupied_count.saturating_mul(95);
     if dense_rebuild {
         for &idx in &arena.changed_scratch {
-            arena.meta[idx.index()].set_in_changed_list(false);
+            let meta = &mut arena.meta[idx.index()];
+            if meta.in_changed_list() {
+                meta.set_in_changed_list(false);
+            }
         }
         arena.active_set.reserve(arena.occupied_count);
-        for i in 1..arena.meta.len() {
-            if arena.meta[i].occupied() {
-                arena.meta[i].active_epoch = epoch;
-                arena.active_set.push(TileIdx(i as u32));
+        if arena.free_list.is_empty() && arena.occupied_count + 1 == arena.meta.len() {
+            for i in 1..arena.meta.len() {
+                if arena.meta[i].occupied() {
+                    arena.meta[i].active_epoch = epoch;
+                    arena.active_set.push(TileIdx(i as u32));
+                }
+            }
+        } else {
+            for (word_idx, &word) in arena.occupied_bits.iter().enumerate() {
+                let mut bits = word;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    let i = (word_idx << 6) + bit;
+                    if i == 0 || i >= arena.meta.len() {
+                        bits &= bits - 1;
+                        continue;
+                    }
+                    arena.meta[i].active_epoch = epoch;
+                    arena.active_set.push(TileIdx(i as u32));
+                    bits &= bits - 1;
+                }
             }
         }
         return;
@@ -222,7 +242,9 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         // SAFETY: i < meta_len guaranteed by arena invariants (idx came from changed_list).
         unsafe {
             let m = &mut *meta_ptr.add(i);
-            m.set_in_changed_list(false);
+            if m.in_changed_list() {
+                m.set_in_changed_list(false);
+            }
             if m.occupied() && m.active_epoch != epoch {
                 m.active_epoch = epoch;
                 arena.active_set.push(idx);
