@@ -155,21 +155,18 @@ const fn build_expand_mask_table() -> ExpandMaskTable {
 const EXPAND_MASK_TABLE: ExpandMaskTable = build_expand_mask_table();
 
 #[inline(always)]
-fn pack_expand_candidate(idx: TileIdx, dir: usize) -> u64 {
-    ((idx.0 as u64) << 3) | dir as u64
+fn pack_expand_candidate(idx: TileIdx, dir: usize) -> u32 {
+    (idx.0 << 3) | dir as u32
 }
 
 #[inline(always)]
-fn unpack_expand_candidate(candidate: u64) -> (TileIdx, usize) {
-    (
-        TileIdx((candidate >> 3) as u32),
-        (candidate & 0b111) as usize,
-    )
+fn unpack_expand_candidate(candidate: u32) -> (TileIdx, usize) {
+    (TileIdx(candidate >> 3), (candidate & 0b111) as usize)
 }
 
 #[inline(always)]
 pub(crate) fn append_expand_candidates(
-    expand: &mut Vec<u64>,
+    expand: &mut Vec<u32>,
     idx: TileIdx,
     missing_mask: u8,
     live_mask: u8,
@@ -194,10 +191,17 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     arena.changed_scratch.clear();
     // Swap instead of copy to avoid O(n) memcpy.
     std::mem::swap(&mut arena.changed_scratch, &mut arena.changed_list);
+    let had_synced_changed_bits = arena.begin_changed_rebuild();
 
     let changed_count = arena.changed_scratch.len();
     if changed_count == 0 {
         return;
+    }
+    if had_synced_changed_bits {
+        for i in 0..changed_count {
+            let idx = arena.changed_scratch[i];
+            arena.clear_changed_mark(idx.index());
+        }
     }
 
     arena.active_epoch = arena.active_epoch.wrapping_add(1);
@@ -212,9 +216,6 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     let dense_rebuild = arena.occupied_count >= 4096
         && changed_count.saturating_mul(100) >= arena.occupied_count.saturating_mul(95);
     if dense_rebuild {
-        for &idx in &arena.changed_scratch {
-            arena.meta[idx.index()].set_changed_tag(false);
-        }
         arena.active_set.reserve(arena.occupied_count);
         if arena.free_list.is_empty() && arena.occupied_count + 1 == arena.meta.len() {
             for i in 1..arena.meta.len() {
@@ -253,7 +254,6 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         // SAFETY: i < meta_len guaranteed by arena invariants (idx came from changed_list).
         unsafe {
             let m = &mut *meta_ptr.add(i);
-            m.set_changed_tag(false);
             if m.occupied() && m.active_epoch != epoch {
                 m.active_epoch = epoch;
                 arena.active_set.push(idx);
@@ -310,7 +310,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
         let meta = &mut arena.meta[idx.index()];
         meta.active_epoch = 0;
         meta.population = 0;
-        arena.mark_changed(idx);
+        arena.mark_changed_new_unique(idx);
     }
 
     let prune_len = arena.prune_buf.len();

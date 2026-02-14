@@ -31,6 +31,8 @@ pub struct TileArena {
     pub coord_to_idx: TileMap,
     pub free_list: Vec<TileIdx>,
     pub changed_list: Vec<TileIdx>,
+    changed_bits: Vec<u64>,
+    changed_bitmap_synced: bool,
     pub occupied_count: usize,
     pub occupied_bits: Vec<u64>,
 
@@ -39,8 +41,8 @@ pub struct TileArena {
     pub active_sort_scratch: Vec<TileIdx>,
     pub active_sort_counts: Vec<u32>,
     /// Pending directional frontier-expansion candidates.
-    /// Packed as `((src_idx as u64) << 3) | dir`.
-    pub expand_buf: Vec<u64>,
+    /// Packed as `((src_idx as u32) << 3) | dir`.
+    pub expand_buf: Vec<u32>,
     pub prune_buf: Vec<TileIdx>,
     pub changed_scratch: Vec<TileIdx>,
 }
@@ -86,6 +88,8 @@ impl TileArena {
             coord_to_idx: TileMap::with_capacity(INITIAL_TILE_CAPACITY),
             free_list: Vec::new(),
             changed_list: Vec::new(),
+            changed_bits: vec![0],
+            changed_bitmap_synced: true,
             occupied_count: 0,
             occupied_bits: vec![0],
             active_epoch: 1,
@@ -174,19 +178,37 @@ impl TileArena {
 
     #[inline]
     pub fn mark_changed(&mut self, idx: TileIdx) {
-        let m = &mut self.meta[idx.index()];
-        if !m.changed_tag() {
-            m.set_changed_tag(true);
+        self.sync_changed_bitmap_if_needed();
+        let i = idx.index();
+        if !self.changed_test_and_set(i) {
             self.changed_list.push(idx);
         }
     }
 
     #[inline(always)]
-    pub fn push_changed_from_kernel(&mut self, idx: TileIdx) {
-        let meta = &mut self.meta[idx.index()];
-        debug_assert!(!meta.changed_tag());
-        meta.set_changed_tag(true);
+    pub(crate) fn mark_changed_new_unique(&mut self, idx: TileIdx) {
+        if self.changed_bitmap_synced {
+            let duplicate = self.changed_test_and_set(idx.index());
+            debug_assert!(
+                !duplicate,
+                "mark_changed_new_unique received a duplicate tile index"
+            );
+            if duplicate {
+                return;
+            }
+        }
         self.changed_list.push(idx);
+    }
+
+    #[inline(always)]
+    pub fn push_changed_from_kernel(&mut self, idx: TileIdx) {
+        self.changed_list.push(idx);
+        self.changed_bitmap_synced = false;
+    }
+
+    #[inline(always)]
+    pub(crate) fn mark_changed_bitmap_unsynced(&mut self) {
+        self.changed_bitmap_synced = false;
     }
 
     #[inline]
@@ -210,6 +232,59 @@ impl TileArena {
             self.occupied_bits
                 .reserve(target_words - self.occupied_bits.len());
         }
+        if self.changed_bits.len() < target_words {
+            self.changed_bits
+                .reserve(target_words - self.changed_bits.len());
+        }
+    }
+
+    #[inline(always)]
+    fn ensure_changed_bit_capacity(&mut self, idx: usize) {
+        let word = idx >> 6;
+        if word >= self.changed_bits.len() {
+            self.changed_bits.resize(word + 1, 0);
+        }
+    }
+
+    #[inline(always)]
+    fn changed_test_and_set(&mut self, idx: usize) -> bool {
+        self.ensure_changed_bit_capacity(idx);
+        let word = idx >> 6;
+        let bit = 1u64 << (idx & 63);
+        let old = self.changed_bits[word];
+        self.changed_bits[word] = old | bit;
+        (old & bit) != 0
+    }
+
+    #[inline(always)]
+    fn sync_changed_bitmap_if_needed(&mut self) {
+        if self.changed_bitmap_synced {
+            return;
+        }
+        let len = self.changed_list.len();
+        for i in 0..len {
+            let idx = self.changed_list[i].index();
+            self.ensure_changed_bit_capacity(idx);
+            let word = idx >> 6;
+            self.changed_bits[word] |= 1u64 << (idx & 63);
+        }
+        self.changed_bitmap_synced = true;
+    }
+
+    #[inline(always)]
+    pub(crate) fn clear_changed_mark(&mut self, idx: usize) {
+        let word = idx >> 6;
+        if word >= self.changed_bits.len() {
+            return;
+        }
+        self.changed_bits[word] &= !(1u64 << (idx & 63));
+    }
+
+    #[inline]
+    pub(crate) fn begin_changed_rebuild(&mut self) -> bool {
+        let was_synced = self.changed_bitmap_synced;
+        self.changed_bitmap_synced = true;
+        was_synced
     }
 
     #[inline]
@@ -335,6 +410,7 @@ impl TileArena {
             return;
         }
         self.clear_occupied_bit(i);
+        self.clear_changed_mark(i);
 
         // Unlink neighbors using raw pointer access.
         let neighbors_ptr = self.neighbors.as_mut_ptr();
@@ -382,5 +458,37 @@ impl TileArena {
         m.population = 0;
         m.set_has_live(false);
         self.mark_changed(idx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TileArena;
+
+    #[test]
+    fn mark_changed_dedupes_after_kernel_queue_becomes_unsynced() {
+        let mut arena = TileArena::new();
+        let idx = arena.allocate((0, 0));
+
+        arena.push_changed_from_kernel(idx);
+        assert!(!arena.changed_bitmap_synced);
+        assert_eq!(arena.changed_list.len(), 1);
+
+        arena.mark_changed(idx);
+        assert_eq!(arena.changed_list.len(), 1);
+        assert!(arena.changed_bitmap_synced);
+    }
+
+    #[test]
+    fn mark_changed_new_unique_preserves_synced_bitmap_when_possible() {
+        let mut arena = TileArena::new();
+        let idx = arena.allocate((0, 0));
+
+        arena.mark_changed_new_unique(idx);
+        assert!(arena.changed_bitmap_synced);
+        assert_eq!(arena.changed_list.len(), 1);
+
+        arena.mark_changed(idx);
+        assert_eq!(arena.changed_list.len(), 1);
     }
 }

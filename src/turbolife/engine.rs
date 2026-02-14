@@ -74,7 +74,7 @@ static AUTO_KERNEL_BACKEND: OnceLock<KernelBackend> = OnceLock::new();
 #[derive(Default)]
 struct WorkerScratch {
     changed: Vec<TileIdx>,
-    expand: Vec<u64>,
+    expand: Vec<u32>,
     prune: Vec<TileIdx>,
 }
 
@@ -1001,13 +1001,8 @@ impl TurboLife {
                         )
                     };
 
-                    unsafe {
-                        if result.changed {
-                            let meta = &mut *meta_ptr.get().add(ii);
-                            debug_assert!(!meta.changed_tag());
-                            meta.set_changed_tag(true);
-                            ($scratch).changed.push(idx);
-                        }
+                    if result.changed {
+                        ($scratch).changed.push(idx);
                     }
 
                     let missing = result.missing_mask;
@@ -1113,14 +1108,11 @@ impl TurboLife {
                 let scratch = &mut self.worker_scratch[worker_id];
                 self.arena.expand_buf.append(&mut scratch.expand);
                 self.arena.prune_buf.append(&mut scratch.prune);
-                debug_assert!(
-                    scratch
-                        .changed
-                        .iter()
-                        .all(|idx| self.arena.meta[idx.index()].changed_tag())
-                );
                 self.arena.changed_list.append(&mut scratch.changed);
             }
+        }
+        if !self.arena.changed_list.is_empty() {
+            self.arena.mark_changed_bitmap_unsynced();
         }
 
         self.arena.flip_borders();
@@ -1385,6 +1377,32 @@ mod tests {
         assert_eq!(
             changed_after, changed_before,
             "set_cell should not duplicate tiles already queued in changed_list"
+        );
+    }
+
+    #[test]
+    fn parallel_step_changed_tiles_are_deduped_for_followup_mutation() {
+        let mut engine = TurboLife::with_config(
+            TurboLifeConfig::default()
+                .thread_count(4)
+                .kernel(KernelBackend::Scalar),
+        );
+        seed_parallel_scheduler_fixture(&mut engine);
+        engine.step();
+
+        let changed_before = engine.arena.changed_list.len();
+        assert!(changed_before > 0);
+        let tile_idx = engine.arena.changed_list[0];
+        let coord = engine.arena.coords[tile_idx.index()];
+        let x = coord.0 * TILE_SIZE_I64 + 1;
+        let y = coord.1 * TILE_SIZE_I64 + 1;
+        let alive = engine.get_cell(x, y);
+        engine.set_cell(x, y, !alive);
+        let changed_after = engine.arena.changed_list.len();
+
+        assert_eq!(
+            changed_after, changed_before,
+            "set_cell should not duplicate tiles already queued in changed_list after parallel steps"
         );
     }
 
