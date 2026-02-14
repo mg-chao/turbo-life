@@ -1,3 +1,4 @@
+use super::kernel::TileAdvanceResult;
 use super::kernel::{ghost_is_empty_from_live_masks, tile_is_empty};
 use super::tile::{BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, TILE_SIZE};
 
@@ -223,14 +224,15 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
     next_live_masks_ptr: *mut u8,
     idx: usize,
     cache: *mut TileCache,
-) -> bool {
+) -> TileAdvanceResult {
     let nb = unsafe { &*neighbors_ptr.add(idx) };
     let current = unsafe { &(*current_ptr.add(idx)).0 };
     let next = unsafe { &mut (*next_ptr.add(idx)).0 };
     let meta = unsafe { &mut *meta_ptr.add(idx) };
+    let missing_mask = meta.missing_mask;
 
     if !meta.has_live() {
-        if meta.missing_mask == MISSING_ALL_NEIGHBORS {
+        if missing_mask == MISSING_ALL_NEIGHBORS {
             debug_assert!(tile_is_empty(current));
             unsafe {
                 std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
@@ -238,7 +240,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
                 *next_live_masks_ptr.add(idx) = 0;
             }
             meta.update_after_step(false, false);
-            return false;
+            return TileAdvanceResult::new(false, false, missing_mask, 0);
         }
 
         // Ultra-fast path: metadata says current tile is empty and halo has no
@@ -262,7 +264,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
                 *next_live_masks_ptr.add(idx) = 0;
             }
             meta.update_after_step(false, false);
-            return false;
+            return TileAdvanceResult::new(false, false, missing_mask, 0);
         }
     }
 
@@ -307,9 +309,11 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
                 *next_live_masks_ptr.add(idx) = entry.border.live_mask;
             }
             let changed = entry.changed;
-            meta.update_after_step(changed, entry.has_live);
+            let has_live = entry.has_live;
+            let live_mask = entry.border.live_mask;
+            meta.update_after_step(changed, has_live);
             cr.record_hit();
-            return changed;
+            return TileAdvanceResult::new(changed, has_live, missing_mask, live_mask);
         }
         let (changed, border, has_live) =
             unsafe { advance_core_const::<USE_AVX2>(current, next, &ghost) };
@@ -332,7 +336,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
         em.changed = changed;
         em.has_live = has_live;
         cr.record_miss();
-        return changed;
+        return TileAdvanceResult::new(changed, has_live, missing_mask, border.live_mask);
     }
 
     // Cache disabled path.
@@ -343,7 +347,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
         *next_live_masks_ptr.add(idx) = border.live_mask;
     }
     meta.update_after_step(changed, has_live);
-    changed
+    TileAdvanceResult::new(changed, has_live, missing_mask, border.live_mask)
 }
 
 /// # Safety
@@ -361,7 +365,7 @@ pub unsafe fn advance_tile_cached_scalar(
     next_live_masks_ptr: *mut u8,
     idx: usize,
     cache: *mut TileCache,
-) -> bool {
+) -> TileAdvanceResult {
     unsafe {
         advance_tile_cached_impl::<false>(
             current_ptr,
@@ -394,7 +398,7 @@ pub unsafe fn advance_tile_cached_avx2(
     next_live_masks_ptr: *mut u8,
     idx: usize,
     cache: *mut TileCache,
-) -> bool {
+) -> TileAdvanceResult {
     unsafe {
         advance_tile_cached_impl::<true>(
             current_ptr,

@@ -789,7 +789,7 @@ impl TurboLife {
                             }
                         }
 
-                        let changed = unsafe {
+                        let result = unsafe {
                             $advance(
                                 current_ptr,
                                 next_ptr,
@@ -804,27 +804,22 @@ impl TurboLife {
                             )
                         };
 
-                        if changed {
+                        if result.changed {
                             self.arena.push_changed_from_kernel(idx);
                         }
 
-                        unsafe {
-                            let meta = &*meta_ptr.add(ii);
+                        let missing = result.missing_mask;
+                        if missing != 0 {
+                            append_expand_candidates(
+                                &mut self.arena.expand_buf,
+                                idx,
+                                missing,
+                                result.live_mask,
+                            );
+                        }
 
-                            let missing = meta.missing_mask;
-                            if missing != 0 {
-                                let live_mask = *next_live_masks_ptr.add(ii);
-                                append_expand_candidates(
-                                    &mut self.arena.expand_buf,
-                                    idx,
-                                    missing,
-                                    live_mask,
-                                );
-                            }
-
-                            if !changed && !meta.has_live() {
-                                self.arena.prune_buf.push(idx);
-                            }
+                        if !result.changed && !result.has_live {
+                            self.arena.prune_buf.push(idx);
                         }
                     }
                 }};
@@ -868,7 +863,7 @@ impl TurboLife {
                             }
                         }
 
-                        let changed = unsafe {
+                        let result = unsafe {
                             $advance(
                                 current_ptr,
                                 next_ptr,
@@ -882,27 +877,22 @@ impl TurboLife {
                             )
                         };
 
-                        if changed {
+                        if result.changed {
                             self.arena.push_changed_from_kernel(idx);
                         }
 
-                        unsafe {
-                            let meta = &*meta_ptr.add(ii);
+                        let missing = result.missing_mask;
+                        if missing != 0 {
+                            append_expand_candidates(
+                                &mut self.arena.expand_buf,
+                                idx,
+                                missing,
+                                result.live_mask,
+                            );
+                        }
 
-                            let missing = meta.missing_mask;
-                            if missing != 0 {
-                                let live_mask = *next_live_masks_ptr.add(ii);
-                                append_expand_candidates(
-                                    &mut self.arena.expand_buf,
-                                    idx,
-                                    missing,
-                                    live_mask,
-                                );
-                            }
-
-                            if !changed && !meta.has_live() {
-                                self.arena.prune_buf.push(idx);
-                            }
+                        if !result.changed && !result.has_live {
+                            self.arena.prune_buf.push(idx);
                         }
                     }
                 }};
@@ -997,7 +987,7 @@ impl TurboLife {
                     prefetch_for_work_item!($i, $end);
                     let idx = unsafe { *active_ptr.get().add($i) };
                     let ii = idx.index();
-                    let changed = unsafe {
+                    let result = unsafe {
                         $advance(
                             current_ptr.get(),
                             next_ptr.get(),
@@ -1012,28 +1002,26 @@ impl TurboLife {
                     };
 
                     unsafe {
-                        let meta_snapshot = *meta_ptr.get().add(ii);
-                        if changed {
+                        if result.changed {
                             let meta = &mut *meta_ptr.get().add(ii);
                             debug_assert!(!meta.changed_tag());
                             meta.set_changed_tag(true);
                             ($scratch).changed.push(idx);
                         }
+                    }
 
-                        let missing = meta_snapshot.missing_mask;
-                        if missing != 0 {
-                            let live_mask = *next_live_masks_ptr.get().add(ii);
-                            append_expand_candidates(
-                                &mut ($scratch).expand,
-                                idx,
-                                missing,
-                                live_mask,
-                            );
-                        }
+                    let missing = result.missing_mask;
+                    if missing != 0 {
+                        append_expand_candidates(
+                            &mut ($scratch).expand,
+                            idx,
+                            missing,
+                            result.live_mask,
+                        );
+                    }
 
-                        if !changed && !meta_snapshot.has_live() {
-                            ($scratch).prune.push(idx);
-                        }
+                    if !result.changed && !result.has_live {
+                        ($scratch).prune.push(idx);
                     }
                 }};
             }

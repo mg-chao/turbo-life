@@ -13,6 +13,26 @@ pub enum KernelBackend {
     Avx2,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileAdvanceResult {
+    pub changed: bool,
+    pub has_live: bool,
+    pub missing_mask: u8,
+    pub live_mask: u8,
+}
+
+impl TileAdvanceResult {
+    #[inline(always)]
+    pub const fn new(changed: bool, has_live: bool, missing_mask: u8, live_mask: u8) -> Self {
+        Self {
+            changed,
+            has_live,
+            missing_mask,
+            live_mask,
+        }
+    }
+}
+
 #[inline(always)]
 fn full_add(a: u64, b: u64, c: u64) -> (u64, u64) {
     let sum = a ^ b ^ c;
@@ -198,18 +218,6 @@ pub fn advance_core_scalar(
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn avx2_set_u64x4_lane_order(
-    a0: u64,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-) -> std::arch::x86_64::__m256i {
-    use std::arch::x86_64::_mm256_set_epi64x;
-    unsafe { _mm256_set_epi64x(a3 as i64, a2 as i64, a1 as i64, a0 as i64) }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
 unsafe fn avx2_full_add(
     a: std::arch::x86_64::__m256i,
     b: std::arch::x86_64::__m256i,
@@ -234,6 +242,18 @@ unsafe fn avx2_half_add(
 ) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i) {
     use std::arch::x86_64::{_mm256_and_si256, _mm256_xor_si256};
     unsafe { (_mm256_xor_si256(a, b), _mm256_and_si256(a, b)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn avx2_set_u64x4_lane_order(
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::_mm256_set_epi64x;
+    unsafe { _mm256_set_epi64x(a3 as i64, a2 as i64, a1 as i64, a0 as i64) }
 }
 
 /// Build carry masks for 4 lanes from 4 ghost bits, placing each bit at `shift`.
@@ -473,14 +493,15 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
-) -> bool {
+) -> TileAdvanceResult {
     let nb = unsafe { &*neighbors_ptr.add(idx) };
     let current = unsafe { &(*current_ptr.add(idx)).0 };
     let next = unsafe { &mut (*next_ptr.add(idx)).0 };
     let meta = unsafe { &mut *meta_ptr.add(idx) };
+    let missing_mask = meta.missing_mask;
 
     if !meta.has_live() {
-        if meta.missing_mask == MISSING_ALL_NEIGHBORS {
+        if missing_mask == MISSING_ALL_NEIGHBORS {
             debug_assert!(tile_is_empty(current));
             unsafe {
                 std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
@@ -488,7 +509,7 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
                 *next_live_masks_ptr.add(idx) = 0;
             }
             meta.update_after_step(false, false);
-            return false;
+            return TileAdvanceResult::new(false, false, missing_mask, 0);
         }
 
         // Ultra-fast path: metadata says current tile is empty and halo has no
@@ -512,7 +533,7 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
                 *next_live_masks_ptr.add(idx) = 0;
             }
             meta.update_after_step(false, false);
-            return false;
+            return TileAdvanceResult::new(false, false, missing_mask, 0);
         }
     }
 
@@ -547,7 +568,7 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
 
     meta.update_after_step(changed, has_live);
 
-    changed
+    TileAdvanceResult::new(changed, has_live, missing_mask, border.live_mask)
 }
 
 #[inline(always)]
@@ -562,7 +583,7 @@ pub unsafe fn advance_tile_fused_scalar(
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
-) -> bool {
+) -> TileAdvanceResult {
     unsafe {
         advance_tile_fused_impl::<false>(
             current_ptr,
@@ -591,7 +612,7 @@ pub unsafe fn advance_tile_fused_avx2(
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
-) -> bool {
+) -> TileAdvanceResult {
     unsafe {
         advance_tile_fused_impl::<true>(
             current_ptr,
