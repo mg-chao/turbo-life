@@ -1,5 +1,6 @@
 use rayon::prelude::*;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use super::activity::{append_expand_candidates, finalize_prune_and_expand, rebuild_active_set};
@@ -63,6 +64,9 @@ const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
 const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
 const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 32_768;
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 4;
+const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 16;
+const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 512;
 
 static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
 static AUTO_KERNEL_BACKEND: OnceLock<KernelBackend> = OnceLock::new();
@@ -276,6 +280,16 @@ fn tuned_parallel_threads(active_len: usize, thread_count: usize) -> usize {
     effective.max(1)
 }
 
+#[inline]
+fn dynamic_parallel_chunk_size(active_len: usize, worker_count: usize) -> usize {
+    let workers = worker_count.max(1);
+    let target_chunks = workers
+        .saturating_mul(PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER)
+        .max(workers);
+    let size = active_len.div_ceil(target_chunks);
+    size.clamp(PARALLEL_DYNAMIC_CHUNK_MIN, PARALLEL_DYNAMIC_CHUNK_MAX)
+}
+
 /// Resolve the thread count from a config, falling back to auto-detect.
 fn resolve_thread_count(config: &TurboLifeConfig) -> usize {
     let mut threads = config.thread_count.unwrap_or_else(auto_pool_thread_count);
@@ -352,7 +366,7 @@ pub struct TurboLife {
     touched_bitmap: Vec<u64>,
     /// Direct-mapped tile result cache for kernel memoization.
     tile_cache: TileCache,
-    /// Per-worker scratch buffers used by the static parallel scheduler.
+    /// Per-worker scratch buffers reused by parallel kernel schedulers.
     worker_scratch: Vec<WorkerScratch>,
     /// Reusable touched-tile list for `set_cells`.
     set_cells_scratch: Vec<TileIdx>,
@@ -909,10 +923,10 @@ impl TurboLife {
                 }
             }
         } else {
-            // Parallel kernel compute:
-            // - Small/medium active sets keep the existing par_chunks collect path.
-            // - Very large active sets switch to a static contiguous scheduler with
-            //   per-worker scratch buffers and fused post-processing.
+            // Parallel kernel compute with a hybrid scheduler:
+            // - static contiguous slices for very large or reduced-worker runs
+            // - lock-free dynamic chunking for medium activity levels
+            // Both reuse per-worker scratch buffers to avoid collect/reduce churn.
             let active_set = &self.arena.active_set;
             let active_ptr = SendConstPtr::new(active_set.as_ptr());
             let current_ptr = SendConstPtr::new(current_vec.as_ptr());
@@ -922,100 +936,139 @@ impl TurboLife {
             let next_borders_ptr = SendPtr::new(next_borders_vec.as_mut_ptr());
             let borders_read_ptr = SendConstPtr::new(borders_read.as_ptr());
             let worker_count = effective_threads.min(active_len);
-
             let use_static_schedule =
                 active_len >= PARALLEL_STATIC_SCHEDULE_THRESHOLD || worker_count < thread_count;
+            self.prepare_worker_scratch(worker_count, active_len);
+            let scratch_ptr = SendPtr::new(self.worker_scratch.as_mut_ptr());
 
-            if use_static_schedule {
-                self.prepare_worker_scratch(worker_count, active_len);
-                let scratch_ptr = SendPtr::new(self.worker_scratch.as_mut_ptr());
-                let chunk_size = active_len.div_ceil(worker_count);
+            macro_rules! prefetch_for_work_item {
+                ($i:expr, $end:expr) => {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        use super::tile::NO_NEIGHBOR;
+                        use std::arch::x86_64::*;
 
-                macro_rules! prefetch_for_work_item {
-                    ($i:expr, $end:expr) => {
-                        #[cfg(target_arch = "x86_64")]
-                        unsafe {
-                            use super::tile::NO_NEIGHBOR;
-                            use std::arch::x86_64::*;
-
-                            if $i + 2 < $end {
-                                let far_ii = (*active_ptr.get().add($i + 2)).index();
-                                _mm_prefetch(
-                                    current_ptr.get().add(far_ii) as *const i8,
-                                    _MM_HINT_T1,
-                                );
-                                _mm_prefetch(next_ptr.get().add(far_ii) as *const i8, _MM_HINT_T1);
-                            }
-                            if $i + 1 < $end {
-                                let near_ii = (*active_ptr.get().add($i + 1)).index();
-                                _mm_prefetch(
-                                    current_ptr.get().add(near_ii) as *const i8,
-                                    _MM_HINT_T0,
-                                );
-                                _mm_prefetch(next_ptr.get().add(near_ii) as *const i8, _MM_HINT_T0);
-                                _mm_prefetch(
-                                    neighbors_ptr.get().add(near_ii) as *const i8,
-                                    _MM_HINT_T0,
-                                );
-                                let nb = &*neighbors_ptr.get().add(near_ii);
-                                for &ni in nb.iter() {
-                                    if ni != NO_NEIGHBOR {
-                                        _mm_prefetch(
-                                            borders_read_ptr.get().add(ni as usize) as *const i8,
-                                            _MM_HINT_T0,
-                                        );
-                                    }
+                        if $i + 2 < $end {
+                            let far_ii = (*active_ptr.get().add($i + 2)).index();
+                            _mm_prefetch(current_ptr.get().add(far_ii) as *const i8, _MM_HINT_T1);
+                            _mm_prefetch(next_ptr.get().add(far_ii) as *const i8, _MM_HINT_T1);
+                        }
+                        if $i + 1 < $end {
+                            let near_ii = (*active_ptr.get().add($i + 1)).index();
+                            _mm_prefetch(current_ptr.get().add(near_ii) as *const i8, _MM_HINT_T0);
+                            _mm_prefetch(next_ptr.get().add(near_ii) as *const i8, _MM_HINT_T0);
+                            _mm_prefetch(
+                                neighbors_ptr.get().add(near_ii) as *const i8,
+                                _MM_HINT_T0,
+                            );
+                            let nb = &*neighbors_ptr.get().add(near_ii);
+                            for &ni in nb.iter() {
+                                if ni != NO_NEIGHBOR {
+                                    _mm_prefetch(
+                                        borders_read_ptr.get().add(ni as usize) as *const i8,
+                                        _MM_HINT_T0,
+                                    );
                                 }
                             }
                         }
-                    };
-                }
+                    }
+                };
+            }
 
-                macro_rules! parallel_kernel_fused {
+            macro_rules! process_work_item {
+                ($advance:path, $scratch:expr, $i:expr, $end:expr) => {{
+                    prefetch_for_work_item!($i, $end);
+                    let idx = unsafe { *active_ptr.get().add($i) };
+                    let ii = idx.index();
+                    let changed = unsafe {
+                        $advance(
+                            current_ptr.get(),
+                            next_ptr.get(),
+                            meta_ptr.get(),
+                            next_borders_ptr.get(),
+                            borders_read_ptr.get(),
+                            neighbors_ptr.get(),
+                            ii,
+                        )
+                    };
+
+                    unsafe {
+                        let meta_snapshot = *meta_ptr.get().add(ii);
+                        if changed {
+                            let meta = &mut *meta_ptr.get().add(ii);
+                            debug_assert!(!meta.in_changed_list());
+                            meta.set_in_changed_list(true);
+                            ($scratch).changed.push(idx);
+                        }
+
+                        let missing = meta_snapshot.missing_mask;
+                        if missing != 0 {
+                            let live_mask = (*next_borders_ptr.get().add(ii)).live_mask;
+                            append_expand_candidates(
+                                &mut ($scratch).expand,
+                                idx,
+                                missing,
+                                live_mask,
+                            );
+                        }
+
+                        if !changed && !meta_snapshot.has_live() {
+                            ($scratch).prune.push(idx);
+                        }
+                    }
+                }};
+            }
+
+            macro_rules! parallel_kernel_static {
+                ($advance:path, $chunk_size:expr) => {{
+                    (0..worker_count).into_par_iter().for_each(|worker_id| {
+                        let start = worker_id.saturating_mul($chunk_size);
+                        if start >= active_len {
+                            return;
+                        }
+                        let end = (start + $chunk_size).min(active_len);
+                        let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
+                        for i in start..end {
+                            process_work_item!($advance, scratch, i, end);
+                        }
+                    });
+                }};
+            }
+
+            if use_static_schedule {
+                let chunk_size = active_len.div_ceil(worker_count);
+
+                match backend {
+                    KernelBackend::Scalar => {
+                        parallel_kernel_static!(advance_tile_fused_scalar, chunk_size)
+                    }
+                    KernelBackend::Avx2 => {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            parallel_kernel_static!(advance_tile_fused_avx2, chunk_size)
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            parallel_kernel_static!(advance_tile_fused_scalar, chunk_size)
+                        }
+                    }
+                }
+            } else {
+                let chunk_size = dynamic_parallel_chunk_size(active_len, worker_count);
+                let cursor = AtomicUsize::new(0);
+
+                macro_rules! parallel_kernel_lockfree {
                     ($advance:path) => {{
                         (0..worker_count).into_par_iter().for_each(|worker_id| {
-                            let start = worker_id.saturating_mul(chunk_size);
-                            if start >= active_len {
-                                return;
-                            }
-                            let end = (start + chunk_size).min(active_len);
                             let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
-                            for i in start..end {
-                                prefetch_for_work_item!(i, end);
-                                let idx = unsafe { *active_ptr.get().add(i) };
-                                let ii = idx.index();
-                                let changed = unsafe {
-                                    $advance(
-                                        current_ptr.get(),
-                                        next_ptr.get(),
-                                        meta_ptr.get(),
-                                        next_borders_ptr.get(),
-                                        borders_read_ptr.get(),
-                                        neighbors_ptr.get(),
-                                        ii,
-                                    )
-                                };
-
-                                unsafe {
-                                    let meta = &*meta_ptr.get().add(ii);
-                                    if changed {
-                                        scratch.changed.push(idx);
-                                    }
-
-                                    let missing = meta.missing_mask;
-                                    if missing != 0 {
-                                        let live_mask = (*next_borders_ptr.get().add(ii)).live_mask;
-                                        append_expand_candidates(
-                                            &mut scratch.expand,
-                                            idx,
-                                            missing,
-                                            live_mask,
-                                        );
-                                    }
-
-                                    if !changed && !meta.has_live() {
-                                        scratch.prune.push(idx);
-                                    }
+                            loop {
+                                let start = cursor.fetch_add(chunk_size, Ordering::Relaxed);
+                                if start >= active_len {
+                                    break;
+                                }
+                                let end = (start + chunk_size).min(active_len);
+                                for i in start..end {
+                                    process_work_item!($advance, scratch, i, end);
                                 }
                             }
                         });
@@ -1023,174 +1076,43 @@ impl TurboLife {
                 }
 
                 match backend {
-                    KernelBackend::Scalar => parallel_kernel_fused!(advance_tile_fused_scalar),
+                    KernelBackend::Scalar => parallel_kernel_lockfree!(advance_tile_fused_scalar),
                     KernelBackend::Avx2 => {
                         #[cfg(target_arch = "x86_64")]
                         {
-                            parallel_kernel_fused!(advance_tile_fused_avx2)
+                            parallel_kernel_lockfree!(advance_tile_fused_avx2)
                         }
                         #[cfg(not(target_arch = "x86_64"))]
                         {
-                            parallel_kernel_fused!(advance_tile_fused_scalar)
+                            parallel_kernel_lockfree!(advance_tile_fused_scalar)
                         }
                     }
                 }
+            }
 
-                let mut reserve_expand = 0usize;
-                let mut reserve_prune = 0usize;
-                let mut reserve_changed = 0usize;
-                for scratch in self.worker_scratch.iter().take(worker_count) {
-                    reserve_expand = reserve_expand.saturating_add(scratch.expand.len());
-                    reserve_prune = reserve_prune.saturating_add(scratch.prune.len());
-                    reserve_changed = reserve_changed.saturating_add(scratch.changed.len());
-                }
-                self.arena.expand_buf.reserve(reserve_expand);
-                self.arena.prune_buf.reserve(reserve_prune);
-                self.arena.changed_list.reserve(reserve_changed);
+            let mut reserve_expand = 0usize;
+            let mut reserve_prune = 0usize;
+            let mut reserve_changed = 0usize;
+            for scratch in self.worker_scratch.iter().take(worker_count) {
+                reserve_expand = reserve_expand.saturating_add(scratch.expand.len());
+                reserve_prune = reserve_prune.saturating_add(scratch.prune.len());
+                reserve_changed = reserve_changed.saturating_add(scratch.changed.len());
+            }
+            self.arena.expand_buf.reserve(reserve_expand);
+            self.arena.prune_buf.reserve(reserve_prune);
+            self.arena.changed_list.reserve(reserve_changed);
 
-                for worker_id in 0..worker_count {
-                    let scratch = &mut self.worker_scratch[worker_id];
-                    self.arena.expand_buf.append(&mut scratch.expand);
-                    self.arena.prune_buf.append(&mut scratch.prune);
-                }
-
-                for worker_id in 0..worker_count {
-                    let scratch = &mut self.worker_scratch[worker_id];
-                    for idx in scratch.changed.drain(..) {
-                        self.arena.push_changed_from_kernel(idx);
-                    }
-                }
-            } else {
-                let chunk_size = active_len.div_ceil(worker_count);
-
-                macro_rules! parallel_loop_collect {
-                    ($advance:path) => {{
-                        active_set
-                            .par_chunks(chunk_size)
-                            .fold(
-                                || {
-                                    (
-                                        Vec::<TileIdx>::new(),
-                                        Vec::<u64>::new(),
-                                        Vec::<TileIdx>::new(),
-                                    )
-                                },
-                                move |mut acc, chunk| {
-                                    for (ci, &idx) in chunk.iter().enumerate() {
-                                        #[cfg(target_arch = "x86_64")]
-                                        unsafe {
-                                            use super::tile::NO_NEIGHBOR;
-                                            use std::arch::x86_64::*;
-                                            if ci + 2 < chunk.len() {
-                                                let far_ii = chunk[ci + 2].index();
-                                                _mm_prefetch(
-                                                    current_ptr.get().add(far_ii) as *const i8,
-                                                    _MM_HINT_T1,
-                                                );
-                                                _mm_prefetch(
-                                                    next_ptr.get().add(far_ii) as *const i8,
-                                                    _MM_HINT_T1,
-                                                );
-                                            }
-                                            if ci + 1 < chunk.len() {
-                                                let near_ii = chunk[ci + 1].index();
-                                                _mm_prefetch(
-                                                    current_ptr.get().add(near_ii) as *const i8,
-                                                    _MM_HINT_T0,
-                                                );
-                                                _mm_prefetch(
-                                                    next_ptr.get().add(near_ii) as *const i8,
-                                                    _MM_HINT_T0,
-                                                );
-                                                _mm_prefetch(
-                                                    neighbors_ptr.get().add(near_ii) as *const i8,
-                                                    _MM_HINT_T0,
-                                                );
-                                                let nb = &*neighbors_ptr.get().add(near_ii);
-                                                for &ni in nb.iter() {
-                                                    if ni != NO_NEIGHBOR {
-                                                        _mm_prefetch(
-                                                            borders_read_ptr.get().add(ni as usize)
-                                                                as *const i8,
-                                                            _MM_HINT_T0,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        let ii = idx.index();
-                                        let changed = unsafe {
-                                            $advance(
-                                                current_ptr.get(),
-                                                next_ptr.get(),
-                                                meta_ptr.get(),
-                                                next_borders_ptr.get(),
-                                                borders_read_ptr.get(),
-                                                neighbors_ptr.get(),
-                                                ii,
-                                            )
-                                        };
-
-                                        unsafe {
-                                            let meta = &*meta_ptr.get().add(ii);
-                                            let missing = meta.missing_mask;
-                                            if missing != 0 {
-                                                let live_mask =
-                                                    (*next_borders_ptr.get().add(ii)).live_mask;
-                                                append_expand_candidates(
-                                                    &mut acc.1, idx, missing, live_mask,
-                                                );
-                                            }
-                                            if !changed && !meta.has_live() {
-                                                acc.2.push(idx);
-                                            }
-                                        }
-                                        if changed {
-                                            acc.0.push(idx);
-                                        }
-                                    }
-                                    acc
-                                },
-                            )
-                            .reduce(
-                                || {
-                                    (
-                                        Vec::<TileIdx>::new(),
-                                        Vec::<u64>::new(),
-                                        Vec::<TileIdx>::new(),
-                                    )
-                                },
-                                |mut left, mut right| {
-                                    left.0.append(&mut right.0);
-                                    left.1.append(&mut right.1);
-                                    left.2.append(&mut right.2);
-                                    left
-                                },
-                            )
-                    }};
-                }
-
-                let (mut changed_all, mut expand_all, mut prune_all) = match backend {
-                    KernelBackend::Scalar => parallel_loop_collect!(advance_tile_fused_scalar),
-                    KernelBackend::Avx2 => {
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            parallel_loop_collect!(advance_tile_fused_avx2)
-                        }
-                        #[cfg(not(target_arch = "x86_64"))]
-                        {
-                            parallel_loop_collect!(advance_tile_fused_scalar)
-                        }
-                    }
-                };
-
-                self.arena.expand_buf.append(&mut expand_all);
-                self.arena.prune_buf.append(&mut prune_all);
-
-                for idx in changed_all.drain(..) {
-                    self.arena.push_changed_from_kernel(idx);
-                }
+            for worker_id in 0..worker_count {
+                let scratch = &mut self.worker_scratch[worker_id];
+                self.arena.expand_buf.append(&mut scratch.expand);
+                self.arena.prune_buf.append(&mut scratch.prune);
+                debug_assert!(
+                    scratch
+                        .changed
+                        .iter()
+                        .all(|idx| self.arena.meta[idx.index()].in_changed_list())
+                );
+                self.arena.changed_list.append(&mut scratch.changed);
             }
         }
 
@@ -1320,7 +1242,54 @@ impl TurboLife {
 
 #[cfg(test)]
 mod tests {
-    use super::{TurboLife, auto_pool_thread_count_for_physical, memory_parallel_cap};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    use rand::{Rng, SeedableRng};
+
+    use super::{
+        KernelBackend, PARALLEL_KERNEL_MIN_ACTIVE, TILE_SIZE_I64, TurboLife, TurboLifeConfig,
+        auto_pool_thread_count_for_physical, memory_parallel_cap,
+    };
+
+    const PARALLEL_TEST_TILE_GRID: i64 = 12;
+    const PARALLEL_TEST_CELLS_PER_TILE: usize = 16;
+
+    fn seed_parallel_scheduler_fixture(engine: &mut TurboLife) {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xA55A_CE11_1234_5678);
+        let mut cells = Vec::new();
+        for ty in 0..PARALLEL_TEST_TILE_GRID {
+            for tx in 0..PARALLEL_TEST_TILE_GRID {
+                let base_x = tx * TILE_SIZE_I64;
+                let base_y = ty * TILE_SIZE_I64;
+                for _ in 0..PARALLEL_TEST_CELLS_PER_TILE {
+                    let local_x = rng.random_range(0i64..TILE_SIZE_I64);
+                    let local_y = rng.random_range(0i64..TILE_SIZE_I64);
+                    cells.push((base_x + local_x, base_y + local_y));
+                }
+            }
+        }
+        engine.set_cells_alive(cells);
+    }
+
+    fn run_parallel_scheduler_fixture(threads: usize, steps: u64) -> (u64, u64) {
+        let mut engine = TurboLife::with_config(
+            TurboLifeConfig::default()
+                .thread_count(threads)
+                .kernel(KernelBackend::Scalar),
+        );
+        seed_parallel_scheduler_fixture(&mut engine);
+        assert!(engine.arena.changed_list.len() >= PARALLEL_KERNEL_MIN_ACTIVE);
+
+        engine.step_n(steps);
+        let pop = engine.population();
+        let mut hasher = DefaultHasher::new();
+        engine.for_each_live(|x, y| {
+            x.hash(&mut hasher);
+            y.hash(&mut hasher);
+        });
+        (pop, hasher.finish())
+    }
 
     #[test]
     fn memory_parallel_cap_stays_monotonic() {
@@ -1394,5 +1363,19 @@ mod tests {
             changed_after, changed_before,
             "set_cell should not duplicate tiles already queued in changed_list"
         );
+    }
+
+    #[test]
+    fn parallel_dynamic_scheduler_matches_single_thread() {
+        let single = run_parallel_scheduler_fixture(1, 4);
+        let dynamic = run_parallel_scheduler_fixture(2, 4);
+        assert_eq!(single, dynamic);
+    }
+
+    #[test]
+    fn parallel_static_scheduler_matches_single_thread() {
+        let single = run_parallel_scheduler_fixture(1, 4);
+        let static_sched = run_parallel_scheduler_fixture(4, 4);
+        assert_eq!(single, static_sched);
     }
 }
