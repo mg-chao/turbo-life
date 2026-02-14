@@ -499,15 +499,6 @@ impl TileArena {
 
         let coord = self.coords[i];
         self.coord_to_idx.remove(coord.0, coord.1);
-        // Use ptr::write_bytes for fast zeroing of cell buffers.
-        unsafe {
-            std::ptr::write_bytes(self.cell_bufs[0].as_mut_ptr().add(i), 0, 1);
-            std::ptr::write_bytes(self.cell_bufs[1].as_mut_ptr().add(i), 0, 1);
-        }
-        self.borders[0][i] = BorderData::default();
-        self.borders[1][i] = BorderData::default();
-        self.border_live_masks[0][i] = 0;
-        self.border_live_masks[1][i] = 0;
         self.meta[i] = TileMeta::released();
         self.free_list.push(idx);
         self.occupied_count = self.occupied_count.saturating_sub(1);
@@ -530,6 +521,7 @@ impl TileArena {
 #[cfg(test)]
 mod tests {
     use super::TileArena;
+    use crate::turbolife::tile::BorderData;
 
     #[test]
     fn mark_changed_dedupes_after_kernel_queue_becomes_unsynced() {
@@ -587,5 +579,39 @@ mod tests {
 
         assert_eq!(recycled, idx);
         assert_eq!(arena.active_tags[recycled.index()], 0);
+    }
+
+    #[test]
+    fn recycled_slot_resets_buffers_and_border_cache() {
+        let mut arena = TileArena::new();
+        let idx = arena.allocate((0, 0));
+        let i = idx.index();
+
+        arena.cell_bufs[0][i].0[0] = u64::MAX;
+        arena.cell_bufs[1][i].0[1] = u64::MAX;
+        arena.borders[0][i] = BorderData::from_edges(1, 2, 3, 4);
+        arena.borders[1][i] = BorderData::from_edges(5, 6, 7, 8);
+        arena.border_live_masks[0][i] = 0xFF;
+        arena.border_live_masks[1][i] = 0xFF;
+
+        arena.release(idx);
+        let recycled = arena.allocate((1, 0));
+        let ri = recycled.index();
+
+        assert_eq!(recycled, idx);
+        assert!(arena.cell_bufs[0][ri].0.iter().all(|&row| row == 0));
+        assert!(arena.cell_bufs[1][ri].0.iter().all(|&row| row == 0));
+        let border0 = arena.borders[0][ri];
+        assert_eq!(border0.north, 0);
+        assert_eq!(border0.south, 0);
+        assert_eq!(border0.west, 0);
+        assert_eq!(border0.east, 0);
+        let border1 = arena.borders[1][ri];
+        assert_eq!(border1.north, 0);
+        assert_eq!(border1.south, 0);
+        assert_eq!(border1.west, 0);
+        assert_eq!(border1.east, 0);
+        assert_eq!(arena.border_live_masks[0][ri], 0);
+        assert_eq!(arena.border_live_masks[1][ri], 0);
     }
 }
