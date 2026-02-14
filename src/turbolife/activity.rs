@@ -214,8 +214,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         && changed_count.saturating_mul(100) >= arena.occupied_count.saturating_mul(95);
     if dense_rebuild {
         for &idx in &arena.changed_scratch {
-            let meta = &mut arena.meta[idx.index()];
-            meta.set_in_changed_list(false);
+            arena.meta[idx.index()].set_changed_tag(false);
         }
         arena.active_set.reserve(arena.occupied_count);
         if arena.free_list.is_empty() && arena.occupied_count + 1 == arena.meta.len() {
@@ -255,7 +254,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         // SAFETY: i < meta_len guaranteed by arena invariants (idx came from changed_list).
         unsafe {
             let m = &mut *meta_ptr.add(i);
-            m.set_in_changed_list(false);
+            m.set_changed_tag(false);
             if m.occupied() && m.active_epoch != epoch {
                 m.active_epoch = epoch;
                 arena.active_set.push(idx);
@@ -442,5 +441,19 @@ mod tests {
         assert_eq!(arena.active_epoch, 1);
         assert_eq!(arena.meta[idx.index()].active_epoch, 1);
         assert_eq!(arena.active_set, vec![idx]);
+    }
+
+    #[test]
+    fn rebuild_active_set_keeps_other_tiles_markable() {
+        let mut arena = TileArena::new();
+        let first = arena.allocate((0, 0));
+        let second = arena.allocate((8, 8));
+
+        arena.mark_changed(first);
+        rebuild_active_set(&mut arena);
+        assert!(arena.changed_list.is_empty());
+
+        arena.mark_changed(second);
+        assert_eq!(arena.changed_list, vec![second]);
     }
 }

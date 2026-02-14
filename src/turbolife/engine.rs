@@ -996,8 +996,8 @@ impl TurboLife {
                         let meta_snapshot = *meta_ptr.get().add(ii);
                         if changed {
                             let meta = &mut *meta_ptr.get().add(ii);
-                            debug_assert!(!meta.in_changed_list());
-                            meta.set_in_changed_list(true);
+                            debug_assert!(!meta.changed_tag());
+                            meta.set_changed_tag(true);
                             ($scratch).changed.push(idx);
                         }
 
@@ -1110,7 +1110,7 @@ impl TurboLife {
                     scratch
                         .changed
                         .iter()
-                        .all(|idx| self.arena.meta[idx.index()].in_changed_list())
+                        .all(|idx| self.arena.meta[idx.index()].changed_tag())
                 );
                 self.arena.changed_list.append(&mut scratch.changed);
             }
@@ -1362,6 +1362,28 @@ mod tests {
         assert_eq!(
             changed_after, changed_before,
             "set_cell should not duplicate tiles already queued in changed_list"
+        );
+    }
+
+    #[test]
+    fn set_cell_requeues_stable_tile_after_unrelated_steps() {
+        let mut engine = TurboLife::new();
+        // Stable block in tile (0, 0).
+        engine.set_cells_alive([(0, 0), (1, 0), (0, 1), (1, 1)]);
+        // Distant blinker keeps subsequent generations non-empty.
+        engine.set_cells_alive([(256, 256), (257, 256), (258, 256)]);
+
+        engine.step();
+        engine.step();
+
+        let changed_before = engine.arena.changed_list.len();
+        engine.set_cell(0, 0, false);
+        let changed_after = engine.arena.changed_list.len();
+
+        assert_eq!(
+            changed_after,
+            changed_before + 1,
+            "set_cell should requeue a stable tile even after unrelated steps"
         );
     }
 

@@ -198,8 +198,8 @@ pub struct GhostZone {
 // ── TileMeta with packed flags ──────────────────────────────────────────
 
 const FLAG_OCCUPIED: u8 = 1 << 0;
-const FLAG_IN_CHANGED_LIST: u8 = 1 << 1;
-const FLAG_HAS_LIVE: u8 = 1 << 2;
+const FLAG_HAS_LIVE: u8 = 1 << 1;
+const FLAG_CHANGED_TAG: u8 = 1 << 2;
 pub const MISSING_ALL_NEIGHBORS: u8 = 0xFF;
 
 /// Per-tile metadata with flags packed into a single byte.
@@ -226,12 +226,12 @@ impl TileMeta {
         self.flags & FLAG_OCCUPIED != 0
     }
     #[inline(always)]
-    pub fn in_changed_list(self) -> bool {
-        self.flags & FLAG_IN_CHANGED_LIST != 0
-    }
-    #[inline(always)]
     pub fn has_live(self) -> bool {
         self.flags & FLAG_HAS_LIVE != 0
+    }
+    #[inline(always)]
+    pub fn changed_tag(self) -> bool {
+        self.flags & FLAG_CHANGED_TAG != 0
     }
 
     #[inline(always)]
@@ -240,12 +240,12 @@ impl TileMeta {
         self.set_flag(FLAG_OCCUPIED, v);
     }
     #[inline(always)]
-    pub fn set_in_changed_list(&mut self, v: bool) {
-        self.set_flag(FLAG_IN_CHANGED_LIST, v);
-    }
-    #[inline(always)]
     pub fn set_has_live(&mut self, v: bool) {
         self.set_flag(FLAG_HAS_LIVE, v);
+    }
+    #[inline(always)]
+    pub fn set_changed_tag(&mut self, v: bool) {
+        self.set_flag(FLAG_CHANGED_TAG, v);
     }
 
     #[inline(always)]
