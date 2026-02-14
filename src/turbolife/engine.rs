@@ -64,7 +64,8 @@ const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
 const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
 const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 32_768;
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 4;
+// Fewer, larger dynamic chunks reduce scheduler atomics and scratch merge churn.
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 2;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 16;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 512;
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
@@ -131,6 +132,13 @@ struct WorkerScratch {
 
 impl WorkerScratch {
     #[inline]
+    fn reserve_capacity<T>(buf: &mut Vec<T>, target: usize) {
+        if buf.capacity() < target {
+            buf.reserve(target.saturating_sub(buf.len()));
+        }
+    }
+
+    #[inline]
     fn clear(&mut self) {
         self.changed.clear();
         self.expand.clear();
@@ -139,16 +147,10 @@ impl WorkerScratch {
 
     #[inline]
     fn reserve_for_chunk(&mut self, chunk_len: usize) {
-        if self.changed.capacity() < chunk_len {
-            self.changed.reserve(chunk_len - self.changed.capacity());
-        }
-        if self.prune.capacity() < chunk_len {
-            self.prune.reserve(chunk_len - self.prune.capacity());
-        }
-        let expand_target = chunk_len.saturating_mul(2);
-        if self.expand.capacity() < expand_target {
-            self.expand.reserve(expand_target - self.expand.capacity());
-        }
+        Self::reserve_capacity(&mut self.changed, chunk_len);
+        Self::reserve_capacity(&mut self.prune, chunk_len);
+        let expand_target = chunk_len.saturating_mul(3);
+        Self::reserve_capacity(&mut self.expand, expand_target);
     }
 }
 
@@ -1409,6 +1411,34 @@ mod tests {
     #[test]
     fn worker_scratch_is_cacheline_aligned() {
         assert_eq!(std::mem::align_of::<super::WorkerScratch>(), 64);
+    }
+
+    #[test]
+    fn worker_scratch_reserve_for_chunk_reaches_requested_capacity() {
+        let mut scratch = super::WorkerScratch::default();
+        scratch.reserve_for_chunk(8);
+
+        let chunk_target = scratch.changed.capacity() + 1;
+        scratch.reserve_for_chunk(chunk_target);
+        assert!(
+            scratch.changed.capacity() >= chunk_target,
+            "changed capacity {} < chunk target {chunk_target}",
+            scratch.changed.capacity()
+        );
+        assert!(
+            scratch.prune.capacity() >= chunk_target,
+            "prune capacity {} < chunk target {chunk_target}",
+            scratch.prune.capacity()
+        );
+
+        let expand_chunk_target = scratch.expand.capacity().div_ceil(3) + 1;
+        let expand_target = expand_chunk_target.saturating_mul(3);
+        scratch.reserve_for_chunk(expand_chunk_target);
+        assert!(
+            scratch.expand.capacity() >= expand_target,
+            "expand capacity {} < expand target {expand_target}",
+            scratch.expand.capacity()
+        );
     }
 
     #[test]
