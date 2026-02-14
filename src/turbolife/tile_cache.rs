@@ -20,6 +20,7 @@ struct CacheEntry {
     border: BorderData,
     changed: bool,
     has_live: bool,
+    live_mask: u8,
 }
 
 impl CacheEntry {
@@ -43,11 +44,10 @@ impl CacheEntry {
             south: 0,
             west: 0,
             east: 0,
-            corners: 0,
-            live_mask: 0,
         },
         changed: false,
         has_live: false,
+        live_mask: 0,
     };
 }
 
@@ -297,20 +297,21 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
                     TILE_SIZE,
                 );
                 *next_borders_ptr.add(idx) = entry.border;
-                *next_live_masks_ptr.add(idx) = entry.border.live_mask;
+                *next_live_masks_ptr.add(idx) = entry.live_mask;
             }
             let changed = entry.changed;
             let has_live = entry.has_live;
-            let live_mask = entry.border.live_mask;
+            let live_mask = entry.live_mask;
             meta.update_after_step(changed, has_live);
             cr.record_hit();
             return TileAdvanceResult::new(changed, has_live, missing_mask, live_mask);
         }
         let (changed, border, has_live) =
             unsafe { advance_core_const::<USE_AVX2>(current, next, &ghost) };
+        let live_mask = border.live_mask();
         unsafe {
             *next_borders_ptr.add(idx) = border;
-            *next_live_masks_ptr.add(idx) = border.live_mask;
+            *next_live_masks_ptr.add(idx) = live_mask;
         }
         meta.update_after_step(changed, has_live);
         let em = unsafe { cr.entries.get_unchecked_mut(slot) };
@@ -326,19 +327,21 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
         em.border = border;
         em.changed = changed;
         em.has_live = has_live;
+        em.live_mask = live_mask;
         cr.record_miss();
-        return TileAdvanceResult::new(changed, has_live, missing_mask, border.live_mask);
+        return TileAdvanceResult::new(changed, has_live, missing_mask, live_mask);
     }
 
     // Cache disabled path.
     let (changed, border, has_live) =
         unsafe { advance_core_const::<USE_AVX2>(current, next, &ghost) };
+    let live_mask = border.live_mask();
     unsafe {
         *next_borders_ptr.add(idx) = border;
-        *next_live_masks_ptr.add(idx) = border.live_mask;
+        *next_live_masks_ptr.add(idx) = live_mask;
     }
     meta.update_after_step(changed, has_live);
-    TileAdvanceResult::new(changed, has_live, missing_mask, border.live_mask)
+    TileAdvanceResult::new(changed, has_live, missing_mask, live_mask)
 }
 
 /// # Safety

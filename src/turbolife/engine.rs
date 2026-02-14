@@ -168,7 +168,7 @@ fn benchmark_backend(backend: KernelBackend) -> u128 {
             ^ border.south
             ^ border.west
             ^ border.east
-            ^ border.corners as u64
+            ^ border.live_mask() as u64
             ^ changed as u64
             ^ has_live as u64;
 
@@ -553,24 +553,6 @@ impl TurboLife {
                 let row_bit = 1u64 << local_y;
                 border.east = (border.east & !row_bit) | (((row_after >> 63) & 1) << local_y);
             }
-
-            let corner_mask = match (local_x, local_y) {
-                (0, y) if y == tile::TILE_SIZE - 1 => tile::BorderData::CORNER_NW,
-                (x, y) if x == tile::TILE_SIZE - 1 && y == tile::TILE_SIZE - 1 => {
-                    tile::BorderData::CORNER_NE
-                }
-                (0, 0) => tile::BorderData::CORNER_SW,
-                (x, 0) if x == tile::TILE_SIZE - 1 => tile::BorderData::CORNER_SE,
-                _ => 0,
-            };
-            if corner_mask != 0 {
-                if alive {
-                    border.corners |= corner_mask;
-                } else {
-                    border.corners &= !corner_mask;
-                }
-            }
-            border.refresh_live_mask();
         }
         self.arena.sync_current_border_live_mask(idx);
 
@@ -1309,7 +1291,7 @@ mod tests {
             for i in 0..engine.arena.borders[phase].len() {
                 assert_eq!(
                     engine.arena.border_live_masks[phase][i],
-                    engine.arena.borders[phase][i].live_mask,
+                    engine.arena.borders[phase][i].live_mask(),
                     "phase={phase} idx={i}"
                 );
             }

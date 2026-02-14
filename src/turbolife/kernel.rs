@@ -55,14 +55,6 @@ fn east_neighbor_plane(word: u64, ghost_e: u64) -> u64 {
     (word >> 1) | (ghost_e << 63)
 }
 
-#[inline(always)]
-fn corners_from_rows(north: u64, south: u64) -> u8 {
-    ((north & 1 != 0) as u8)
-        | (((north >> 63 != 0) as u8) << 1)
-        | (((south & 1 != 0) as u8) << 2)
-        | (((south >> 63 != 0) as u8) << 3)
-}
-
 const LIVE_N: u8 = 1 << 0;
 const LIVE_S: u8 = 1 << 1;
 const LIVE_W: u8 = 1 << 2;
@@ -230,9 +222,7 @@ pub fn advance_core_scalar(
 
     let north_row = next[TILE_SIZE - 1];
     let south_row = next[0];
-    let corners = corners_from_rows(north_row, south_row);
-
-    let border = BorderData::from_parts(north_row, south_row, border_west, border_east, corners);
+    let border = BorderData::from_edges(north_row, south_row, border_west, border_east);
 
     (changed, border, has_live)
 }
@@ -450,16 +440,7 @@ pub unsafe fn advance_core_avx2(
         unsafe { _mm256_loadu_si256(current_ptr.add(last_base - 1) as *const __m256i) };
     let next_rows_last = process_chunk!(last_base, row_above_last, row_self_last, row_below_last);
     let border_north = _mm256_extract_epi64(next_rows_last, 3) as u64;
-
-    let corners = corners_from_rows(border_north, border_south);
-
-    let border = BorderData::from_parts(
-        border_north,
-        border_south,
-        border_west,
-        border_east,
-        corners,
-    );
+    let border = BorderData::from_edges(border_north, border_south, border_west, border_east);
 
     let changed = _mm256_testz_si256(diff_acc, diff_acc) == 0;
     let has_live = _mm256_testz_si256(live_acc, live_acc) == 0;
@@ -588,15 +569,16 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
 
     let (changed, border, has_live) =
         unsafe { advance_core_const::<USE_AVX2>(current, next, &ghost) };
+    let live_mask = border.live_mask();
 
     unsafe {
         *next_borders_ptr.add(idx) = border;
-        *next_live_masks_ptr.add(idx) = border.live_mask;
+        *next_live_masks_ptr.add(idx) = live_mask;
     }
 
     meta.update_after_step(changed, has_live);
 
-    TileAdvanceResult::new(changed, has_live, missing_mask, border.live_mask)
+    TileAdvanceResult::new(changed, has_live, missing_mask, live_mask)
 }
 
 #[inline(always)]
@@ -696,9 +678,8 @@ pub unsafe fn advance_tile_split(
 #[cfg(test)]
 mod tests {
     use super::{
-        BorderData, GhostZone, TILE_SIZE, advance_core_scalar, corners_from_rows, ghost_bit,
-        ghost_is_empty, ghost_is_empty_from_live_masks, ghost_is_empty_from_live_masks_ptr,
-        tile_is_empty,
+        BorderData, GhostZone, TILE_SIZE, advance_core_scalar, ghost_bit, ghost_is_empty,
+        ghost_is_empty_from_live_masks, ghost_is_empty_from_live_masks_ptr, tile_is_empty,
     };
 
     #[cfg(target_arch = "x86_64")]
@@ -749,21 +730,7 @@ mod tests {
         assert_eq!(border.south, 0);
         assert_eq!(border.west, 0);
         assert_eq!(border.east, 0);
-        assert_eq!(border.corners, 0);
-        assert_eq!(border.live_mask, 0);
-    }
-
-    #[test]
-    fn corners_from_rows_matches_corner_flags() {
-        let corners = corners_from_rows(1 | (1u64 << 63), 1 | (1u64 << 63));
-        assert_eq!(
-            corners,
-            BorderData::CORNER_NW
-                | BorderData::CORNER_NE
-                | BorderData::CORNER_SW
-                | BorderData::CORNER_SE
-        );
-        assert_eq!(corners_from_rows(0, 0), 0);
+        assert_eq!(border.live_mask(), 0);
     }
 
     #[test]
@@ -785,48 +752,24 @@ mod tests {
         for _ in 0..2048 {
             let ghost = random_ghost(&mut rng);
 
-            let north = BorderData::from_parts(0, ghost.north, 0, 0, 0);
-            let south = BorderData::from_parts(ghost.south, 0, 0, 0, 0);
-            let west = BorderData::from_parts(0, 0, 0, ghost.west, 0);
-            let east = BorderData::from_parts(0, 0, ghost.east, 0, 0);
-            let nw = BorderData::from_parts(
-                0,
-                0,
-                0,
-                0,
-                if ghost.nw { BorderData::CORNER_SE } else { 0 },
-            );
-            let ne = BorderData::from_parts(
-                0,
-                0,
-                0,
-                0,
-                if ghost.ne { BorderData::CORNER_SW } else { 0 },
-            );
-            let sw = BorderData::from_parts(
-                0,
-                0,
-                0,
-                0,
-                if ghost.sw { BorderData::CORNER_NE } else { 0 },
-            );
-            let se = BorderData::from_parts(
-                0,
-                0,
-                0,
-                0,
-                if ghost.se { BorderData::CORNER_NW } else { 0 },
-            );
+            let north = BorderData::from_edges(0, ghost.north, 0, 0);
+            let south = BorderData::from_edges(ghost.south, 0, 0, 0);
+            let west = BorderData::from_edges(0, 0, 0, ghost.west);
+            let east = BorderData::from_edges(0, 0, ghost.east, 0);
+            let nw = BorderData::from_edges(0, (ghost.nw as u64) << 63, 0, 0);
+            let ne = BorderData::from_edges(0, ghost.ne as u64, 0, 0);
+            let sw = BorderData::from_edges((ghost.sw as u64) << 63, 0, 0, 0);
+            let se = BorderData::from_edges(ghost.se as u64, 0, 0, 0);
 
             let from_masks = ghost_is_empty_from_live_masks([
-                north.live_mask,
-                south.live_mask,
-                west.live_mask,
-                east.live_mask,
-                nw.live_mask,
-                ne.live_mask,
-                sw.live_mask,
-                se.live_mask,
+                north.live_mask(),
+                south.live_mask(),
+                west.live_mask(),
+                east.live_mask(),
+                nw.live_mask(),
+                ne.live_mask(),
+                sw.live_mask(),
+                se.live_mask(),
             ]);
 
             assert_eq!(from_masks, ghost_is_empty(&ghost));
@@ -900,8 +843,7 @@ mod tests {
                 assert_eq!(scalar.1.south, avx.1.south);
                 assert_eq!(scalar.1.west, avx.1.west);
                 assert_eq!(scalar.1.east, avx.1.east);
-                assert_eq!(scalar.1.corners, avx.1.corners);
-                assert_eq!(scalar.1.live_mask, avx.1.live_mask);
+                assert_eq!(scalar.1.live_mask(), avx.1.live_mask());
             }
         }
     }

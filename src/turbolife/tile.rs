@@ -4,7 +4,7 @@
 //! - Cell buffers: two separate `Vec<[u64; 64]>` with a global phase bit
 //!   (halves the working set during kernel — only current is read, only next is written)
 //! - `TileMeta`: packed flags in a single u8 bitfield for cache density
-//! - `BorderData`: corners packed into a u8 bitfield
+//! - `BorderData`: four edge bit-planes (corner activity is derived from edge rows)
 
 pub const TILE_SIZE: usize = 64;
 pub const POPULATION_UNKNOWN: u16 = u16::MAX;
@@ -94,18 +94,14 @@ pub type Neighbors = [u32; 8];
 pub const EMPTY_NEIGHBORS: Neighbors = [NO_NEIGHBOR; 8];
 
 /// Pre-extracted border data from a tile's current buffer.
-/// Corners packed into a u8 bitfield: bit0=nw, bit1=ne, bit2=sw, bit3=se.
+/// Corner activity is represented by the corner bits in `north` / `south`.
 #[derive(Clone, Copy, Debug)]
-#[repr(C)]
+#[repr(C, align(32))]
 pub struct BorderData {
     pub north: u64,
     pub south: u64,
     pub west: u64,
     pub east: u64,
-    pub corners: u8,
-    /// Bitset for fast frontier checks:
-    /// 0=N, 1=S, 2=W, 3=E, 4=NW, 5=NE, 6=SW, 7=SE.
-    pub live_mask: u8,
 }
 
 impl Default for BorderData {
@@ -116,69 +112,53 @@ impl Default for BorderData {
             south: 0,
             west: 0,
             east: 0,
-            corners: 0,
-            live_mask: 0,
         }
     }
 }
 
 impl BorderData {
-    pub const CORNER_NW: u8 = 1 << 0;
-    pub const CORNER_NE: u8 = 1 << 1;
-    pub const CORNER_SW: u8 = 1 << 2;
-    pub const CORNER_SE: u8 = 1 << 3;
-
     #[inline(always)]
-    pub const fn compute_live_mask(
-        north: u64,
-        south: u64,
-        west: u64,
-        east: u64,
-        corners: u8,
-    ) -> u8 {
+    pub const fn compute_live_mask(north: u64, south: u64, west: u64, east: u64) -> u8 {
         ((north != 0) as u8)
             | (((south != 0) as u8) << 1)
             | (((west != 0) as u8) << 2)
             | (((east != 0) as u8) << 3)
-            | (((corners & Self::CORNER_NW != 0) as u8) << 4)
-            | (((corners & Self::CORNER_NE != 0) as u8) << 5)
-            | (((corners & Self::CORNER_SW != 0) as u8) << 6)
-            | (((corners & Self::CORNER_SE != 0) as u8) << 7)
+            | ((((north & 1) != 0) as u8) << 4)
+            | ((((north >> 63) != 0) as u8) << 5)
+            | ((((south & 1) != 0) as u8) << 6)
+            | ((((south >> 63) != 0) as u8) << 7)
     }
 
     #[inline(always)]
-    pub fn refresh_live_mask(&mut self) {
-        self.live_mask =
-            Self::compute_live_mask(self.north, self.south, self.west, self.east, self.corners);
+    pub const fn live_mask(&self) -> u8 {
+        Self::compute_live_mask(self.north, self.south, self.west, self.east)
     }
 
     #[inline(always)]
-    pub fn from_parts(north: u64, south: u64, west: u64, east: u64, corners: u8) -> Self {
+    pub const fn from_edges(north: u64, south: u64, west: u64, east: u64) -> Self {
         Self {
             north,
             south,
             west,
             east,
-            corners,
-            live_mask: Self::compute_live_mask(north, south, west, east, corners),
         }
     }
 
     #[inline(always)]
-    pub fn nw(self) -> bool {
-        self.corners & Self::CORNER_NW != 0
+    pub const fn nw(&self) -> bool {
+        (self.north & 1) != 0
     }
     #[inline(always)]
-    pub fn ne(self) -> bool {
-        self.corners & Self::CORNER_NE != 0
+    pub const fn ne(&self) -> bool {
+        ((self.north >> 63) & 1) != 0
     }
     #[inline(always)]
-    pub fn sw(self) -> bool {
-        self.corners & Self::CORNER_SW != 0
+    pub const fn sw(&self) -> bool {
+        (self.south & 1) != 0
     }
     #[inline(always)]
-    pub fn se(self) -> bool {
-        self.corners & Self::CORNER_SE != 0
+    pub const fn se(&self) -> bool {
+        ((self.south >> 63) & 1) != 0
     }
 }
 
@@ -306,21 +286,8 @@ pub fn recompute_border_and_has_live(buf: &[u64; TILE_SIZE]) -> (BorderData, boo
         east |= ((row >> 63) & 1) << row_index;
         any_live |= row;
     }
-    let mut corners = 0u8;
-    if (buf[63] & 1) != 0 {
-        corners |= BorderData::CORNER_NW;
-    }
-    if ((buf[63] >> 63) & 1) != 0 {
-        corners |= BorderData::CORNER_NE;
-    }
-    if (buf[0] & 1) != 0 {
-        corners |= BorderData::CORNER_SW;
-    }
-    if ((buf[0] >> 63) & 1) != 0 {
-        corners |= BorderData::CORNER_SE;
-    }
     (
-        BorderData::from_parts(buf[63], buf[0], west, east, corners),
+        BorderData::from_edges(buf[63], buf[0], west, east),
         any_live != 0,
     )
 }
@@ -352,10 +319,31 @@ pub fn get_local_cell(buf: &[u64; TILE_SIZE], local_x: usize, local_y: usize) ->
 
 #[cfg(test)]
 mod tests {
-    use super::TileMeta;
+    use super::{BorderData, TileMeta};
 
     #[test]
     fn tile_meta_is_compact() {
         assert_eq!(std::mem::size_of::<TileMeta>(), 6);
+    }
+
+    #[test]
+    fn border_data_is_cache_dense() {
+        assert_eq!(std::mem::size_of::<BorderData>(), 32);
+        assert_eq!(std::mem::align_of::<BorderData>(), 32);
+    }
+
+    #[test]
+    fn border_data_corners_are_derived_from_edge_rows() {
+        let border = BorderData::from_edges(1 | (1u64 << 63), 1 | (1u64 << 63), 0, 0);
+        assert!(border.nw());
+        assert!(border.ne());
+        assert!(border.sw());
+        assert!(border.se());
+    }
+
+    #[test]
+    fn border_data_live_mask_includes_edges_and_corners() {
+        let border = BorderData::from_edges(1, 1u64 << 63, 1, 1);
+        assert_eq!(border.live_mask(), 0b1001_1111);
     }
 }
