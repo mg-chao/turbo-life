@@ -130,7 +130,7 @@ fn advance_row_scalar(row_above: u64, row_self: u64, row_below: u64, ghost: RowG
     let (t2, _) = half_add(u0c, t1c);
 
     let alive_mask = !t2 & t1;
-    (alive_mask & t0) | (alive_mask & !t0 & row_self)
+    alive_mask & (t0 | row_self)
 }
 
 #[cfg(test)]
@@ -362,9 +362,7 @@ pub unsafe fn advance_core_avx2(
         let (t2, _) = unsafe { avx2_half_add(u0c, t1c) };
 
         let alive_mask = _mm256_andnot_si256(t2, t1);
-        let born = _mm256_and_si256(alive_mask, t0);
-        let survive = _mm256_and_si256(_mm256_andnot_si256(t0, alive_mask), row_self);
-        let next_rows = _mm256_or_si256(born, survive);
+        let next_rows = _mm256_and_si256(alive_mask, _mm256_or_si256(t0, row_self));
 
         let diff = _mm256_xor_si256(next_rows, row_self);
         diff_acc = _mm256_or_si256(diff_acc, diff);
