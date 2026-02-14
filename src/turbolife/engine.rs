@@ -854,7 +854,9 @@ impl TurboLife {
                         };
 
                         if result.changed {
-                            self.arena.push_changed_from_kernel(idx);
+                            self.arena.changed_list.push(idx);
+                        } else if !result.has_live {
+                            self.arena.prune_buf.push(idx);
                         }
 
                         let missing = result.missing_mask;
@@ -865,10 +867,6 @@ impl TurboLife {
                                 missing,
                                 result.live_mask,
                             );
-                        }
-
-                        if !result.changed && !result.has_live {
-                            self.arena.prune_buf.push(idx);
                         }
                     }
                 }};
@@ -931,7 +929,9 @@ impl TurboLife {
                         };
 
                         if result.changed {
-                            self.arena.push_changed_from_kernel(idx);
+                            self.arena.changed_list.push(idx);
+                        } else if !result.has_live {
+                            self.arena.prune_buf.push(idx);
                         }
 
                         let missing = result.missing_mask;
@@ -942,10 +942,6 @@ impl TurboLife {
                                 missing,
                                 result.live_mask,
                             );
-                        }
-
-                        if !result.changed && !result.has_live {
-                            self.arena.prune_buf.push(idx);
                         }
                     }
                 }};
@@ -1069,6 +1065,8 @@ impl TurboLife {
 
                     if result.changed {
                         ($scratch).changed.push(idx);
+                    } else if !result.has_live {
+                        ($scratch).prune.push(idx);
                     }
 
                     let missing = result.missing_mask;
@@ -1079,10 +1077,6 @@ impl TurboLife {
                             missing,
                             result.live_mask,
                         );
-                    }
-
-                    if !result.changed && !result.has_live {
-                        ($scratch).prune.push(idx);
                     }
                 }};
             }

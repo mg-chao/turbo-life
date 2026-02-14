@@ -314,6 +314,7 @@ impl TileArena {
         self.changed_list.push(idx);
     }
 
+    #[cfg(test)]
     #[inline(always)]
     pub fn push_changed_from_kernel(&mut self, idx: TileIdx) {
         self.changed_list.push(idx);
