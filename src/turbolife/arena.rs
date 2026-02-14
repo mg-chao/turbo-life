@@ -44,6 +44,7 @@ pub struct TileArena {
     /// Packed as `((src_idx as u32) << 3) | dir`.
     pub expand_buf: Vec<u32>,
     pub prune_buf: Vec<TileIdx>,
+    pub prune_marks: Vec<u8>,
     pub changed_scratch: Vec<TileIdx>,
 }
 
@@ -98,6 +99,7 @@ impl TileArena {
             active_sort_counts: vec![0u32; ACTIVE_SORT_RADIX_BUCKETS],
             expand_buf: Vec::new(),
             prune_buf: Vec::new(),
+            prune_marks: Vec::new(),
             changed_scratch: Vec::new(),
         }
     }

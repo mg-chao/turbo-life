@@ -324,71 +324,69 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
     let run_parallel = thread_count > 1 && prune_len >= PARALLEL_PRUNE_CANDIDATES_MIN;
     let live_masks = &arena.border_live_masks[arena.border_phase];
     debug_assert_eq!(live_masks.len(), arena.borders[arena.border_phase].len());
+    arena.prune_marks.resize(prune_len, 0);
 
-    let mut to_prune = if run_parallel {
+    if run_parallel {
         let chunk_size = prune_filter_chunk_size(prune_len, thread_count);
         let meta_ptr = SendConstPtr::new(arena.meta.as_ptr());
         let neighbors_ptr = SendConstPtr::new(arena.neighbors.as_ptr());
         let live_masks_ptr = SendConstPtr::new(live_masks.as_ptr());
         let prune_candidates = &arena.prune_buf;
+        let prune_marks = &mut arena.prune_marks;
         prune_candidates
             .par_chunks(chunk_size)
-            .fold(Vec::new, move |mut acc, chunk| {
+            .zip(prune_marks.par_chunks_mut(chunk_size))
+            .for_each(|(chunk, marks)| {
                 let mp = meta_ptr.get();
                 let np = neighbors_ptr.get();
                 let lp = live_masks_ptr.get();
-                for &idx in chunk {
+                for (mark, &idx) in marks.iter_mut().zip(chunk.iter()) {
                     let ii = idx.index();
-                    // SAFETY: pointers are stable and only read during this phase.
-                    unsafe {
+                    // SAFETY: pointers are valid for the entire prune phase.
+                    let should_prune = unsafe {
                         let meta = *mp.add(ii);
                         if !meta.occupied() || meta.has_live() {
-                            continue;
+                            false
+                        } else {
+                            let missing_mask = meta.missing_mask;
+                            if missing_mask == MISSING_ALL_NEIGHBORS {
+                                true
+                            } else {
+                                let nb = *np.add(ii);
+                                ghost_is_empty_from_live_masks_ptr(lp, &nb)
+                            }
                         }
-                        let missing_mask = meta.missing_mask;
-                        if missing_mask == MISSING_ALL_NEIGHBORS {
-                            acc.push(idx);
-                            continue;
-                        }
-                        let nb = *np.add(ii);
-                        let ghost_empty = ghost_is_empty_from_live_masks_ptr(lp, &nb);
-                        if ghost_empty {
-                            acc.push(idx);
-                        }
-                    }
+                    };
+                    *mark = should_prune as u8;
                 }
-                acc
-            })
-            .reduce(Vec::new, |mut left, mut right| {
-                left.append(&mut right);
-                left
-            })
+            });
     } else {
-        let mut serial = Vec::with_capacity(prune_len);
         for i in 0..prune_len {
             let idx = arena.prune_buf[i];
             let ii = idx.index();
             let meta = arena.meta[ii];
-            if !meta.occupied() || meta.has_live() {
-                continue;
-            }
-            let missing_mask = meta.missing_mask;
-            if missing_mask == MISSING_ALL_NEIGHBORS {
-                serial.push(idx);
-                continue;
-            }
-            let nb = arena.neighbors[ii];
-            let ghost_empty =
-                unsafe { ghost_is_empty_from_live_masks_ptr(live_masks.as_ptr(), &nb) };
-            if ghost_empty {
-                serial.push(idx);
-            }
+            let should_prune = if !meta.occupied() || meta.has_live() {
+                0
+            } else {
+                let missing_mask = meta.missing_mask;
+                if missing_mask == MISSING_ALL_NEIGHBORS {
+                    1
+                } else {
+                    let nb = arena.neighbors[ii];
+                    let ghost_empty =
+                        unsafe { ghost_is_empty_from_live_masks_ptr(live_masks.as_ptr(), &nb) };
+                    ghost_empty as u8
+                }
+            };
+            arena.prune_marks[i] = should_prune;
         }
-        serial
-    };
+    }
 
-    for idx in to_prune.drain(..) {
-        arena.release(idx);
+    for i in 0..prune_len {
+        if arena.prune_marks[i] != 0 {
+            let idx = arena.prune_buf[i];
+            arena.release(idx);
+        }
     }
 
     arena.expand_buf.clear();
@@ -397,7 +395,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
 
 #[cfg(test)]
 mod tests {
-    use super::{TileArena, rebuild_active_set};
+    use super::{TileArena, finalize_prune_and_expand, rebuild_active_set};
 
     #[test]
     fn rebuild_active_set_does_not_advance_epoch_without_changes() {
@@ -438,5 +436,19 @@ mod tests {
 
         arena.mark_changed(second);
         assert_eq!(arena.changed_list, vec![second]);
+    }
+
+    #[test]
+    fn finalize_prune_and_expand_skips_live_candidates() {
+        let mut arena = TileArena::new();
+        let live_idx = arena.allocate((0, 0));
+        arena.meta_mut(live_idx).set_has_live(true);
+        arena.prune_buf.push(live_idx);
+
+        finalize_prune_and_expand(&mut arena);
+
+        assert!(arena.meta(live_idx).occupied());
+        assert!(arena.meta(live_idx).has_live());
+        assert_eq!(arena.idx_at((0, 0)), Some(live_idx));
     }
 }
