@@ -59,7 +59,7 @@ fn main() {
         }
     }
 
-    let total_iterations = 10000u64;
+    let total_iterations = 3000u64;
     let check_interval = 1000u64;
     let mut quick_total_duration = std::time::Duration::ZERO;
     let mut turbo_total_duration = std::time::Duration::ZERO;
