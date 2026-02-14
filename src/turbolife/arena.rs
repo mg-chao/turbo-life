@@ -6,7 +6,7 @@
 //! can use unconditional loads — NO_NEIGHBOR maps to the sentinel.
 
 use super::tile::{
-    BorderData, CellBuf, Neighbors, TileIdx, TileMeta, EMPTY_NEIGHBORS, NO_NEIGHBOR, TILE_SIZE,
+    BorderData, CellBuf, EMPTY_NEIGHBORS, NO_NEIGHBOR, Neighbors, TILE_SIZE, TileIdx, TileMeta,
 };
 use super::tilemap::TileMap;
 
@@ -45,6 +45,7 @@ pub struct TileArena {
     pub expand_buf: Vec<u32>,
     pub prune_buf: Vec<TileIdx>,
     pub prune_marks: Vec<u8>,
+    pub prune_marks_words: Vec<u64>,
     pub changed_scratch: Vec<TileIdx>,
 }
 
@@ -101,6 +102,7 @@ impl TileArena {
             expand_buf: Vec::new(),
             prune_buf: Vec::new(),
             prune_marks: Vec::new(),
+            prune_marks_words: Vec::new(),
             changed_scratch: Vec::new(),
         }
     }
