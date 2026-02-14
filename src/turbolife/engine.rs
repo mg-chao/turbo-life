@@ -237,6 +237,21 @@ fn memory_parallel_cap(thread_count: usize) -> usize {
 }
 
 #[inline]
+fn auto_pool_thread_count_for_physical(physical: usize) -> usize {
+    let physical = physical.max(1);
+    if physical <= 8 {
+        physical
+    } else {
+        physical.div_ceil(2).max(6)
+    }
+}
+
+#[inline]
+fn auto_pool_thread_count() -> usize {
+    auto_pool_thread_count_for_physical(physical_core_count())
+}
+
+#[inline]
 fn tuned_parallel_threads(active_len: usize, thread_count: usize) -> usize {
     if thread_count <= 1 {
         return 1;
@@ -248,10 +263,12 @@ fn tuned_parallel_threads(active_len: usize, thread_count: usize) -> usize {
     let bw_cap = memory_parallel_cap(thread_count);
     let tuned_cap = if active_len < 256 {
         bw_cap.min(2)
-    } else if active_len < 512 {
+    } else if active_len < 1_024 {
         bw_cap.min(4)
-    } else if active_len < 2_048 {
+    } else if active_len < 8_192 {
         bw_cap.min(6)
+    } else if active_len < 32_768 {
+        bw_cap.min(8)
     } else {
         bw_cap
     };
@@ -261,9 +278,7 @@ fn tuned_parallel_threads(active_len: usize, thread_count: usize) -> usize {
 
 /// Resolve the thread count from a config, falling back to auto-detect.
 fn resolve_thread_count(config: &TurboLifeConfig) -> usize {
-    let mut threads = config
-        .thread_count
-        .unwrap_or_else(|| memory_parallel_cap(physical_core_count()));
+    let mut threads = config.thread_count.unwrap_or_else(auto_pool_thread_count);
     if let Some(cap) = config.max_threads {
         threads = threads.min(cap);
     }
@@ -889,7 +904,10 @@ impl TurboLife {
             let borders_read_ptr = SendConstPtr::new(borders_read.as_ptr());
             let worker_count = effective_threads.min(active_len);
 
-            if active_len >= PARALLEL_STATIC_SCHEDULE_THRESHOLD {
+            let use_static_schedule =
+                active_len >= PARALLEL_STATIC_SCHEDULE_THRESHOLD || worker_count < thread_count;
+
+            if use_static_schedule {
                 self.prepare_worker_scratch(worker_count, active_len);
                 let scratch_ptr = SendPtr::new(self.worker_scratch.as_mut_ptr());
                 let chunk_size = active_len.div_ceil(worker_count);
@@ -1282,7 +1300,7 @@ impl TurboLife {
 
 #[cfg(test)]
 mod tests {
-    use super::{TurboLife, memory_parallel_cap};
+    use super::{TurboLife, auto_pool_thread_count_for_physical, memory_parallel_cap};
 
     #[test]
     fn memory_parallel_cap_stays_monotonic() {
@@ -1309,6 +1327,25 @@ mod tests {
         assert_eq!(memory_parallel_cap(11), 8);
         assert_eq!(memory_parallel_cap(12), 8);
         assert_eq!(memory_parallel_cap(16), 8);
+    }
+
+    #[test]
+    fn auto_pool_thread_count_targets_bandwidth_sweet_spot() {
+        assert_eq!(auto_pool_thread_count_for_physical(0), 1);
+        assert_eq!(auto_pool_thread_count_for_physical(1), 1);
+        assert_eq!(auto_pool_thread_count_for_physical(4), 4);
+        assert_eq!(auto_pool_thread_count_for_physical(8), 8);
+        assert_eq!(auto_pool_thread_count_for_physical(9), 6);
+        assert_eq!(auto_pool_thread_count_for_physical(12), 6);
+        assert_eq!(auto_pool_thread_count_for_physical(16), 8);
+        assert_eq!(auto_pool_thread_count_for_physical(24), 12);
+    }
+
+    #[test]
+    fn default_pool_uses_auto_thread_count() {
+        let engine = TurboLife::new();
+        let expected = auto_pool_thread_count_for_physical(num_cpus::get_physical().max(1));
+        assert_eq!(engine.pool.current_num_threads(), expected);
     }
 
     #[test]
