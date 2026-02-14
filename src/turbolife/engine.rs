@@ -72,6 +72,7 @@ static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
 static AUTO_KERNEL_BACKEND: OnceLock<KernelBackend> = OnceLock::new();
 
 #[derive(Default)]
+#[repr(align(64))]
 struct WorkerScratch {
     changed: Vec<TileIdx>,
     expand: Vec<u32>,
@@ -1343,6 +1344,11 @@ mod tests {
         assert_eq!(auto_pool_thread_count_for_physical(12), 6);
         assert_eq!(auto_pool_thread_count_for_physical(16), 8);
         assert_eq!(auto_pool_thread_count_for_physical(24), 12);
+    }
+
+    #[test]
+    fn worker_scratch_is_cacheline_aligned() {
+        assert_eq!(std::mem::align_of::<super::WorkerScratch>(), 64);
     }
 
     #[test]
