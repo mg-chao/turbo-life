@@ -21,6 +21,9 @@ const PRUNE_FILTER_CHUNK_MIN: usize = 64;
 const PRUNE_FILTER_CHUNK_MAX: usize = 512;
 const ACTIVE_SORT_STD_MAX: usize = 8_192;
 const ACTIVE_SORT_RADIX_MIN: usize = 32_768;
+const ACTIVE_SORT_LOW_CHURN_PCT: usize = 20;
+const ACTIVE_SORT_SKIP_MIN: usize = 2_048;
+const ACTIVE_SORT_SKIP_MAX: usize = 4_096;
 
 struct SendConstPtr<T> {
     inner: *const T,
@@ -50,6 +53,20 @@ fn prune_filter_chunk_size(candidate_len: usize, threads: usize) -> usize {
     let target_chunks = threads.saturating_mul(4).max(1);
     let size = candidate_len.div_ceil(target_chunks);
     size.clamp(PRUNE_FILTER_CHUNK_MIN, PRUNE_FILTER_CHUNK_MAX)
+}
+
+#[inline(always)]
+fn should_skip_std_active_sort(active_len: usize, changed_count: usize) -> bool {
+    debug_assert!(ACTIVE_SORT_SKIP_MIN <= ACTIVE_SORT_SKIP_MAX);
+    debug_assert!(ACTIVE_SORT_SKIP_MAX <= ACTIVE_SORT_STD_MAX);
+    debug_assert!(ACTIVE_SORT_LOW_CHURN_PCT <= 100);
+
+    let in_skip_window = (ACTIVE_SORT_SKIP_MIN..=ACTIVE_SORT_SKIP_MAX).contains(&active_len);
+    if !in_skip_window {
+        return false;
+    }
+
+    changed_count.saturating_mul(100) <= active_len.saturating_mul(ACTIVE_SORT_LOW_CHURN_PCT)
 }
 
 #[inline]
@@ -265,11 +282,14 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     }
 
     // Sort active set by index for better cache locality during kernel execution.
-    // Small sets use std sort, very large sets use a stable two-pass radix sort.
-    // Mid-sized sets skip sorting to keep rebuild costs bounded.
+    // Small sets use std sort unless a low-churn 2k-4k window opts out.
+    // Very large sets use a stable two-pass radix sort.
+    // The 8k-32k band still skips sorting to keep rebuild costs bounded.
     let active_len = arena.active_set.len();
     if active_len <= ACTIVE_SORT_STD_MAX {
-        arena.active_set.sort_unstable_by_key(|idx| idx.0);
+        if !should_skip_std_active_sort(active_len, changed_count) {
+            arena.active_set.sort_unstable_by_key(|idx| idx.0);
+        }
     } else if active_len >= ACTIVE_SORT_RADIX_MIN {
         radix_sort_active_set(arena);
     }
