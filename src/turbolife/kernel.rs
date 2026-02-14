@@ -4,7 +4,7 @@
 //! Border extraction is fused into the main loop.
 //! Works with split cell buffers (separate current/next vecs).
 
-use super::tile::{BorderData, CellBuf, GhostZone, POPULATION_UNKNOWN, TILE_SIZE, TileMeta};
+use super::tile::{BorderData, CellBuf, GhostZone, TILE_SIZE, TileMeta};
 const _: [(); 1] = [(); (TILE_SIZE == 64) as usize];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -509,9 +509,7 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
                 std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
                 *next_borders_ptr.add(idx) = BorderData::default();
             }
-            meta.set_changed(false);
-            meta.set_has_live(false);
-            meta.population = 0;
+            meta.update_after_step(false, false);
             return false;
         }
     }
@@ -534,13 +532,7 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
         *next_borders_ptr.add(idx) = border;
     }
 
-    meta.set_changed(changed);
-    meta.set_has_live(has_live);
-    if changed {
-        meta.population = POPULATION_UNKNOWN;
-    } else if !has_live {
-        meta.population = 0;
-    }
+    meta.update_after_step(changed, has_live);
 
     changed
 }
@@ -624,13 +616,7 @@ pub unsafe fn advance_tile_split(
         *next_borders_ptr.add(idx) = border;
     }
 
-    meta.set_changed(changed);
-    meta.set_has_live(has_live);
-    if changed {
-        meta.population = POPULATION_UNKNOWN;
-    } else if !has_live {
-        meta.population = 0;
-    }
+    meta.update_after_step(changed, has_live);
 
     changed
 }

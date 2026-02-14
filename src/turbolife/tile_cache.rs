@@ -222,8 +222,6 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
     idx: usize,
     cache: *mut TileCache,
 ) -> bool {
-    use super::tile::POPULATION_UNKNOWN;
-
     let nb = unsafe { &*neighbors_ptr.add(idx) };
     let north_b = unsafe { &*borders_read_ptr.add(nb[0] as usize) };
     let south_b = unsafe { &*borders_read_ptr.add(nb[1] as usize) };
@@ -258,9 +256,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
                 std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
                 *next_borders_ptr.add(idx) = BorderData::default();
             }
-            meta.set_changed(false);
-            meta.set_has_live(false);
-            meta.population = 0;
+            meta.update_after_step(false, false);
             return false;
         }
     }
@@ -296,13 +292,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
                 *next_borders_ptr.add(idx) = entry.border;
             }
             let changed = entry.changed;
-            meta.set_changed(changed);
-            meta.set_has_live(entry.has_live);
-            if changed {
-                meta.population = POPULATION_UNKNOWN;
-            } else if !entry.has_live {
-                meta.population = 0;
-            }
+            meta.update_after_step(changed, entry.has_live);
             cr.record_hit();
             return changed;
         }
@@ -311,13 +301,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
         unsafe {
             *next_borders_ptr.add(idx) = border;
         }
-        meta.set_changed(changed);
-        meta.set_has_live(has_live);
-        if changed {
-            meta.population = POPULATION_UNKNOWN;
-        } else if !has_live {
-            meta.population = 0;
-        }
+        meta.update_after_step(changed, has_live);
         let em = unsafe { cr.entries.get_unchecked_mut(slot) };
         em.key_lo = key_lo;
         em.key_hi = key_hi;
@@ -341,13 +325,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
     unsafe {
         *next_borders_ptr.add(idx) = border;
     }
-    meta.set_changed(changed);
-    meta.set_has_live(has_live);
-    if changed {
-        meta.population = POPULATION_UNKNOWN;
-    } else if !has_live {
-        meta.population = 0;
-    }
+    meta.update_after_step(changed, has_live);
     changed
 }
 

@@ -152,11 +152,18 @@ impl TileArena {
     #[inline]
     pub fn mark_changed(&mut self, idx: TileIdx) {
         let m = &mut self.meta[idx.index()];
-        m.set_changed(true);
         if !m.in_changed_list() {
             m.set_in_changed_list(true);
             self.changed_list.push(idx);
         }
+    }
+
+    #[inline(always)]
+    pub fn push_changed_from_kernel(&mut self, idx: TileIdx) {
+        let meta = &mut self.meta[idx.index()];
+        debug_assert!(!meta.in_changed_list());
+        meta.set_in_changed_list(true);
+        self.changed_list.push(idx);
     }
 
     #[inline]

@@ -312,7 +312,6 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
         let (dx, dy) = EXPAND_OFFSETS[dir];
         let idx = arena.allocate_absent((tx + dx, ty + dy));
         let meta = &mut arena.meta[idx.index()];
-        meta.set_changed(true);
         meta.active_epoch = 0;
         meta.population = 0;
         arena.mark_changed(idx);

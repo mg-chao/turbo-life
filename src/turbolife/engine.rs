@@ -778,7 +778,7 @@ impl TurboLife {
                         };
 
                         if changed {
-                            self.arena.mark_changed(idx);
+                            self.arena.push_changed_from_kernel(idx);
                         }
 
                         unsafe {
@@ -854,7 +854,7 @@ impl TurboLife {
                         };
 
                         if changed {
-                            self.arena.mark_changed(idx);
+                            self.arena.push_changed_from_kernel(idx);
                         }
 
                         unsafe {
@@ -1057,7 +1057,7 @@ impl TurboLife {
                 for worker_id in 0..worker_count {
                     let scratch = &mut self.worker_scratch[worker_id];
                     for idx in scratch.changed.drain(..) {
-                        self.arena.mark_changed(idx);
+                        self.arena.push_changed_from_kernel(idx);
                     }
                 }
             } else {
@@ -1189,7 +1189,7 @@ impl TurboLife {
                 self.arena.prune_buf.append(&mut prune_all);
 
                 for idx in changed_all.drain(..) {
-                    self.arena.mark_changed(idx);
+                    self.arena.push_changed_from_kernel(idx);
                 }
             }
         }
