@@ -65,6 +65,7 @@ const LIVE_SW: u8 = 1 << 6;
 const LIVE_SE: u8 = 1 << 7;
 
 #[inline(always)]
+#[cfg(test)]
 fn ghost_is_empty_from_neighbor_masks(neighbor_live_masks: [u8; 8]) -> bool {
     let [north, south, west, east, nw, ne, sw, se] = neighbor_live_masks;
     let ghost_activity = (north & LIVE_S)
@@ -108,7 +109,15 @@ pub(crate) unsafe fn ghost_is_empty_from_live_masks_ptr(
     let sw = unsafe { *live_masks_ptr.add(neighbors[6] as usize) };
     let se = unsafe { *live_masks_ptr.add(neighbors[7] as usize) };
 
-    ghost_is_empty_from_neighbor_masks([north, south, west, east, nw, ne, sw, se])
+    let ghost_activity = (north & LIVE_S)
+        | (south & LIVE_N)
+        | (west & LIVE_E)
+        | (east & LIVE_W)
+        | (nw & LIVE_SE)
+        | (ne & LIVE_SW)
+        | (sw & LIVE_NE)
+        | (se & LIVE_NW);
+    ghost_activity == 0
 }
 
 #[inline(always)]
