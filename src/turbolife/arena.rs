@@ -14,6 +14,116 @@ const INITIAL_TILE_CAPACITY: usize = 256;
 const MIN_GROW_TILES: usize = 256;
 const ACTIVE_SORT_RADIX_BUCKETS: usize = 1 << 16;
 
+#[derive(Clone)]
+pub struct BorderPlanes {
+    north: Vec<u64>,
+    south: Vec<u64>,
+    west: Vec<u64>,
+    east: Vec<u64>,
+}
+
+impl BorderPlanes {
+    #[inline]
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            north: Vec::with_capacity(capacity),
+            south: Vec::with_capacity(capacity),
+            west: Vec::with_capacity(capacity),
+            east: Vec::with_capacity(capacity),
+        }
+    }
+
+    #[inline]
+    fn push_zero(&mut self) {
+        self.north.push(0);
+        self.south.push(0);
+        self.west.push(0);
+        self.east.push(0);
+    }
+
+    #[inline]
+    fn reserve(&mut self, additional: usize) {
+        self.north.reserve(additional);
+        self.south.reserve(additional);
+        self.west.reserve(additional);
+        self.east.reserve(additional);
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        debug_assert_eq!(self.north.len(), self.south.len());
+        debug_assert_eq!(self.north.len(), self.west.len());
+        debug_assert_eq!(self.north.len(), self.east.len());
+        self.north.len()
+    }
+
+    #[inline(always)]
+    pub fn get(&self, idx: usize) -> BorderData {
+        BorderData::from_edges(
+            self.north[idx],
+            self.south[idx],
+            self.west[idx],
+            self.east[idx],
+        )
+    }
+
+    #[inline(always)]
+    pub fn set(&mut self, idx: usize, border: BorderData) {
+        self.north[idx] = border.north;
+        self.south[idx] = border.south;
+        self.west[idx] = border.west;
+        self.east[idx] = border.east;
+    }
+
+    #[inline(always)]
+    pub fn clear(&mut self, idx: usize) {
+        self.north[idx] = 0;
+        self.south[idx] = 0;
+        self.west[idx] = 0;
+        self.east[idx] = 0;
+    }
+
+    #[inline(always)]
+    pub fn north_ptr(&self) -> *const u64 {
+        self.north.as_ptr()
+    }
+
+    #[inline(always)]
+    pub fn south_ptr(&self) -> *const u64 {
+        self.south.as_ptr()
+    }
+
+    #[inline(always)]
+    pub fn west_ptr(&self) -> *const u64 {
+        self.west.as_ptr()
+    }
+
+    #[inline(always)]
+    pub fn east_ptr(&self) -> *const u64 {
+        self.east.as_ptr()
+    }
+
+    #[inline(always)]
+    pub fn north_mut_ptr(&mut self) -> *mut u64 {
+        self.north.as_mut_ptr()
+    }
+
+    #[inline(always)]
+    pub fn south_mut_ptr(&mut self) -> *mut u64 {
+        self.south.as_mut_ptr()
+    }
+
+    #[inline(always)]
+    pub fn west_mut_ptr(&mut self) -> *mut u64 {
+        self.west.as_mut_ptr()
+    }
+
+    #[inline(always)]
+    pub fn east_mut_ptr(&mut self) -> *mut u64 {
+        self.east.as_mut_ptr()
+    }
+}
+
 pub struct TileArena {
     /// Two cell buffers: `cell_bufs[phase]` = current (read), `cell_bufs[1-phase]` = next (write).
     pub cell_bufs: [Vec<CellBuf>; 2],
@@ -22,8 +132,8 @@ pub struct TileArena {
     pub meta: Vec<TileMeta>,
     pub neighbors: Vec<Neighbors>,
     pub coords: Vec<(i64, i64)>,
-    /// Double-buffered borders. `borders[border_phase]` = current gen (read).
-    pub borders: [Vec<BorderData>; 2],
+    /// Double-buffered border planes. `borders[border_phase]` = current gen (read).
+    pub borders: [BorderPlanes; 2],
     /// Cached `BorderData::live_mask` for each border phase.
     pub border_live_masks: [Vec<u8>; 2],
     pub border_phase: usize,
@@ -54,7 +164,6 @@ impl TileArena {
         // Slot 0 is the sentinel – always zeroed, never used for real tiles.
         let sentinel_cells = CellBuf::empty();
         let sentinel_meta = TileMeta::released();
-        let sentinel_border = BorderData::default();
         let sentinel_neighbors = EMPTY_NEIGHBORS;
         let sentinel_coord = (i64::MIN, i64::MIN);
 
@@ -63,8 +172,8 @@ impl TileArena {
         let mut meta = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
         let mut neighbors = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
         let mut coords = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
-        let mut borders0 = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
-        let mut borders1 = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
+        let mut borders0 = BorderPlanes::with_capacity(INITIAL_TILE_CAPACITY + 1);
+        let mut borders1 = BorderPlanes::with_capacity(INITIAL_TILE_CAPACITY + 1);
         let mut border_live_masks0 = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
         let mut border_live_masks1 = Vec::with_capacity(INITIAL_TILE_CAPACITY + 1);
 
@@ -73,8 +182,8 @@ impl TileArena {
         meta.push(sentinel_meta);
         neighbors.push(sentinel_neighbors);
         coords.push(sentinel_coord);
-        borders0.push(sentinel_border);
-        borders1.push(sentinel_border);
+        borders0.push_zero();
+        borders1.push_zero();
         border_live_masks0.push(0);
         border_live_masks1.push(0);
 
@@ -135,21 +244,15 @@ impl TileArena {
     /// Current-gen border for a tile.
     #[inline(always)]
     #[allow(dead_code)]
-    pub fn border(&self, idx: TileIdx) -> &BorderData {
-        &self.borders[self.border_phase][idx.index()]
-    }
-
-    /// Mutable ref to current-gen border.
-    #[inline(always)]
-    pub fn border_mut(&mut self, idx: TileIdx) -> &mut BorderData {
-        &mut self.borders[self.border_phase][idx.index()]
+    pub fn border(&self, idx: TileIdx) -> BorderData {
+        self.borders[self.border_phase].get(idx.index())
     }
 
     /// Write current-gen border and keep cached live-mask in sync.
     #[inline(always)]
     pub fn set_current_border(&mut self, idx: TileIdx, border: BorderData) {
         let i = idx.index();
-        self.borders[self.border_phase][i] = border;
+        self.borders[self.border_phase].set(i, border);
         self.border_live_masks[self.border_phase][i] = border.live_mask();
     }
 
@@ -157,8 +260,13 @@ impl TileArena {
     #[inline(always)]
     pub fn sync_current_border_live_mask(&mut self, idx: TileIdx) {
         let i = idx.index();
-        self.border_live_masks[self.border_phase][i] =
-            self.borders[self.border_phase][i].live_mask();
+        let borders = &self.borders[self.border_phase];
+        self.border_live_masks[self.border_phase][i] = BorderData::compute_live_mask(
+            borders.north[i],
+            borders.south[i],
+            borders.west[i],
+            borders.east[i],
+        );
     }
 
     /// Flip border phase.
@@ -388,8 +496,8 @@ impl TileArena {
             self.meta[i] = TileMeta::empty();
             self.neighbors[i] = EMPTY_NEIGHBORS;
             self.coords[i] = coord;
-            self.borders[0][i] = BorderData::default();
-            self.borders[1][i] = BorderData::default();
+            self.borders[0].clear(i);
+            self.borders[1].clear(i);
             self.border_live_masks[0][i] = 0;
             self.border_live_masks[1][i] = 0;
             self.set_occupied_bit(i);
@@ -404,8 +512,8 @@ impl TileArena {
             self.meta.push(TileMeta::empty());
             self.neighbors.push(EMPTY_NEIGHBORS);
             self.coords.push(coord);
-            self.borders[0].push(BorderData::default());
-            self.borders[1].push(BorderData::default());
+            self.borders[0].push_zero();
+            self.borders[1].push_zero();
             self.border_live_masks[0].push(0);
             self.border_live_masks[1].push(0);
             self.active_tags.push(0);
@@ -589,8 +697,8 @@ mod tests {
 
         arena.cell_bufs[0][i].0[0] = u64::MAX;
         arena.cell_bufs[1][i].0[1] = u64::MAX;
-        arena.borders[0][i] = BorderData::from_edges(1, 2, 3, 4);
-        arena.borders[1][i] = BorderData::from_edges(5, 6, 7, 8);
+        arena.borders[0].set(i, BorderData::from_edges(1, 2, 3, 4));
+        arena.borders[1].set(i, BorderData::from_edges(5, 6, 7, 8));
         arena.border_live_masks[0][i] = 0xFF;
         arena.border_live_masks[1][i] = 0xFF;
 
@@ -601,12 +709,12 @@ mod tests {
         assert_eq!(recycled, idx);
         assert!(arena.cell_bufs[0][ri].0.iter().all(|&row| row == 0));
         assert!(arena.cell_bufs[1][ri].0.iter().all(|&row| row == 0));
-        let border0 = arena.borders[0][ri];
+        let border0 = arena.borders[0].get(ri);
         assert_eq!(border0.north, 0);
         assert_eq!(border0.south, 0);
         assert_eq!(border0.west, 0);
         assert_eq!(border0.east, 0);
-        let border1 = arena.borders[1][ri];
+        let border1 = arena.borders[1].get(ri);
         assert_eq!(border1.north, 0);
         assert_eq!(border1.south, 0);
         assert_eq!(border1.west, 0);

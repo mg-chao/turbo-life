@@ -607,8 +607,14 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut TileMeta,
-    next_borders_ptr: *mut BorderData,
-    borders_read_ptr: *const BorderData,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
     neighbors_ptr: *const [u32; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
@@ -626,7 +632,10 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
             debug_assert!(tile_is_empty(current));
             unsafe {
                 clear_tile_if_needed(next);
-                *next_borders_ptr.add(idx) = BorderData::default();
+                *next_borders_north_ptr.add(idx) = 0;
+                *next_borders_south_ptr.add(idx) = 0;
+                *next_borders_west_ptr.add(idx) = 0;
+                *next_borders_east_ptr.add(idx) = 0;
                 *next_live_masks_ptr.add(idx) = 0;
             }
             meta.update_after_step(false, false);
@@ -641,7 +650,10 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
             debug_assert!(tile_is_empty(current));
             unsafe {
                 clear_tile_if_needed(next);
-                *next_borders_ptr.add(idx) = BorderData::default();
+                *next_borders_north_ptr.add(idx) = 0;
+                *next_borders_south_ptr.add(idx) = 0;
+                *next_borders_west_ptr.add(idx) = 0;
+                *next_borders_east_ptr.add(idx) = 0;
                 *next_live_masks_ptr.add(idx) = 0;
             }
             meta.update_after_step(false, false);
@@ -650,24 +662,15 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
     }
 
     // Inline ghost-zone gather (avoids function call + struct construction).
-    let north_b = unsafe { &*borders_read_ptr.add(nb[0] as usize) };
-    let south_b = unsafe { &*borders_read_ptr.add(nb[1] as usize) };
-    let west_b = unsafe { &*borders_read_ptr.add(nb[2] as usize) };
-    let east_b = unsafe { &*borders_read_ptr.add(nb[3] as usize) };
-    let nw_b = unsafe { &*borders_read_ptr.add(nb[4] as usize) };
-    let ne_b = unsafe { &*borders_read_ptr.add(nb[5] as usize) };
-    let sw_b = unsafe { &*borders_read_ptr.add(nb[6] as usize) };
-    let se_b = unsafe { &*borders_read_ptr.add(nb[7] as usize) };
-
     let ghost = GhostZone {
-        north: north_b.south,
-        south: south_b.north,
-        west: west_b.east,
-        east: east_b.west,
-        nw: nw_b.se(),
-        ne: ne_b.sw(),
-        sw: sw_b.ne(),
-        se: se_b.nw(),
+        north: unsafe { *borders_south_read_ptr.add(nb[0] as usize) },
+        south: unsafe { *borders_north_read_ptr.add(nb[1] as usize) },
+        west: unsafe { *borders_east_read_ptr.add(nb[2] as usize) },
+        east: unsafe { *borders_west_read_ptr.add(nb[3] as usize) },
+        nw: unsafe { ((*borders_south_read_ptr.add(nb[4] as usize) >> 63) & 1) != 0 },
+        ne: unsafe { (*borders_south_read_ptr.add(nb[5] as usize) & 1) != 0 },
+        sw: unsafe { ((*borders_north_read_ptr.add(nb[6] as usize) >> 63) & 1) != 0 },
+        se: unsafe { (*borders_north_read_ptr.add(nb[7] as usize) & 1) != 0 },
     };
 
     let (changed, border, has_live) = if tile_has_live {
@@ -679,7 +682,10 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
     let live_mask = border.live_mask();
 
     unsafe {
-        *next_borders_ptr.add(idx) = border;
+        *next_borders_north_ptr.add(idx) = border.north;
+        *next_borders_south_ptr.add(idx) = border.south;
+        *next_borders_west_ptr.add(idx) = border.west;
+        *next_borders_east_ptr.add(idx) = border.east;
         *next_live_masks_ptr.add(idx) = live_mask;
     }
 
@@ -694,8 +700,14 @@ pub unsafe fn advance_tile_fused_scalar(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut TileMeta,
-    next_borders_ptr: *mut BorderData,
-    borders_read_ptr: *const BorderData,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
     neighbors_ptr: *const [u32; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
@@ -706,8 +718,14 @@ pub unsafe fn advance_tile_fused_scalar(
             current_ptr,
             next_ptr,
             meta_ptr,
-            next_borders_ptr,
-            borders_read_ptr,
+            next_borders_north_ptr,
+            next_borders_south_ptr,
+            next_borders_west_ptr,
+            next_borders_east_ptr,
+            borders_north_read_ptr,
+            borders_south_read_ptr,
+            borders_west_read_ptr,
+            borders_east_read_ptr,
             neighbors_ptr,
             live_masks_read_ptr,
             next_live_masks_ptr,
@@ -723,8 +741,14 @@ pub unsafe fn advance_tile_fused_avx2(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut TileMeta,
-    next_borders_ptr: *mut BorderData,
-    borders_read_ptr: *const BorderData,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
     neighbors_ptr: *const [u32; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
@@ -735,8 +759,14 @@ pub unsafe fn advance_tile_fused_avx2(
             current_ptr,
             next_ptr,
             meta_ptr,
-            next_borders_ptr,
-            borders_read_ptr,
+            next_borders_north_ptr,
+            next_borders_south_ptr,
+            next_borders_west_ptr,
+            next_borders_east_ptr,
+            borders_north_read_ptr,
+            borders_south_read_ptr,
+            borders_west_read_ptr,
+            borders_east_read_ptr,
             neighbors_ptr,
             live_masks_read_ptr,
             next_live_masks_ptr,

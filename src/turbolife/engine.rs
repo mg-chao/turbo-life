@@ -73,40 +73,48 @@ const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 #[inline(always)]
 unsafe fn prefetch_neighbor_border_lines(
     neighbors_ptr: *const [u32; 8],
-    borders_read_ptr: *const tile::BorderData,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
     tile_index: usize,
 ) {
     use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 
     let nb = unsafe { &*neighbors_ptr.add(tile_index) };
-    let all_present = (nb[0] != NO_NEIGHBOR)
-        & (nb[1] != NO_NEIGHBOR)
-        & (nb[2] != NO_NEIGHBOR)
-        & (nb[3] != NO_NEIGHBOR)
-        & (nb[4] != NO_NEIGHBOR)
-        & (nb[5] != NO_NEIGHBOR)
-        & (nb[6] != NO_NEIGHBOR)
-        & (nb[7] != NO_NEIGHBOR);
-
-    if all_present {
-        unsafe {
-            _mm_prefetch(borders_read_ptr.add(nb[0] as usize) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(borders_read_ptr.add(nb[1] as usize) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(borders_read_ptr.add(nb[2] as usize) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(borders_read_ptr.add(nb[3] as usize) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(borders_read_ptr.add(nb[4] as usize) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(borders_read_ptr.add(nb[5] as usize) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(borders_read_ptr.add(nb[6] as usize) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(borders_read_ptr.add(nb[7] as usize) as *const i8, _MM_HINT_T0);
-        }
-    } else {
-        for &ni in nb.iter() {
-            if ni != NO_NEIGHBOR {
-                unsafe {
-                    _mm_prefetch(borders_read_ptr.add(ni as usize) as *const i8, _MM_HINT_T0);
-                }
-            }
-        }
+    unsafe {
+        _mm_prefetch(
+            borders_south_read_ptr.add(nb[Direction::North.index()] as usize) as *const i8,
+            _MM_HINT_T0,
+        );
+        _mm_prefetch(
+            borders_north_read_ptr.add(nb[Direction::South.index()] as usize) as *const i8,
+            _MM_HINT_T0,
+        );
+        _mm_prefetch(
+            borders_east_read_ptr.add(nb[Direction::West.index()] as usize) as *const i8,
+            _MM_HINT_T0,
+        );
+        _mm_prefetch(
+            borders_west_read_ptr.add(nb[Direction::East.index()] as usize) as *const i8,
+            _MM_HINT_T0,
+        );
+        _mm_prefetch(
+            borders_south_read_ptr.add(nb[Direction::NW.index()] as usize) as *const i8,
+            _MM_HINT_T0,
+        );
+        _mm_prefetch(
+            borders_south_read_ptr.add(nb[Direction::NE.index()] as usize) as *const i8,
+            _MM_HINT_T0,
+        );
+        _mm_prefetch(
+            borders_north_read_ptr.add(nb[Direction::SW.index()] as usize) as *const i8,
+            _MM_HINT_T0,
+        );
+        _mm_prefetch(
+            borders_north_read_ptr.add(nb[Direction::SE.index()] as usize) as *const i8,
+            _MM_HINT_T0,
+        );
     }
 }
 
@@ -577,7 +585,10 @@ impl TurboLife {
         }
 
         {
-            let border = self.arena.border_mut(idx);
+            let i = idx.index();
+            let bp = self.arena.border_phase;
+            let borders = &mut self.arena.borders[bp];
+            let mut border = borders.get(i);
 
             if local_y == 0 {
                 border.south = row_after;
@@ -594,6 +605,8 @@ impl TurboLife {
                 let row_bit = 1u64 << local_y;
                 border.east = (border.east & !row_bit) | (((row_after >> 63) & 1) << local_y);
             }
+
+            borders.set(i, border);
         }
         self.arena.sync_current_border_live_mask(idx);
 
@@ -744,9 +757,9 @@ impl TurboLife {
         };
         let (bd_lo, bd_hi) = self.arena.borders.split_at_mut(1);
         let (borders_read, next_borders_vec) = if bp == 0 {
-            (bd_lo[0].as_slice(), &mut bd_hi[0])
+            (&bd_lo[0], &mut bd_hi[0])
         } else {
-            (bd_hi[0].as_slice(), &mut bd_lo[0])
+            (&bd_hi[0], &mut bd_lo[0])
         };
         let (lm_lo, lm_hi) = self.arena.border_live_masks.split_at_mut(1);
         let (live_masks_read, next_live_masks_vec) = if bp == 0 {
@@ -766,11 +779,17 @@ impl TurboLife {
         if !run_parallel {
             // Serial path: cached kernel with multi-level prefetching.
             let neighbors_ptr = self.arena.neighbors.as_ptr();
-            let borders_read_ptr = borders_read.as_ptr();
+            let borders_north_read_ptr = borders_read.north_ptr();
+            let borders_south_read_ptr = borders_read.south_ptr();
+            let borders_west_read_ptr = borders_read.west_ptr();
+            let borders_east_read_ptr = borders_read.east_ptr();
             let live_masks_read_ptr = live_masks_read.as_ptr();
             let current_ptr = current_vec.as_ptr();
             let next_ptr = next_vec.as_mut_ptr();
-            let next_borders_ptr = next_borders_vec.as_mut_ptr();
+            let next_borders_north_ptr = next_borders_vec.north_mut_ptr();
+            let next_borders_south_ptr = next_borders_vec.south_mut_ptr();
+            let next_borders_west_ptr = next_borders_vec.west_mut_ptr();
+            let next_borders_east_ptr = next_borders_vec.east_mut_ptr();
             let next_live_masks_ptr = next_live_masks_vec.as_mut_ptr();
             let meta_ptr = self.arena.meta.as_mut_ptr();
             let active_ptr = self.arena.active_set.as_ptr();
@@ -803,7 +822,10 @@ impl TurboLife {
                                 if prefetch_neighbor_borders {
                                     prefetch_neighbor_border_lines(
                                         neighbors_ptr,
-                                        borders_read_ptr,
+                                        borders_north_read_ptr,
+                                        borders_south_read_ptr,
+                                        borders_west_read_ptr,
+                                        borders_east_read_ptr,
                                         near_ii,
                                     );
                                 }
@@ -815,8 +837,14 @@ impl TurboLife {
                                 current_ptr,
                                 next_ptr,
                                 meta_ptr,
-                                next_borders_ptr,
-                                borders_read_ptr,
+                                next_borders_north_ptr,
+                                next_borders_south_ptr,
+                                next_borders_west_ptr,
+                                next_borders_east_ptr,
+                                borders_north_read_ptr,
+                                borders_south_read_ptr,
+                                borders_west_read_ptr,
+                                borders_east_read_ptr,
                                 neighbors_ptr,
                                 live_masks_read_ptr,
                                 next_live_masks_ptr,
@@ -872,7 +900,10 @@ impl TurboLife {
                                 if prefetch_neighbor_borders {
                                     prefetch_neighbor_border_lines(
                                         neighbors_ptr,
-                                        borders_read_ptr,
+                                        borders_north_read_ptr,
+                                        borders_south_read_ptr,
+                                        borders_west_read_ptr,
+                                        borders_east_read_ptr,
                                         near_ii,
                                     );
                                 }
@@ -884,8 +915,14 @@ impl TurboLife {
                                 current_ptr,
                                 next_ptr,
                                 meta_ptr,
-                                next_borders_ptr,
-                                borders_read_ptr,
+                                next_borders_north_ptr,
+                                next_borders_south_ptr,
+                                next_borders_west_ptr,
+                                next_borders_east_ptr,
+                                borders_north_read_ptr,
+                                borders_south_read_ptr,
+                                borders_west_read_ptr,
+                                borders_east_read_ptr,
                                 neighbors_ptr,
                                 live_masks_read_ptr,
                                 next_live_masks_ptr,
@@ -954,8 +991,14 @@ impl TurboLife {
             let next_ptr = SendPtr::new(next_vec.as_mut_ptr());
             let meta_ptr = SendPtr::new(self.arena.meta.as_mut_ptr());
             let neighbors_ptr = SendConstPtr::new(self.arena.neighbors.as_ptr());
-            let next_borders_ptr = SendPtr::new(next_borders_vec.as_mut_ptr());
-            let borders_read_ptr = SendConstPtr::new(borders_read.as_ptr());
+            let next_borders_north_ptr = SendPtr::new(next_borders_vec.north_mut_ptr());
+            let next_borders_south_ptr = SendPtr::new(next_borders_vec.south_mut_ptr());
+            let next_borders_west_ptr = SendPtr::new(next_borders_vec.west_mut_ptr());
+            let next_borders_east_ptr = SendPtr::new(next_borders_vec.east_mut_ptr());
+            let borders_north_read_ptr = SendConstPtr::new(borders_read.north_ptr());
+            let borders_south_read_ptr = SendConstPtr::new(borders_read.south_ptr());
+            let borders_west_read_ptr = SendConstPtr::new(borders_read.west_ptr());
+            let borders_east_read_ptr = SendConstPtr::new(borders_read.east_ptr());
             let live_masks_read_ptr = SendConstPtr::new(live_masks_read.as_ptr());
             let next_live_masks_ptr = SendPtr::new(next_live_masks_vec.as_mut_ptr());
             let worker_count = effective_threads.min(active_len);
@@ -987,7 +1030,10 @@ impl TurboLife {
                             if prefetch_neighbor_borders {
                                 prefetch_neighbor_border_lines(
                                     neighbors_ptr.get(),
-                                    borders_read_ptr.get(),
+                                    borders_north_read_ptr.get(),
+                                    borders_south_read_ptr.get(),
+                                    borders_west_read_ptr.get(),
+                                    borders_east_read_ptr.get(),
                                     near_ii,
                                 );
                             }
@@ -1006,8 +1052,14 @@ impl TurboLife {
                             current_ptr.get(),
                             next_ptr.get(),
                             meta_ptr.get(),
-                            next_borders_ptr.get(),
-                            borders_read_ptr.get(),
+                            next_borders_north_ptr.get(),
+                            next_borders_south_ptr.get(),
+                            next_borders_west_ptr.get(),
+                            next_borders_east_ptr.get(),
+                            borders_north_read_ptr.get(),
+                            borders_south_read_ptr.get(),
+                            borders_west_read_ptr.get(),
+                            borders_east_read_ptr.get(),
                             neighbors_ptr.get(),
                             live_masks_read_ptr.get(),
                             next_live_masks_ptr.get(),
@@ -1311,9 +1363,10 @@ mod tests {
                 engine.arena.border_live_masks[phase].len()
             );
             for i in 0..engine.arena.borders[phase].len() {
+                let border = engine.arena.borders[phase].get(i);
                 assert_eq!(
                     engine.arena.border_live_masks[phase][i],
-                    engine.arena.borders[phase][i].live_mask(),
+                    border.live_mask(),
                     "phase={phase} idx={i}"
                 );
             }

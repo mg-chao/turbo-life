@@ -118,8 +118,32 @@ fn active_set_is_sorted(active_set: &[TileIdx]) -> bool {
     true
 }
 
+#[derive(Clone, Copy)]
+struct BorderEdges {
+    north: u64,
+    south: u64,
+    west: u64,
+    east: u64,
+}
+
 #[inline(always)]
-fn border_neighbor_influence_mask(current: &BorderData, previous: &BorderData) -> u8 {
+unsafe fn load_border_edges(
+    north_ptr: *const u64,
+    south_ptr: *const u64,
+    west_ptr: *const u64,
+    east_ptr: *const u64,
+    idx: usize,
+) -> BorderEdges {
+    BorderEdges {
+        north: unsafe { *north_ptr.add(idx) },
+        south: unsafe { *south_ptr.add(idx) },
+        west: unsafe { *west_ptr.add(idx) },
+        east: unsafe { *east_ptr.add(idx) },
+    }
+}
+
+#[inline(always)]
+fn border_neighbor_influence_mask(current: BorderEdges, previous: BorderEdges) -> u8 {
     BorderData::compute_live_mask(
         current.north ^ previous.north,
         current.south ^ previous.south,
@@ -151,15 +175,38 @@ fn should_use_directional_neighbor_filter(
     }
 
     let sample_len = changed_len.min(DIRECTIONAL_FILTER_SAMPLE_MAX);
-    let borders_current = arena.borders[border_phase].as_ptr();
-    let borders_prev = arena.borders[1 - border_phase].as_ptr();
+    let borders_current = &arena.borders[border_phase];
+    let borders_prev = &arena.borders[1 - border_phase];
+    let current_north_ptr = borders_current.north_ptr();
+    let current_south_ptr = borders_current.south_ptr();
+    let current_west_ptr = borders_current.west_ptr();
+    let current_east_ptr = borders_current.east_ptr();
+    let prev_north_ptr = borders_prev.north_ptr();
+    let prev_south_ptr = borders_prev.south_ptr();
+    let prev_west_ptr = borders_prev.west_ptr();
+    let prev_east_ptr = borders_prev.east_ptr();
     let changed_ptr = changed_tiles.as_ptr();
     let mut influence_dirs = 0usize;
 
     for i in 0..sample_len {
         let idx = unsafe { *changed_ptr.add(i) }.index();
         let influence = unsafe {
-            border_neighbor_influence_mask(&*borders_current.add(idx), &*borders_prev.add(idx))
+            border_neighbor_influence_mask(
+                load_border_edges(
+                    current_north_ptr,
+                    current_south_ptr,
+                    current_west_ptr,
+                    current_east_ptr,
+                    idx,
+                ),
+                load_border_edges(
+                    prev_north_ptr,
+                    prev_south_ptr,
+                    prev_west_ptr,
+                    prev_east_ptr,
+                    idx,
+                ),
+            )
         };
         influence_dirs += influence.count_ones() as usize;
     }
@@ -340,8 +387,16 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     let neighbors_ptr = arena.neighbors.as_ptr();
     let meta_ptr = arena.meta.as_ptr();
     let border_phase = arena.border_phase;
-    let borders_current_ptr = arena.borders[border_phase].as_ptr();
-    let borders_prev_ptr = arena.borders[1 - border_phase].as_ptr();
+    let borders_current = &arena.borders[border_phase];
+    let borders_prev = &arena.borders[1 - border_phase];
+    let current_north_ptr = borders_current.north_ptr();
+    let current_south_ptr = borders_current.south_ptr();
+    let current_west_ptr = borders_current.west_ptr();
+    let current_east_ptr = borders_current.east_ptr();
+    let prev_north_ptr = borders_prev.north_ptr();
+    let prev_south_ptr = borders_prev.south_ptr();
+    let prev_west_ptr = borders_prev.west_ptr();
+    let prev_east_ptr = borders_prev.east_ptr();
     let directional_neighbor_filter =
         should_use_directional_neighbor_filter(arena, &arena.changed_scratch, border_phase);
 
@@ -358,8 +413,20 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         if directional_neighbor_filter {
             let influence_mask = unsafe {
                 border_neighbor_influence_mask(
-                    &*borders_current_ptr.add(i),
-                    &*borders_prev_ptr.add(i),
+                    load_border_edges(
+                        current_north_ptr,
+                        current_south_ptr,
+                        current_west_ptr,
+                        current_east_ptr,
+                        i,
+                    ),
+                    load_border_edges(
+                        prev_north_ptr,
+                        prev_south_ptr,
+                        prev_west_ptr,
+                        prev_east_ptr,
+                        i,
+                    ),
                 )
             };
             if influence_mask == 0 {
@@ -582,9 +649,9 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PARALLEL_PRUNE_BITMAP_MIN, PARALLEL_PRUNE_CANDIDATES_MIN, TileArena, active_set_is_sorted,
-        border_neighbor_influence_mask, finalize_prune_and_expand, rebuild_active_set,
-        should_probe_std_active_sort, should_skip_std_active_sort,
+        BorderEdges, PARALLEL_PRUNE_BITMAP_MIN, PARALLEL_PRUNE_CANDIDATES_MIN, TileArena,
+        active_set_is_sorted, border_neighbor_influence_mask, finalize_prune_and_expand,
+        rebuild_active_set, should_probe_std_active_sort, should_skip_std_active_sort,
     };
     use crate::turbolife::tile::{BorderData, MISSING_ALL_NEIGHBORS, TileIdx};
 
@@ -726,7 +793,20 @@ mod tests {
     fn border_neighbor_influence_mask_tracks_edges_and_corners() {
         let prev = BorderData::default();
         let cur = BorderData::from_edges(1u64 << 5, 1u64 << 63, 0, 0);
-        let mask = border_neighbor_influence_mask(&cur, &prev);
+        let mask = border_neighbor_influence_mask(
+            BorderEdges {
+                north: cur.north,
+                south: cur.south,
+                west: cur.west,
+                east: cur.east,
+            },
+            BorderEdges {
+                north: prev.north,
+                south: prev.south,
+                west: prev.west,
+                east: prev.east,
+            },
+        );
         assert_eq!(mask & (1 << 0), 1 << 0); // N
         assert_eq!(mask & (1 << 1), 1 << 1); // S
         assert_eq!(mask & (1 << 5), 0); // NE corner unchanged
@@ -747,8 +827,8 @@ mod tests {
         let _se = arena.allocate((1, -1));
 
         let bp = arena.border_phase;
-        arena.borders[bp][center.index()] = BorderData::default();
-        arena.borders[1 - bp][center.index()] = BorderData::default();
+        arena.borders[bp].set(center.index(), BorderData::default());
+        arena.borders[1 - bp].set(center.index(), BorderData::default());
         arena.mark_changed(center);
 
         rebuild_active_set(&mut arena);
@@ -770,8 +850,8 @@ mod tests {
         let _se = arena.allocate((1, -1));
 
         let bp = arena.border_phase;
-        arena.borders[bp][center.index()] = BorderData::from_edges(1, 0, 0, 0);
-        arena.borders[1 - bp][center.index()] = BorderData::default();
+        arena.borders[bp].set(center.index(), BorderData::from_edges(1, 0, 0, 0));
+        arena.borders[1 - bp].set(center.index(), BorderData::default());
         arena.mark_changed(center);
 
         rebuild_active_set(&mut arena);
