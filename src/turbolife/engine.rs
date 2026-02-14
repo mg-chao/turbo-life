@@ -69,6 +69,47 @@ const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 16;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 512;
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn prefetch_neighbor_border_lines(
+    neighbors_ptr: *const [u32; 8],
+    borders_read_ptr: *const tile::BorderData,
+    tile_index: usize,
+) {
+    use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+
+    let nb = unsafe { &*neighbors_ptr.add(tile_index) };
+    let all_present = (nb[0] != NO_NEIGHBOR)
+        & (nb[1] != NO_NEIGHBOR)
+        & (nb[2] != NO_NEIGHBOR)
+        & (nb[3] != NO_NEIGHBOR)
+        & (nb[4] != NO_NEIGHBOR)
+        & (nb[5] != NO_NEIGHBOR)
+        & (nb[6] != NO_NEIGHBOR)
+        & (nb[7] != NO_NEIGHBOR);
+
+    if all_present {
+        unsafe {
+            _mm_prefetch(borders_read_ptr.add(nb[0] as usize) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(borders_read_ptr.add(nb[1] as usize) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(borders_read_ptr.add(nb[2] as usize) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(borders_read_ptr.add(nb[3] as usize) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(borders_read_ptr.add(nb[4] as usize) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(borders_read_ptr.add(nb[5] as usize) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(borders_read_ptr.add(nb[6] as usize) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(borders_read_ptr.add(nb[7] as usize) as *const i8, _MM_HINT_T0);
+        }
+    } else {
+        for &ni in nb.iter() {
+            if ni != NO_NEIGHBOR {
+                unsafe {
+                    _mm_prefetch(borders_read_ptr.add(ni as usize) as *const i8, _MM_HINT_T0);
+                }
+            }
+        }
+    }
+}
+
 static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
 static AUTO_KERNEL_BACKEND: OnceLock<KernelBackend> = OnceLock::new();
 
@@ -744,7 +785,6 @@ impl TurboLife {
 
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
-                            use super::tile::NO_NEIGHBOR;
                             use std::arch::x86_64::*;
 
                             // Prefetch tile i+2 cell buffers into L2.
@@ -761,17 +801,11 @@ impl TurboLife {
                                 _mm_prefetch(next_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(neighbors_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 if prefetch_neighbor_borders {
-                                    // Prefetch border data for the next tile's 8 neighbors.
-                                    // This hides the random-access latency of ghost zone gathering.
-                                    let nb = &*neighbors_ptr.add(near_ii);
-                                    for &ni in nb.iter() {
-                                        if ni != NO_NEIGHBOR {
-                                            _mm_prefetch(
-                                                borders_read_ptr.add(ni as usize) as *const i8,
-                                                _MM_HINT_T0,
-                                            );
-                                        }
-                                    }
+                                    prefetch_neighbor_border_lines(
+                                        neighbors_ptr,
+                                        borders_read_ptr,
+                                        near_ii,
+                                    );
                                 }
                             }
                         }
@@ -820,7 +854,6 @@ impl TurboLife {
 
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
-                            use super::tile::NO_NEIGHBOR;
                             use std::arch::x86_64::*;
 
                             // Prefetch tile i+2 cell buffers into L2.
@@ -837,17 +870,11 @@ impl TurboLife {
                                 _mm_prefetch(next_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(neighbors_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 if prefetch_neighbor_borders {
-                                    // Prefetch border data for the next tile's 8 neighbors.
-                                    // This hides the random-access latency of ghost zone gathering.
-                                    let nb = &*neighbors_ptr.add(near_ii);
-                                    for &ni in nb.iter() {
-                                        if ni != NO_NEIGHBOR {
-                                            _mm_prefetch(
-                                                borders_read_ptr.add(ni as usize) as *const i8,
-                                                _MM_HINT_T0,
-                                            );
-                                        }
-                                    }
+                                    prefetch_neighbor_border_lines(
+                                        neighbors_ptr,
+                                        borders_read_ptr,
+                                        near_ii,
+                                    );
                                 }
                             }
                         }
@@ -942,7 +969,6 @@ impl TurboLife {
                 ($i:expr, $end:expr) => {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
-                        use super::tile::NO_NEIGHBOR;
                         use std::arch::x86_64::*;
 
                         if $i + 2 < $end {
@@ -959,15 +985,11 @@ impl TurboLife {
                                 _MM_HINT_T0,
                             );
                             if prefetch_neighbor_borders {
-                                let nb = &*neighbors_ptr.get().add(near_ii);
-                                for &ni in nb.iter() {
-                                    if ni != NO_NEIGHBOR {
-                                        _mm_prefetch(
-                                            borders_read_ptr.get().add(ni as usize) as *const i8,
-                                            _MM_HINT_T0,
-                                        );
-                                    }
-                                }
+                                prefetch_neighbor_border_lines(
+                                    neighbors_ptr.get(),
+                                    borders_read_ptr.get(),
+                                    near_ii,
+                                );
                             }
                         }
                     }
