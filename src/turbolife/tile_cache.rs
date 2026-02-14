@@ -1,5 +1,5 @@
 use super::kernel::TileAdvanceResult;
-use super::kernel::{ghost_is_empty_from_live_masks, tile_is_empty};
+use super::kernel::{ghost_is_empty_from_live_masks_ptr, tile_is_empty};
 use super::tile::{BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, TILE_SIZE};
 
 const CACHE_SIZE: usize = 1 << 13;
@@ -245,16 +245,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
 
         // Ultra-fast path: metadata says current tile is empty and halo has no
         // incoming live cells.
-        let ghost_empty = ghost_is_empty_from_live_masks([
-            unsafe { *live_masks_read_ptr.add(nb[0] as usize) },
-            unsafe { *live_masks_read_ptr.add(nb[1] as usize) },
-            unsafe { *live_masks_read_ptr.add(nb[2] as usize) },
-            unsafe { *live_masks_read_ptr.add(nb[3] as usize) },
-            unsafe { *live_masks_read_ptr.add(nb[4] as usize) },
-            unsafe { *live_masks_read_ptr.add(nb[5] as usize) },
-            unsafe { *live_masks_read_ptr.add(nb[6] as usize) },
-            unsafe { *live_masks_read_ptr.add(nb[7] as usize) },
-        ]);
+        let ghost_empty = unsafe { ghost_is_empty_from_live_masks_ptr(live_masks_read_ptr, nb) };
 
         if ghost_empty {
             debug_assert!(tile_is_empty(current));

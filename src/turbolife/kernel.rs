@@ -63,6 +63,29 @@ fn corners_from_rows(north: u64, south: u64) -> u8 {
         | (((south >> 63 != 0) as u8) << 3)
 }
 
+const LIVE_N: u8 = 1 << 0;
+const LIVE_S: u8 = 1 << 1;
+const LIVE_W: u8 = 1 << 2;
+const LIVE_E: u8 = 1 << 3;
+const LIVE_NW: u8 = 1 << 4;
+const LIVE_NE: u8 = 1 << 5;
+const LIVE_SW: u8 = 1 << 6;
+const LIVE_SE: u8 = 1 << 7;
+
+#[inline(always)]
+fn ghost_is_empty_from_neighbor_masks(neighbor_live_masks: [u8; 8]) -> bool {
+    let [north, south, west, east, nw, ne, sw, se] = neighbor_live_masks;
+    let ghost_activity = (north & LIVE_S)
+        | (south & LIVE_N)
+        | (west & LIVE_E)
+        | (east & LIVE_W)
+        | (nw & LIVE_SE)
+        | (ne & LIVE_SW)
+        | (sw & LIVE_NE)
+        | (se & LIVE_NW);
+    ghost_activity == 0
+}
+
 #[inline(always)]
 #[cfg(test)]
 pub(crate) fn ghost_is_empty(ghost: &GhostZone) -> bool {
@@ -74,26 +97,26 @@ pub(crate) fn ghost_is_empty(ghost: &GhostZone) -> bool {
 }
 
 #[inline(always)]
+#[cfg(test)]
 pub(crate) fn ghost_is_empty_from_live_masks(neighbor_live_masks: [u8; 8]) -> bool {
-    const LIVE_N: u8 = 1 << 0;
-    const LIVE_S: u8 = 1 << 1;
-    const LIVE_W: u8 = 1 << 2;
-    const LIVE_E: u8 = 1 << 3;
-    const LIVE_NW: u8 = 1 << 4;
-    const LIVE_NE: u8 = 1 << 5;
-    const LIVE_SW: u8 = 1 << 6;
-    const LIVE_SE: u8 = 1 << 7;
+    ghost_is_empty_from_neighbor_masks(neighbor_live_masks)
+}
 
-    let [north, south, west, east, nw, ne, sw, se] = neighbor_live_masks;
-    let ghost_activity = (north & LIVE_S)
-        | (south & LIVE_N)
-        | (west & LIVE_E)
-        | (east & LIVE_W)
-        | (nw & LIVE_SE)
-        | (ne & LIVE_SW)
-        | (sw & LIVE_NE)
-        | (se & LIVE_NW);
-    ghost_activity == 0
+#[inline(always)]
+pub(crate) unsafe fn ghost_is_empty_from_live_masks_ptr(
+    live_masks_ptr: *const u8,
+    neighbors: &[u32; 8],
+) -> bool {
+    let north = unsafe { *live_masks_ptr.add(neighbors[0] as usize) };
+    let south = unsafe { *live_masks_ptr.add(neighbors[1] as usize) };
+    let west = unsafe { *live_masks_ptr.add(neighbors[2] as usize) };
+    let east = unsafe { *live_masks_ptr.add(neighbors[3] as usize) };
+    let nw = unsafe { *live_masks_ptr.add(neighbors[4] as usize) };
+    let ne = unsafe { *live_masks_ptr.add(neighbors[5] as usize) };
+    let sw = unsafe { *live_masks_ptr.add(neighbors[6] as usize) };
+    let se = unsafe { *live_masks_ptr.add(neighbors[7] as usize) };
+
+    ghost_is_empty_from_neighbor_masks([north, south, west, east, nw, ne, sw, se])
 }
 
 #[inline(always)]
@@ -321,9 +344,8 @@ pub unsafe fn advance_core_avx2(
     let mut live_acc = _mm256_setzero_si256();
     let mut border_west = 0u64;
     let mut border_east = 0u64;
-    let mut border_north = 0u64;
-    let mut border_south = 0u64;
     let current_ptr = current.as_ptr();
+    let next_ptr = next.as_mut_ptr();
 
     let mut west_self_bits = ghost.west;
     let mut east_self_bits = ghost.east;
@@ -332,87 +354,102 @@ pub unsafe fn advance_core_avx2(
     let mut west_below_bits = (ghost.west << 1) | (ghost.sw as u64);
     let mut east_below_bits = (ghost.east << 1) | (ghost.se as u64);
 
-    for row_base in (0..TILE_SIZE).step_by(4) {
+    macro_rules! process_chunk {
+        ($row_base:expr, $row_above:expr, $row_self:expr, $row_below:expr) => {{
+            let ghost_w_self = west_self_bits & 0xF;
+            let ghost_e_self = east_self_bits & 0xF;
+            let ghost_w_above = west_above_bits & 0xF;
+            let ghost_e_above = east_above_bits & 0xF;
+            let ghost_w_below = west_below_bits & 0xF;
+            let ghost_e_below = east_below_bits & 0xF;
+
+            let nw = _mm256_or_si256(_mm256_slli_epi64($row_above, 1), unsafe {
+                avx2_carry_mask_lo(ghost_w_above)
+            });
+            let n = $row_above;
+            let ne = _mm256_or_si256(_mm256_srli_epi64($row_above, 1), unsafe {
+                avx2_carry_mask_hi(ghost_e_above)
+            });
+            let w = _mm256_or_si256(_mm256_slli_epi64($row_self, 1), unsafe {
+                avx2_carry_mask_lo(ghost_w_self)
+            });
+            let e = _mm256_or_si256(_mm256_srli_epi64($row_self, 1), unsafe {
+                avx2_carry_mask_hi(ghost_e_self)
+            });
+            let sw = _mm256_or_si256(_mm256_slli_epi64($row_below, 1), unsafe {
+                avx2_carry_mask_lo(ghost_w_below)
+            });
+            let s = $row_below;
+            let se = _mm256_or_si256(_mm256_srli_epi64($row_below, 1), unsafe {
+                avx2_carry_mask_hi(ghost_e_below)
+            });
+
+            let (a0, a1) = unsafe { avx2_full_add(nw, n, ne) };
+            let (s0, s1) = unsafe { avx2_half_add(w, e) };
+            let (b0, b1) = unsafe { avx2_full_add(sw, s, se) };
+            let (t0, t0c) = unsafe { avx2_full_add(a0, s0, b0) };
+            let (u0, u0c) = unsafe { avx2_full_add(a1, s1, b1) };
+            let (t1, t1c) = unsafe { avx2_half_add(u0, t0c) };
+            let (t2, _) = unsafe { avx2_half_add(u0c, t1c) };
+
+            let alive_mask = _mm256_andnot_si256(t2, t1);
+            let next_rows = _mm256_and_si256(alive_mask, _mm256_or_si256(t0, $row_self));
+
+            let diff = _mm256_xor_si256(next_rows, $row_self);
+            diff_acc = _mm256_or_si256(diff_acc, diff);
+            live_acc = _mm256_or_si256(live_acc, next_rows);
+
+            unsafe {
+                _mm256_storeu_si256(next_ptr.add($row_base) as *mut __m256i, next_rows);
+            }
+            let east_mask = _mm256_movemask_pd(_mm256_castsi256_pd(next_rows)) as u64;
+            let west_rows = _mm256_slli_epi64(next_rows, 63);
+            let west_mask = _mm256_movemask_pd(_mm256_castsi256_pd(west_rows)) as u64;
+            border_west |= west_mask << $row_base;
+            border_east |= east_mask << $row_base;
+
+            next_rows
+        }};
+    }
+
+    let row_self_0 = unsafe { _mm256_loadu_si256(current_ptr as *const __m256i) };
+    let row_above_0 = unsafe { _mm256_loadu_si256(current_ptr.add(1) as *const __m256i) };
+    let row_below_0 =
+        unsafe { avx2_set_u64x4_lane_order(ghost.south, current[0], current[1], current[2]) };
+    let next_rows_0 = process_chunk!(0, row_above_0, row_self_0, row_below_0);
+    let border_south = _mm256_extract_epi64(next_rows_0, 0) as u64;
+    west_self_bits >>= 4;
+    east_self_bits >>= 4;
+    west_above_bits >>= 4;
+    east_above_bits >>= 4;
+    west_below_bits >>= 4;
+    east_below_bits >>= 4;
+
+    let mut row_base = 4usize;
+    while row_base < TILE_SIZE - 4 {
         let row_self = unsafe { _mm256_loadu_si256(current_ptr.add(row_base) as *const __m256i) };
-        let row_above = if row_base < TILE_SIZE - 4 {
-            unsafe { _mm256_loadu_si256(current_ptr.add(row_base + 1) as *const __m256i) }
-        } else {
-            unsafe { avx2_set_u64x4_lane_order(current[61], current[62], current[63], ghost.north) }
-        };
-        let row_below = if row_base == 0 {
-            unsafe { avx2_set_u64x4_lane_order(ghost.south, current[0], current[1], current[2]) }
-        } else {
-            unsafe { _mm256_loadu_si256(current_ptr.add(row_base - 1) as *const __m256i) }
-        };
-
-        let ghost_w_self = west_self_bits & 0xF;
-        let ghost_e_self = east_self_bits & 0xF;
-        let ghost_w_above = west_above_bits & 0xF;
-        let ghost_e_above = east_above_bits & 0xF;
-        let ghost_w_below = west_below_bits & 0xF;
-        let ghost_e_below = east_below_bits & 0xF;
-
-        let nw = _mm256_or_si256(_mm256_slli_epi64(row_above, 1), unsafe {
-            avx2_carry_mask_lo(ghost_w_above)
-        });
-        let n = row_above;
-        let ne = _mm256_or_si256(_mm256_srli_epi64(row_above, 1), unsafe {
-            avx2_carry_mask_hi(ghost_e_above)
-        });
-        let w = _mm256_or_si256(_mm256_slli_epi64(row_self, 1), unsafe {
-            avx2_carry_mask_lo(ghost_w_self)
-        });
-        let e = _mm256_or_si256(_mm256_srli_epi64(row_self, 1), unsafe {
-            avx2_carry_mask_hi(ghost_e_self)
-        });
-        let sw = _mm256_or_si256(_mm256_slli_epi64(row_below, 1), unsafe {
-            avx2_carry_mask_lo(ghost_w_below)
-        });
-        let s = row_below;
-        let se = _mm256_or_si256(_mm256_srli_epi64(row_below, 1), unsafe {
-            avx2_carry_mask_hi(ghost_e_below)
-        });
-
-        let (a0, a1) = unsafe { avx2_full_add(nw, n, ne) };
-        let (s0, s1) = unsafe { avx2_half_add(w, e) };
-        let (b0, b1) = unsafe { avx2_full_add(sw, s, se) };
-        let (t0, t0c) = unsafe { avx2_full_add(a0, s0, b0) };
-        let (u0, u0c) = unsafe { avx2_full_add(a1, s1, b1) };
-        let (t1, t1c) = unsafe { avx2_half_add(u0, t0c) };
-        let (t2, _) = unsafe { avx2_half_add(u0c, t1c) };
-
-        let alive_mask = _mm256_andnot_si256(t2, t1);
-        let next_rows = _mm256_and_si256(alive_mask, _mm256_or_si256(t0, row_self));
-
-        let diff = _mm256_xor_si256(next_rows, row_self);
-        diff_acc = _mm256_or_si256(diff_acc, diff);
-        live_acc = _mm256_or_si256(live_acc, next_rows);
-
-        // Store to output and extract border bits directly from register
-        // to avoid store-to-load forwarding stalls.
-        unsafe {
-            _mm256_storeu_si256(next.as_mut_ptr().add(row_base) as *mut __m256i, next_rows);
-        }
-        let east_mask = _mm256_movemask_pd(_mm256_castsi256_pd(next_rows)) as u64;
-        let west_rows = _mm256_slli_epi64(next_rows, 63);
-        let west_mask = _mm256_movemask_pd(_mm256_castsi256_pd(west_rows)) as u64;
-        border_west |= west_mask << row_base;
-        border_east |= east_mask << row_base;
-        // Capture south (row 0) and north (row 63) from registers.
-        if row_base == 0 {
-            border_south = _mm256_extract_epi64(next_rows, 0) as u64;
-        }
-        if row_base == TILE_SIZE - 4 {
-            border_north = _mm256_extract_epi64(next_rows, 3) as u64;
-        }
-
+        let row_above =
+            unsafe { _mm256_loadu_si256(current_ptr.add(row_base + 1) as *const __m256i) };
+        let row_below =
+            unsafe { _mm256_loadu_si256(current_ptr.add(row_base - 1) as *const __m256i) };
+        let _ = process_chunk!(row_base, row_above, row_self, row_below);
         west_self_bits >>= 4;
         east_self_bits >>= 4;
         west_above_bits >>= 4;
         east_above_bits >>= 4;
         west_below_bits >>= 4;
         east_below_bits >>= 4;
+        row_base += 4;
     }
+
+    let last_base = TILE_SIZE - 4;
+    let row_self_last = unsafe { _mm256_loadu_si256(current_ptr.add(last_base) as *const __m256i) };
+    let row_above_last =
+        unsafe { avx2_set_u64x4_lane_order(current[61], current[62], current[63], ghost.north) };
+    let row_below_last =
+        unsafe { _mm256_loadu_si256(current_ptr.add(last_base - 1) as *const __m256i) };
+    let next_rows_last = process_chunk!(last_base, row_above_last, row_self_last, row_below_last);
+    let border_north = _mm256_extract_epi64(next_rows_last, 3) as u64;
 
     let corners = corners_from_rows(border_north, border_south);
 
@@ -514,16 +551,7 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
 
         // Ultra-fast path: metadata says current tile is empty and halo has no
         // incoming live activity.
-        let ghost_empty = ghost_is_empty_from_live_masks([
-            unsafe { *live_masks_read_ptr.add(nb[0] as usize) },
-            unsafe { *live_masks_read_ptr.add(nb[1] as usize) },
-            unsafe { *live_masks_read_ptr.add(nb[2] as usize) },
-            unsafe { *live_masks_read_ptr.add(nb[3] as usize) },
-            unsafe { *live_masks_read_ptr.add(nb[4] as usize) },
-            unsafe { *live_masks_read_ptr.add(nb[5] as usize) },
-            unsafe { *live_masks_read_ptr.add(nb[6] as usize) },
-            unsafe { *live_masks_read_ptr.add(nb[7] as usize) },
-        ]);
+        let ghost_empty = unsafe { ghost_is_empty_from_live_masks_ptr(live_masks_read_ptr, nb) };
 
         if ghost_empty {
             debug_assert!(tile_is_empty(current));
@@ -669,7 +697,8 @@ pub unsafe fn advance_tile_split(
 mod tests {
     use super::{
         BorderData, GhostZone, TILE_SIZE, advance_core_scalar, corners_from_rows, ghost_bit,
-        ghost_is_empty, ghost_is_empty_from_live_masks, tile_is_empty,
+        ghost_is_empty, ghost_is_empty_from_live_masks, ghost_is_empty_from_live_masks_ptr,
+        tile_is_empty,
     };
 
     #[cfg(target_arch = "x86_64")]
@@ -801,6 +830,39 @@ mod tests {
             ]);
 
             assert_eq!(from_masks, ghost_is_empty(&ghost));
+        }
+    }
+
+    #[test]
+    fn ghost_live_masks_ptr_check_matches_array_variant() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xA11C_E7A5_900D_1234);
+        for _ in 0..2048 {
+            let mut live_masks = [0u8; 97];
+            for mask in live_masks.iter_mut() {
+                *mask = (rng.next_u64() & 0xFF) as u8;
+            }
+            // Index 0 is the NO_NEIGHBOR sentinel and must stay empty.
+            live_masks[0] = 0;
+
+            let mut neighbors = [0u32; 8];
+            for ni in neighbors.iter_mut() {
+                *ni = (rng.next_u64() as usize % live_masks.len()) as u32;
+            }
+
+            let from_array = ghost_is_empty_from_live_masks([
+                live_masks[neighbors[0] as usize],
+                live_masks[neighbors[1] as usize],
+                live_masks[neighbors[2] as usize],
+                live_masks[neighbors[3] as usize],
+                live_masks[neighbors[4] as usize],
+                live_masks[neighbors[5] as usize],
+                live_masks[neighbors[6] as usize],
+                live_masks[neighbors[7] as usize],
+            ]);
+            let from_ptr =
+                unsafe { ghost_is_empty_from_live_masks_ptr(live_masks.as_ptr(), &neighbors) };
+
+            assert_eq!(from_ptr, from_array);
         }
     }
 

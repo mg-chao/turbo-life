@@ -3,7 +3,7 @@
 use rayon::prelude::*;
 
 use super::arena::TileArena;
-use super::kernel::ghost_is_empty_from_live_masks;
+use super::kernel::ghost_is_empty_from_live_masks_ptr;
 use super::tile::{MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
 
 const EXPAND_OFFSETS: [(i64, i64); 8] = [
@@ -351,16 +351,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                             continue;
                         }
                         let nb = *np.add(ii);
-                        let ghost_empty = ghost_is_empty_from_live_masks([
-                            *lp.add(nb[0] as usize),
-                            *lp.add(nb[1] as usize),
-                            *lp.add(nb[2] as usize),
-                            *lp.add(nb[3] as usize),
-                            *lp.add(nb[4] as usize),
-                            *lp.add(nb[5] as usize),
-                            *lp.add(nb[6] as usize),
-                            *lp.add(nb[7] as usize),
-                        ]);
+                        let ghost_empty = ghost_is_empty_from_live_masks_ptr(lp, &nb);
                         if ghost_empty {
                             acc.push(idx);
                         }
@@ -387,16 +378,8 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                 continue;
             }
             let nb = arena.neighbors[ii];
-            let ghost_empty = ghost_is_empty_from_live_masks([
-                live_masks[nb[0] as usize],
-                live_masks[nb[1] as usize],
-                live_masks[nb[2] as usize],
-                live_masks[nb[3] as usize],
-                live_masks[nb[4] as usize],
-                live_masks[nb[5] as usize],
-                live_masks[nb[6] as usize],
-                live_masks[nb[7] as usize],
-            ]);
+            let ghost_empty =
+                unsafe { ghost_is_empty_from_live_masks_ptr(live_masks.as_ptr(), &nb) };
             if ghost_empty {
                 serial.push(idx);
             }

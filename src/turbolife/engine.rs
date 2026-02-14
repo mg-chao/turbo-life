@@ -67,6 +67,7 @@ const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 32_768;
 const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 4;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 16;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 512;
+const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 
 static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
 static AUTO_KERNEL_BACKEND: OnceLock<KernelBackend> = OnceLock::new();
@@ -751,6 +752,7 @@ impl TurboLife {
             let meta_ptr = self.arena.meta.as_mut_ptr();
             let active_ptr = self.arena.active_set.as_ptr();
             let cache_ptr = &mut self.tile_cache as *mut TileCache;
+            let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
 
             macro_rules! serial_loop_cached {
                 ($advance:path) => {{
@@ -776,15 +778,17 @@ impl TurboLife {
                                 _mm_prefetch(current_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(next_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(neighbors_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
-                                // Prefetch border data for the next tile's 8 neighbors.
-                                // This hides the random-access latency of ghost zone gathering.
-                                let nb = &*neighbors_ptr.add(near_ii);
-                                for &ni in nb.iter() {
-                                    if ni != NO_NEIGHBOR {
-                                        _mm_prefetch(
-                                            borders_read_ptr.add(ni as usize) as *const i8,
-                                            _MM_HINT_T0,
-                                        );
+                                if prefetch_neighbor_borders {
+                                    // Prefetch border data for the next tile's 8 neighbors.
+                                    // This hides the random-access latency of ghost zone gathering.
+                                    let nb = &*neighbors_ptr.add(near_ii);
+                                    for &ni in nb.iter() {
+                                        if ni != NO_NEIGHBOR {
+                                            _mm_prefetch(
+                                                borders_read_ptr.add(ni as usize) as *const i8,
+                                                _MM_HINT_T0,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -850,15 +854,17 @@ impl TurboLife {
                                 _mm_prefetch(current_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(next_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(neighbors_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
-                                // Prefetch border data for the next tile's 8 neighbors.
-                                // This hides the random-access latency of ghost zone gathering.
-                                let nb = &*neighbors_ptr.add(near_ii);
-                                for &ni in nb.iter() {
-                                    if ni != NO_NEIGHBOR {
-                                        _mm_prefetch(
-                                            borders_read_ptr.add(ni as usize) as *const i8,
-                                            _MM_HINT_T0,
-                                        );
+                                if prefetch_neighbor_borders {
+                                    // Prefetch border data for the next tile's 8 neighbors.
+                                    // This hides the random-access latency of ghost zone gathering.
+                                    let nb = &*neighbors_ptr.add(near_ii);
+                                    for &ni in nb.iter() {
+                                        if ni != NO_NEIGHBOR {
+                                            _mm_prefetch(
+                                                borders_read_ptr.add(ni as usize) as *const i8,
+                                                _MM_HINT_T0,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -948,6 +954,7 @@ impl TurboLife {
                 active_len >= PARALLEL_STATIC_SCHEDULE_THRESHOLD || worker_count < thread_count;
             self.prepare_worker_scratch(worker_count, active_len);
             let scratch_ptr = SendPtr::new(self.worker_scratch.as_mut_ptr());
+            let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
 
             macro_rules! prefetch_for_work_item {
                 ($i:expr, $end:expr) => {
@@ -969,13 +976,15 @@ impl TurboLife {
                                 neighbors_ptr.get().add(near_ii) as *const i8,
                                 _MM_HINT_T0,
                             );
-                            let nb = &*neighbors_ptr.get().add(near_ii);
-                            for &ni in nb.iter() {
-                                if ni != NO_NEIGHBOR {
-                                    _mm_prefetch(
-                                        borders_read_ptr.get().add(ni as usize) as *const i8,
-                                        _MM_HINT_T0,
-                                    );
+                            if prefetch_neighbor_borders {
+                                let nb = &*neighbors_ptr.get().add(near_ii);
+                                for &ni in nb.iter() {
+                                    if ni != NO_NEIGHBOR {
+                                        _mm_prefetch(
+                                            borders_read_ptr.get().add(ni as usize) as *const i8,
+                                            _MM_HINT_T0,
+                                        );
+                                    }
                                 }
                             }
                         }
