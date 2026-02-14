@@ -23,10 +23,13 @@ const ACTIVE_SORT_STD_MAX: usize = 8_192;
 const ACTIVE_SORT_RADIX_MIN: usize = 32_768;
 const ACTIVE_SORT_LOW_CHURN_PCT: usize = 20;
 const ACTIVE_SORT_SKIP_MIN: usize = 2_048;
-const ACTIVE_SORT_SKIP_MAX: usize = 4_096;
+const ACTIVE_SORT_SKIP_MAX: usize = 8_192;
+const ACTIVE_SORT_PROBE_CHURN_PCT: usize = 40;
 const _: [(); 1] = [(); (ACTIVE_SORT_SKIP_MIN <= ACTIVE_SORT_SKIP_MAX) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_SKIP_MAX <= ACTIVE_SORT_STD_MAX) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_LOW_CHURN_PCT <= 100) as usize];
+const _: [(); 1] = [(); (ACTIVE_SORT_PROBE_CHURN_PCT <= 100) as usize];
+const _: [(); 1] = [(); (ACTIVE_SORT_LOW_CHURN_PCT <= ACTIVE_SORT_PROBE_CHURN_PCT) as usize];
 
 struct SendConstPtr<T> {
     inner: *const T,
@@ -66,6 +69,41 @@ fn should_skip_std_active_sort(active_len: usize, changed_count: usize) -> bool 
     }
 
     changed_count.saturating_mul(100) <= active_len.saturating_mul(ACTIVE_SORT_LOW_CHURN_PCT)
+}
+
+#[inline(always)]
+fn should_probe_std_active_sort(active_len: usize, changed_count: usize) -> bool {
+    let in_probe_window = (ACTIVE_SORT_SKIP_MIN..=ACTIVE_SORT_SKIP_MAX).contains(&active_len);
+    if !in_probe_window {
+        return false;
+    }
+
+    changed_count.saturating_mul(100) <= active_len.saturating_mul(ACTIVE_SORT_PROBE_CHURN_PCT)
+}
+
+#[inline(always)]
+fn active_set_is_sorted(active_set: &[TileIdx]) -> bool {
+    let len = active_set.len();
+    if len <= 1 {
+        return true;
+    }
+
+    let ptr = active_set.as_ptr();
+    let mut i = 1usize;
+    // SAFETY: `ptr` originates from `active_set`; `i` starts at 1 and is
+    // incremented while `i < len`, so all dereferences are in-bounds.
+    unsafe {
+        let mut prev = (*ptr).0;
+        while i < len {
+            let cur = (*ptr.add(i)).0;
+            if cur < prev {
+                return false;
+            }
+            prev = cur;
+            i += 1;
+        }
+    }
+    true
 }
 
 #[inline]
@@ -274,12 +312,17 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     }
 
     // Sort active set by index for better cache locality during kernel execution.
-    // Small sets use std sort unless a low-churn 2k-4k window opts out.
+    // Small sets use std sort unless the 2k-8k window opts out:
+    // very low churn skips immediately, and moderate churn probes sortedness.
     // Very large sets use a stable two-pass radix sort.
     // The 8k-32k band still skips sorting to keep rebuild costs bounded.
     let active_len = arena.active_set.len();
     if active_len <= ACTIVE_SORT_STD_MAX {
-        if !should_skip_std_active_sort(active_len, changed_count) {
+        let skip_for_low_churn = should_skip_std_active_sort(active_len, changed_count);
+        let probe_sorted =
+            !skip_for_low_churn && should_probe_std_active_sort(active_len, changed_count);
+        let skip_for_sorted = probe_sorted && active_set_is_sorted(&arena.active_set);
+        if !(skip_for_low_churn || skip_for_sorted) {
             arena.active_set.sort_unstable_by_key(|idx| idx.0);
         }
     } else if active_len >= ACTIVE_SORT_RADIX_MIN {
@@ -395,7 +438,11 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
 
 #[cfg(test)]
 mod tests {
-    use super::{TileArena, finalize_prune_and_expand, rebuild_active_set};
+    use super::{
+        TileArena, active_set_is_sorted, finalize_prune_and_expand, rebuild_active_set,
+        should_probe_std_active_sort, should_skip_std_active_sort,
+    };
+    use crate::turbolife::tile::TileIdx;
 
     #[test]
     fn rebuild_active_set_does_not_advance_epoch_without_changes() {
@@ -450,5 +497,39 @@ mod tests {
         assert!(arena.meta(live_idx).occupied());
         assert!(arena.meta(live_idx).has_live());
         assert_eq!(arena.idx_at((0, 0)), Some(live_idx));
+    }
+
+    #[test]
+    fn active_set_is_sorted_detects_monotonic_sequences() {
+        assert!(active_set_is_sorted(&[]));
+        assert!(active_set_is_sorted(&[TileIdx(1)]));
+        assert!(active_set_is_sorted(&[
+            TileIdx(1),
+            TileIdx(2),
+            TileIdx(2),
+            TileIdx(9)
+        ]));
+        assert!(!active_set_is_sorted(&[
+            TileIdx(1),
+            TileIdx(4),
+            TileIdx(3),
+            TileIdx(9),
+        ]));
+    }
+
+    #[test]
+    fn low_churn_skip_window_extends_to_std_sort_limit() {
+        assert!(should_skip_std_active_sort(8_192, 1_638));
+        assert!(!should_skip_std_active_sort(8_192, 1_639));
+        assert!(!should_skip_std_active_sort(8_193, 1_000));
+    }
+
+    #[test]
+    fn std_sort_probe_window_caps_at_forty_percent_churn() {
+        assert!(!should_probe_std_active_sort(2_047, 700));
+        assert!(should_probe_std_active_sort(2_048, 819));
+        assert!(!should_probe_std_active_sort(2_048, 820));
+        assert!(should_probe_std_active_sort(8_192, 3_276));
+        assert!(!should_probe_std_active_sort(8_192, 3_277));
     }
 }
