@@ -4,7 +4,7 @@ use rayon::prelude::*;
 
 use super::arena::TileArena;
 use super::kernel::ghost_is_empty_from_live_masks;
-use super::tile::{NO_NEIGHBOR, TileIdx};
+use super::tile::{MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
 
 const EXPAND_OFFSETS: [(i64, i64); 8] = [
     (0, 1),   // N
@@ -215,9 +215,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     if dense_rebuild {
         for &idx in &arena.changed_scratch {
             let meta = &mut arena.meta[idx.index()];
-            if meta.in_changed_list() {
-                meta.set_in_changed_list(false);
-            }
+            meta.set_in_changed_list(false);
         }
         arena.active_set.reserve(arena.occupied_count);
         if arena.free_list.is_empty() && arena.occupied_count + 1 == arena.meta.len() {
@@ -259,9 +257,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         // SAFETY: i < meta_len guaranteed by arena invariants (idx came from changed_list).
         unsafe {
             let m = &mut *meta_ptr.add(i);
-            if m.in_changed_list() {
-                m.set_in_changed_list(false);
-            }
+            m.set_in_changed_list(false);
             if m.occupied() && m.active_epoch != epoch {
                 m.active_epoch = epoch;
                 arena.active_set.push(idx);
@@ -314,11 +310,11 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
         }
         let (tx, ty) = arena.coords[src_i];
         let (dx, dy) = EXPAND_OFFSETS[dir];
-        let coord = (tx + dx, ty + dy);
-        let idx = arena.allocate_absent(coord);
-        arena.meta[idx.index()].set_changed(true);
-        arena.meta[idx.index()].active_epoch = 0;
-        arena.meta[idx.index()].population = 0;
+        let idx = arena.allocate_absent((tx + dx, ty + dy));
+        let meta = &mut arena.meta[idx.index()];
+        meta.set_changed(true);
+        meta.active_epoch = 0;
+        meta.population = 0;
         arena.mark_changed(idx);
     }
 
@@ -350,10 +346,14 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                     // SAFETY: pointers are stable and only read during this phase.
                     unsafe {
                         let meta = *mp.add(ii);
-                        if !meta.occupied() || meta.changed() || meta.has_live() {
+                        if !meta.occupied() || meta.has_live() {
                             continue;
                         }
-
+                        let missing_mask = meta.missing_mask;
+                        if missing_mask == MISSING_ALL_NEIGHBORS {
+                            acc.push(idx);
+                            continue;
+                        }
                         let nb = *np.add(ii);
                         let ghost_empty = ghost_is_empty_from_live_masks([
                             (*bp.add(nb[0] as usize)).live_mask,
@@ -382,10 +382,14 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
             let idx = arena.prune_buf[i];
             let ii = idx.index();
             let meta = arena.meta[ii];
-            if !meta.occupied() || meta.changed() || meta.has_live() {
+            if !meta.occupied() || meta.has_live() {
                 continue;
             }
-
+            let missing_mask = meta.missing_mask;
+            if missing_mask == MISSING_ALL_NEIGHBORS {
+                serial.push(idx);
+                continue;
+            }
             let nb = arena.neighbors[ii];
             let ghost_empty = ghost_is_empty_from_live_masks([
                 borders[nb[0] as usize].live_mask,

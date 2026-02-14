@@ -222,10 +222,6 @@ impl TileMeta {
     }
 
     #[inline(always)]
-    pub fn changed(self) -> bool {
-        self.flags & FLAG_CHANGED != 0
-    }
-    #[inline(always)]
     pub fn occupied(self) -> bool {
         self.flags & FLAG_OCCUPIED != 0
     }
