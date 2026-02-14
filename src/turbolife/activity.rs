@@ -4,7 +4,7 @@ use rayon::prelude::*;
 
 use super::arena::TileArena;
 use super::kernel::ghost_is_empty_from_live_masks_ptr;
-use super::tile::{TileIdx, MISSING_ALL_NEIGHBORS, NO_NEIGHBOR};
+use super::tile::{BorderData, MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
 
 const EXPAND_OFFSETS: [(i64, i64); 8] = [
     (0, 1),   // N
@@ -25,11 +25,22 @@ const ACTIVE_SORT_LOW_CHURN_PCT: usize = 20;
 const ACTIVE_SORT_SKIP_MIN: usize = 2_048;
 const ACTIVE_SORT_SKIP_MAX: usize = 8_192;
 const ACTIVE_SORT_PROBE_CHURN_PCT: usize = 40;
+const DIRECTIONAL_FILTER_ALWAYS_ON_MAX_CHANGED: usize = 64;
+const DIRECTIONAL_FILTER_PROBE_MAX_CHANGED: usize = 256;
+const DIRECTIONAL_FILTER_SAMPLE_MAX: usize = 256;
+const DIRECTIONAL_FILTER_DENSE_CHANGED_PCT: usize = 80;
+const DIRECTIONAL_FILTER_MAX_AVG_DIRS_X10: usize = 45;
 const _: [(); 1] = [(); (ACTIVE_SORT_SKIP_MIN <= ACTIVE_SORT_SKIP_MAX) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_SKIP_MAX <= ACTIVE_SORT_STD_MAX) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_LOW_CHURN_PCT <= 100) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_PROBE_CHURN_PCT <= 100) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_LOW_CHURN_PCT <= ACTIVE_SORT_PROBE_CHURN_PCT) as usize];
+const _: [(); 1] = [(); (DIRECTIONAL_FILTER_ALWAYS_ON_MAX_CHANGED
+    <= DIRECTIONAL_FILTER_PROBE_MAX_CHANGED) as usize];
+const _: [(); 1] =
+    [(); (DIRECTIONAL_FILTER_PROBE_MAX_CHANGED <= DIRECTIONAL_FILTER_SAMPLE_MAX) as usize];
+const _: [(); 1] = [(); (DIRECTIONAL_FILTER_DENSE_CHANGED_PCT <= 100) as usize];
+const _: [(); 1] = [(); (DIRECTIONAL_FILTER_MAX_AVG_DIRS_X10 <= 80) as usize];
 
 struct SendConstPtr<T> {
     inner: *const T,
@@ -104,6 +115,56 @@ fn active_set_is_sorted(active_set: &[TileIdx]) -> bool {
         }
     }
     true
+}
+
+#[inline(always)]
+fn border_neighbor_influence_mask(current: &BorderData, previous: &BorderData) -> u8 {
+    BorderData::compute_live_mask(
+        current.north ^ previous.north,
+        current.south ^ previous.south,
+        current.west ^ previous.west,
+        current.east ^ previous.east,
+    )
+}
+
+#[inline]
+fn should_use_directional_neighbor_filter(
+    arena: &TileArena,
+    changed_tiles: &[TileIdx],
+    border_phase: usize,
+) -> bool {
+    let changed_len = changed_tiles.len();
+    if changed_len <= DIRECTIONAL_FILTER_ALWAYS_ON_MAX_CHANGED {
+        return true;
+    }
+    if changed_len > DIRECTIONAL_FILTER_PROBE_MAX_CHANGED {
+        return false;
+    }
+    if arena.occupied_count > 0
+        && changed_len.saturating_mul(100)
+            >= arena
+                .occupied_count
+                .saturating_mul(DIRECTIONAL_FILTER_DENSE_CHANGED_PCT)
+    {
+        return false;
+    }
+
+    let sample_len = changed_len.min(DIRECTIONAL_FILTER_SAMPLE_MAX);
+    let borders_current = arena.borders[border_phase].as_ptr();
+    let borders_prev = arena.borders[1 - border_phase].as_ptr();
+    let changed_ptr = changed_tiles.as_ptr();
+    let mut influence_dirs = 0usize;
+
+    for i in 0..sample_len {
+        let idx = unsafe { *changed_ptr.add(i) }.index();
+        let influence = unsafe {
+            border_neighbor_influence_mask(&*borders_current.add(idx), &*borders_prev.add(idx))
+        };
+        influence_dirs += influence.count_ones() as usize;
+    }
+
+    influence_dirs.saturating_mul(10)
+        <= sample_len.saturating_mul(DIRECTIONAL_FILTER_MAX_AVG_DIRS_X10)
 }
 
 #[inline]
@@ -277,6 +338,11 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         .reserve(changed_count.saturating_mul(9).min(arena.occupied_count));
     let neighbors_ptr = arena.neighbors.as_ptr();
     let meta_ptr = arena.meta.as_ptr();
+    let border_phase = arena.border_phase;
+    let borders_current_ptr = arena.borders[border_phase].as_ptr();
+    let borders_prev_ptr = arena.borders[1 - border_phase].as_ptr();
+    let directional_neighbor_filter =
+        should_use_directional_neighbor_filter(arena, &arena.changed_scratch, border_phase);
 
     let changed_ptr = arena.changed_scratch.as_ptr();
     for changed_i in 0..changed_count {
@@ -287,18 +353,52 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         if unsafe { !arena.active_test_and_set_unchecked(i) } {
             arena.active_set.push(idx);
         }
-        // SAFETY: i < meta_len guaranteed by arena invariants (idx came from changed_list).
-        unsafe {
-            let nb = *neighbors_ptr.add(i);
-            for &ni_raw in nb.iter() {
-                if ni_raw == NO_NEIGHBOR {
-                    continue;
+
+        if directional_neighbor_filter {
+            let influence_mask = unsafe {
+                border_neighbor_influence_mask(
+                    &*borders_current_ptr.add(i),
+                    &*borders_prev_ptr.add(i),
+                )
+            };
+            if influence_mask == 0 {
+                continue;
+            }
+
+            // SAFETY: i < meta_len guaranteed by arena invariants
+            // (idx came from changed_list).
+            unsafe {
+                let nb = *neighbors_ptr.add(i);
+                let dirs = &EXPAND_MASK_TABLE.dirs[influence_mask as usize];
+                let count = EXPAND_MASK_TABLE.len[influence_mask as usize] as usize;
+                for &dir in dirs[..count].iter() {
+                    let ni_raw = nb[dir as usize];
+                    if ni_raw == NO_NEIGHBOR {
+                        continue;
+                    }
+                    let ni_i = ni_raw as usize;
+                    debug_assert!(ni_i < meta_len);
+                    debug_assert!((*meta_ptr.add(ni_i)).occupied());
+                    if !arena.active_test_and_set_unchecked(ni_i) {
+                        arena.active_set.push(TileIdx(ni_raw));
+                    }
                 }
-                let ni_i = ni_raw as usize;
-                debug_assert!(ni_i < meta_len);
-                debug_assert!((*meta_ptr.add(ni_i)).occupied());
-                if !arena.active_test_and_set_unchecked(ni_i) {
-                    arena.active_set.push(TileIdx(ni_raw));
+            }
+        } else {
+            // SAFETY: i < meta_len guaranteed by arena invariants
+            // (idx came from changed_list).
+            unsafe {
+                let nb = *neighbors_ptr.add(i);
+                for &ni_raw in nb.iter() {
+                    if ni_raw == NO_NEIGHBOR {
+                        continue;
+                    }
+                    let ni_i = ni_raw as usize;
+                    debug_assert!(ni_i < meta_len);
+                    debug_assert!((*meta_ptr.add(ni_i)).occupied());
+                    if !arena.active_test_and_set_unchecked(ni_i) {
+                        arena.active_set.push(TileIdx(ni_raw));
+                    }
                 }
             }
         }
@@ -425,10 +525,10 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_set_is_sorted, finalize_prune_and_expand, rebuild_active_set,
-        should_probe_std_active_sort, should_skip_std_active_sort, TileArena,
+        TileArena, active_set_is_sorted, border_neighbor_influence_mask, finalize_prune_and_expand,
+        rebuild_active_set, should_probe_std_active_sort, should_skip_std_active_sort,
     };
-    use crate::turbolife::tile::TileIdx;
+    use crate::turbolife::tile::{BorderData, TileIdx};
 
     #[test]
     fn rebuild_active_set_stays_empty_without_changes() {
@@ -516,5 +616,64 @@ mod tests {
         assert!(!should_probe_std_active_sort(2_048, 820));
         assert!(should_probe_std_active_sort(8_192, 3_276));
         assert!(!should_probe_std_active_sort(8_192, 3_277));
+    }
+
+    #[test]
+    fn border_neighbor_influence_mask_tracks_edges_and_corners() {
+        let prev = BorderData::default();
+        let cur = BorderData::from_edges(1u64 << 5, 1u64 << 63, 0, 0);
+        let mask = border_neighbor_influence_mask(&cur, &prev);
+        assert_eq!(mask & (1 << 0), 1 << 0); // N
+        assert_eq!(mask & (1 << 1), 1 << 1); // S
+        assert_eq!(mask & (1 << 5), 0); // NE corner unchanged
+        assert_eq!(mask & (1 << 7), 1 << 7); // SE corner changed
+    }
+
+    #[test]
+    fn rebuild_active_set_skips_neighbors_when_border_is_unchanged() {
+        let mut arena = TileArena::new();
+        let center = arena.allocate((0, 0));
+        let _north = arena.allocate((0, 1));
+        let _south = arena.allocate((0, -1));
+        let _west = arena.allocate((-1, 0));
+        let _east = arena.allocate((1, 0));
+        let _nw = arena.allocate((-1, 1));
+        let _ne = arena.allocate((1, 1));
+        let _sw = arena.allocate((-1, -1));
+        let _se = arena.allocate((1, -1));
+
+        let bp = arena.border_phase;
+        arena.borders[bp][center.index()] = BorderData::default();
+        arena.borders[1 - bp][center.index()] = BorderData::default();
+        arena.mark_changed(center);
+
+        rebuild_active_set(&mut arena);
+
+        assert_eq!(arena.active_set, vec![center]);
+    }
+
+    #[test]
+    fn rebuild_active_set_only_activates_impacted_neighbors() {
+        let mut arena = TileArena::new();
+        let center = arena.allocate((0, 0));
+        let north = arena.allocate((0, 1));
+        let _south = arena.allocate((0, -1));
+        let _west = arena.allocate((-1, 0));
+        let _east = arena.allocate((1, 0));
+        let nw = arena.allocate((-1, 1));
+        let _ne = arena.allocate((1, 1));
+        let _sw = arena.allocate((-1, -1));
+        let _se = arena.allocate((1, -1));
+
+        let bp = arena.border_phase;
+        arena.borders[bp][center.index()] = BorderData::from_edges(1, 0, 0, 0);
+        arena.borders[1 - bp][center.index()] = BorderData::default();
+        arena.mark_changed(center);
+
+        rebuild_active_set(&mut arena);
+
+        let mut active = arena.active_set.clone();
+        active.sort_unstable_by_key(|idx| idx.0);
+        assert_eq!(active, vec![center, north, nw]);
     }
 }

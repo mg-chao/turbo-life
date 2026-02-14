@@ -4,7 +4,7 @@
 //! Border extraction is fused into the main loop.
 //! Works with split cell buffers (separate current/next vecs).
 
-use super::tile::{BorderData, CellBuf, GhostZone, TileMeta, MISSING_ALL_NEIGHBORS, TILE_SIZE};
+use super::tile::{BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, TILE_SIZE, TileMeta};
 const _: [(); 1] = [(); (TILE_SIZE == 64) as usize];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,9 +236,28 @@ pub fn advance_core_scalar(
     (changed, border, has_live)
 }
 
+const fn build_corner_birth_table() -> [u8; 32] {
+    let mut table = [0u8; 32];
+    let mut bits = 0usize;
+    while bits < 32 {
+        let mut count = 0u32;
+        count += (bits & 1) as u32;
+        count += ((bits >> 1) & 1) as u32;
+        count += ((bits >> 2) & 1) as u32;
+        count += ((bits >> 3) & 1) as u32;
+        count += ((bits >> 4) & 1) as u32;
+        table[bits] = (count == 3) as u8;
+        bits += 1;
+    }
+    table
+}
+
+const CORNER_BIRTH_TABLE: [u8; 32] = build_corner_birth_table();
+
 #[inline(always)]
-fn birth_from_count5(a: u64, b: u64, c: u64, d: u64, e: u64) -> u64 {
-    ((a + b + c + d + e) == 3) as u64
+fn birth_from_count5(bits: u64) -> u64 {
+    debug_assert!(bits < 32);
+    CORNER_BIRTH_TABLE[(bits as usize) & 0b1_1111] as u64
 }
 
 /// Specialized core for tiles whose current buffer is entirely dead.
@@ -255,34 +274,31 @@ pub(crate) fn advance_core_empty(
     let west_trip = (ghost.west << 1) & ghost.west & (ghost.west >> 1);
     let east_trip = (ghost.east << 1) & ghost.east & (ghost.east >> 1);
 
-    let sw_birth = birth_from_count5(
-        ghost.south & 1,
-        (ghost.south >> 1) & 1,
-        ghost.west & 1,
-        (ghost.west >> 1) & 1,
-        ghost.sw as u64,
-    );
-    let se_birth = birth_from_count5(
-        (ghost.south >> 63) & 1,
-        (ghost.south >> 62) & 1,
-        ghost.east & 1,
-        (ghost.east >> 1) & 1,
-        ghost.se as u64,
-    );
-    let nw_birth = birth_from_count5(
-        ghost.north & 1,
-        (ghost.north >> 1) & 1,
-        (ghost.west >> 63) & 1,
-        (ghost.west >> 62) & 1,
-        ghost.nw as u64,
-    );
-    let ne_birth = birth_from_count5(
-        (ghost.north >> 63) & 1,
-        (ghost.north >> 62) & 1,
-        (ghost.east >> 63) & 1,
-        (ghost.east >> 62) & 1,
-        ghost.ne as u64,
-    );
+    let sw_bits = (ghost.south & 1)
+        | (((ghost.south >> 1) & 1) << 1)
+        | ((ghost.west & 1) << 2)
+        | (((ghost.west >> 1) & 1) << 3)
+        | ((ghost.sw as u64) << 4);
+    let se_bits = ((ghost.south >> 63) & 1)
+        | (((ghost.south >> 62) & 1) << 1)
+        | ((ghost.east & 1) << 2)
+        | (((ghost.east >> 1) & 1) << 3)
+        | ((ghost.se as u64) << 4);
+    let nw_bits = (ghost.north & 1)
+        | (((ghost.north >> 1) & 1) << 1)
+        | (((ghost.west >> 63) & 1) << 2)
+        | (((ghost.west >> 62) & 1) << 3)
+        | ((ghost.nw as u64) << 4);
+    let ne_bits = ((ghost.north >> 63) & 1)
+        | (((ghost.north >> 62) & 1) << 1)
+        | (((ghost.east >> 63) & 1) << 2)
+        | (((ghost.east >> 62) & 1) << 3)
+        | ((ghost.ne as u64) << 4);
+
+    let sw_birth = birth_from_count5(sw_bits);
+    let se_birth = birth_from_count5(se_bits);
+    let nw_birth = birth_from_count5(nw_bits);
+    let ne_birth = birth_from_count5(ne_bits);
 
     let south_row = south_trip | sw_birth | (se_birth << 63);
     let north_row = north_trip | nw_birth | (ne_birth << 63);
@@ -769,9 +785,9 @@ pub unsafe fn advance_tile_split(
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_core_empty, advance_core_scalar, ghost_bit, ghost_is_empty,
-        ghost_is_empty_from_live_masks, ghost_is_empty_from_live_masks_ptr, tile_is_empty,
-        BorderData, GhostZone, TILE_SIZE,
+        BorderData, GhostZone, TILE_SIZE, advance_core_empty, advance_core_scalar, ghost_bit,
+        ghost_is_empty, ghost_is_empty_from_live_masks, ghost_is_empty_from_live_masks_ptr,
+        tile_is_empty,
     };
 
     #[cfg(target_arch = "x86_64")]
@@ -823,6 +839,14 @@ mod tests {
         assert_eq!(border.west, 0);
         assert_eq!(border.east, 0);
         assert_eq!(border.live_mask(), 0);
+    }
+
+    #[test]
+    fn corner_birth_table_matches_three_neighbor_rule() {
+        for bits in 0u64..32 {
+            let expected = (bits.count_ones() == 3) as u64;
+            assert_eq!(super::birth_from_count5(bits), expected);
+        }
     }
 
     #[test]
