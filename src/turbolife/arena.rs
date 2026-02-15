@@ -543,11 +543,18 @@ impl TileArena {
             self.active_epoch = 1;
             self.active_tags.fill(0);
         }
+        if self.active_tags.is_empty() {
+            self.active_tags.push(0);
+        }
+        // Reserve slot 0 (NO_NEIGHBOR sentinel) so branchless neighbor fan-out
+        // can mark/test it without ever pushing it to active_set.
+        self.active_tags[0] = self.active_epoch;
     }
 
     #[inline(always)]
     pub(crate) fn begin_active_rebuild_with_capacity(&mut self, required_slots: usize) {
         self.begin_active_rebuild();
+        let required_slots = required_slots.max(1);
         if self.active_tags.len() < required_slots {
             self.active_tags.resize(required_slots, 0);
         }
@@ -953,6 +960,15 @@ mod tests {
         assert_eq!(arena.active_tags[i], 0);
         assert!(!arena.active_test_and_set(i));
         assert!(arena.active_test_and_set(i));
+    }
+
+    #[test]
+    fn begin_active_rebuild_keeps_no_neighbor_slot_reserved() {
+        let mut arena = TileArena::new();
+
+        arena.begin_active_rebuild();
+
+        assert!(arena.active_test_and_set(NO_NEIGHBOR as usize));
     }
 
     #[test]

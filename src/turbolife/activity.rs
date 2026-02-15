@@ -292,9 +292,6 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                     *marks_ptr.add(word) |= 1u64 << (i & 63);
                     let nb = *neighbors_ptr.add(i);
                     for &ni_raw in nb.iter() {
-                        if ni_raw == NO_NEIGHBOR {
-                            continue;
-                        }
                         let ni = ni_raw as usize;
                         let ni_word = ni >> 6;
                         *marks_ptr.add(ni_word) |= 1u64 << (ni & 63);
@@ -311,16 +308,9 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                 unsafe {
                     let word = i >> 6;
                     *marks_ptr.add(word) |= 1u64 << (i & 63);
-
-                    if influence_mask == 0 {
-                        continue;
-                    }
                     let nb = *neighbors_ptr.add(i);
                     if influence_mask == u8::MAX {
                         for &ni_raw in nb.iter() {
-                            if ni_raw == NO_NEIGHBOR {
-                                continue;
-                            }
                             let ni = ni_raw as usize;
                             let ni_word = ni >> 6;
                             *marks_ptr.add(ni_word) |= 1u64 << (ni & 63);
@@ -330,9 +320,6 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                         let count = EXPAND_MASK_TABLE.len[influence_mask as usize] as usize;
                         for &dir in dirs[..count].iter() {
                             let ni_raw = nb[dir as usize];
-                            if ni_raw == NO_NEIGHBOR {
-                                continue;
-                            }
                             let ni = ni_raw as usize;
                             let ni_word = ni >> 6;
                             *marks_ptr.add(ni_word) |= 1u64 << (ni & 63);
@@ -396,12 +383,9 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
             unsafe {
                 let nb = *neighbors_ptr.add(i);
                 for &ni_raw in nb.iter() {
-                    if ni_raw == NO_NEIGHBOR {
-                        continue;
-                    }
                     let ni_i = ni_raw as usize;
                     debug_assert!(ni_i < meta_len);
-                    debug_assert!((*meta_ptr.add(ni_i)).occupied());
+                    debug_assert!(ni_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni_i)).occupied());
                     if !arena.active_test_and_set_unchecked(ni_i) {
                         arena.active_set.push(TileIdx(ni_raw));
                     }
@@ -429,12 +413,11 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                 let nb = *neighbors_ptr.add(i);
                 if influence_mask == u8::MAX {
                     for &ni_raw in nb.iter() {
-                        if ni_raw == NO_NEIGHBOR {
-                            continue;
-                        }
                         let ni_i = ni_raw as usize;
                         debug_assert!(ni_i < meta_len);
-                        debug_assert!((*meta_ptr.add(ni_i)).occupied());
+                        debug_assert!(
+                            ni_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni_i)).occupied()
+                        );
                         if !arena.active_test_and_set_unchecked(ni_i) {
                             arena.active_set.push(TileIdx(ni_raw));
                         }
@@ -444,12 +427,11 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                     let count = EXPAND_MASK_TABLE.len[influence_mask as usize] as usize;
                     for &dir in dirs[..count].iter() {
                         let ni_raw = nb[dir as usize];
-                        if ni_raw == NO_NEIGHBOR {
-                            continue;
-                        }
                         let ni_i = ni_raw as usize;
                         debug_assert!(ni_i < meta_len);
-                        debug_assert!((*meta_ptr.add(ni_i)).occupied());
+                        debug_assert!(
+                            ni_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni_i)).occupied()
+                        );
                         if !arena.active_test_and_set_unchecked(ni_i) {
                             arena.active_set.push(TileIdx(ni_raw));
                         }

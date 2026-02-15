@@ -946,8 +946,32 @@ unsafe fn advance_tile_fused_impl<
     let meta = unsafe { &mut *meta_ptr.add(idx) };
     let missing_mask = meta.missing_mask;
     let tile_has_live = meta.has_live();
+    let north_i = nb[0] as usize;
+    let south_i = nb[1] as usize;
+    let west_i = nb[2] as usize;
+    let east_i = nb[3] as usize;
+    let nw_i = nb[4] as usize;
+    let ne_i = nb[5] as usize;
+    let sw_i = nb[6] as usize;
+    let se_i = nb[7] as usize;
 
-    if !tile_has_live {
+    let (changed, border, has_live) = if tile_has_live {
+        let nw_live = unsafe { *live_masks_read_ptr.add(nw_i) };
+        let ne_live = unsafe { *live_masks_read_ptr.add(ne_i) };
+        let sw_live = unsafe { *live_masks_read_ptr.add(sw_i) };
+        let se_live = unsafe { *live_masks_read_ptr.add(se_i) };
+        let ghost = GhostZone {
+            north: unsafe { *borders_south_read_ptr.add(north_i) },
+            south: unsafe { *borders_north_read_ptr.add(south_i) },
+            west: unsafe { *borders_east_read_ptr.add(west_i) },
+            east: unsafe { *borders_west_read_ptr.add(east_i) },
+            nw: (nw_live & LIVE_SE) != 0,
+            ne: (ne_live & LIVE_SW) != 0,
+            sw: (sw_live & LIVE_NE) != 0,
+            se: (se_live & LIVE_NW) != 0,
+        };
+        unsafe { advance_core_const::<CORE_BACKEND, ASSUME_CHANGED>(current, next, &ghost) }
+    } else {
         if missing_mask == MISSING_ALL_NEIGHBORS {
             debug_assert!(tile_is_empty(current));
             unsafe {
@@ -966,10 +990,23 @@ unsafe fn advance_tile_fused_impl<
             return TileAdvanceResult::new(false, false, missing_mask, 0, 0);
         }
 
-        // Ultra-fast path: metadata says current tile is empty and halo has no
-        // incoming live activity.
-        let ghost_empty = unsafe { ghost_is_empty_from_live_masks_ptr(live_masks_read_ptr, nb) };
-
+        let north_live = unsafe { *live_masks_read_ptr.add(north_i) };
+        let south_live = unsafe { *live_masks_read_ptr.add(south_i) };
+        let west_live = unsafe { *live_masks_read_ptr.add(west_i) };
+        let east_live = unsafe { *live_masks_read_ptr.add(east_i) };
+        let nw_live = unsafe { *live_masks_read_ptr.add(nw_i) };
+        let ne_live = unsafe { *live_masks_read_ptr.add(ne_i) };
+        let sw_live = unsafe { *live_masks_read_ptr.add(sw_i) };
+        let se_live = unsafe { *live_masks_read_ptr.add(se_i) };
+        let ghost_empty = ((north_live & LIVE_S)
+            | (south_live & LIVE_N)
+            | (west_live & LIVE_E)
+            | (east_live & LIVE_W)
+            | (nw_live & LIVE_SE)
+            | (ne_live & LIVE_SW)
+            | (sw_live & LIVE_NE)
+            | (se_live & LIVE_NW))
+            == 0;
         if ghost_empty {
             debug_assert!(tile_is_empty(current));
             unsafe {
@@ -987,32 +1024,17 @@ unsafe fn advance_tile_fused_impl<
             meta.update_after_step(false, false);
             return TileAdvanceResult::new(false, false, missing_mask, 0, 0);
         }
-    }
 
-    // Inline ghost-zone gather (avoids function call + struct construction).
-    let north_i = nb[0] as usize;
-    let south_i = nb[1] as usize;
-    let west_i = nb[2] as usize;
-    let east_i = nb[3] as usize;
-    let nw_i = nb[4] as usize;
-    let ne_i = nb[5] as usize;
-    let sw_i = nb[6] as usize;
-    let se_i = nb[7] as usize;
-
-    let ghost = GhostZone {
-        north: unsafe { *borders_south_read_ptr.add(north_i) },
-        south: unsafe { *borders_north_read_ptr.add(south_i) },
-        west: unsafe { *borders_east_read_ptr.add(west_i) },
-        east: unsafe { *borders_west_read_ptr.add(east_i) },
-        nw: unsafe { (*live_masks_read_ptr.add(nw_i) & LIVE_SE) != 0 },
-        ne: unsafe { (*live_masks_read_ptr.add(ne_i) & LIVE_SW) != 0 },
-        sw: unsafe { (*live_masks_read_ptr.add(sw_i) & LIVE_NE) != 0 },
-        se: unsafe { (*live_masks_read_ptr.add(se_i) & LIVE_NW) != 0 },
-    };
-
-    let (changed, border, has_live) = if tile_has_live {
-        unsafe { advance_core_const::<CORE_BACKEND, ASSUME_CHANGED>(current, next, &ghost) }
-    } else {
+        let ghost = GhostZone {
+            north: unsafe { *borders_south_read_ptr.add(north_i) },
+            south: unsafe { *borders_north_read_ptr.add(south_i) },
+            west: unsafe { *borders_east_read_ptr.add(west_i) },
+            east: unsafe { *borders_west_read_ptr.add(east_i) },
+            nw: (nw_live & LIVE_SE) != 0,
+            ne: (ne_live & LIVE_SW) != 0,
+            sw: (sw_live & LIVE_NE) != 0,
+            se: (se_live & LIVE_NW) != 0,
+        };
         debug_assert!(tile_is_empty(current));
         advance_core_empty_with_clear(next, &ghost, meta.alt_phase_dirty())
     };
