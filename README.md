@@ -24,7 +24,27 @@ cargo build --release
 cargo run --release
 ```
 
-Seeds a 4096×4096 region at 42% density and runs 1000 generations, printing total and per-iteration timings.
+Seeds a 4096×4096 region at 42% density and runs 2000 generations (reported every 1000), printing total and per-iteration timings.
+
+## Performance workflow
+
+Main-harness benchmark helper (parses the `TurboLife` summary line and reports min/median/mean):
+
+```
+./scripts/bench_main.sh 10
+```
+
+PGO build helper (uses `src/main.rs` as the training workload and produces `target/pgo-use/release/turbo-life`):
+
+```
+./scripts/build_pgo.sh 3
+```
+
+To pass CLI args through to the training/benchmark harness, append them after the run count:
+
+```
+./scripts/build_pgo.sh 3 --threads 6 --kernel neon
+```
 
 ## Threading behavior
 
@@ -42,8 +62,8 @@ cargo run --release
 
 ## Kernel backend selection
 
-- `TURBOLIFE_KERNEL=auto|scalar|avx2` controls kernel dispatch behavior.
-- Default is `auto` (uses AVX2 on supported `x86_64` CPUs, otherwise scalar).
+- `TURBOLIFE_KERNEL=auto|scalar|avx2|neon` controls kernel dispatch behavior.
+- Default is `auto` (uses AVX2 on supported `x86_64`, NEON on supported `aarch64`, otherwise scalar).
 - `scalar` is useful for comparison and debugging.
 
 ## Tests

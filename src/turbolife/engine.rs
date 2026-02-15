@@ -1880,10 +1880,26 @@ impl TurboLife {
     }
 
     pub fn step_n(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+
+        // Split borrow: take a shared ref to the pool before mutably borrowing self.
         let pool = &self.pool as *const rayon::ThreadPool;
+        // SAFETY: `pool` is not modified during `install`, and `step_impl` only
+        // mutates arena/generation/population_cache - never the pool itself.
         unsafe { &*pool }.install(|| {
-            for _ in 0..n {
+            let mut remaining = n;
+            while remaining >= 4 {
                 self.step_impl();
+                self.step_impl();
+                self.step_impl();
+                self.step_impl();
+                remaining -= 4;
+            }
+            while remaining != 0 {
+                self.step_impl();
+                remaining -= 1;
             }
         });
     }
