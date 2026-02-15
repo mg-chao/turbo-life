@@ -657,7 +657,7 @@ unsafe fn neon_half_add(
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-pub unsafe fn advance_core_neon(
+unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool>(
     current: &[u64; TILE_SIZE],
     next: &mut [u64; TILE_SIZE],
     ghost: &GhostZone,
@@ -725,8 +725,10 @@ pub unsafe fn advance_core_neon(
             let alive_mask = vandq_u64(veorq_u64(t2, vdupq_n_u64(u64::MAX)), t1);
             let next_rows = vandq_u64(alive_mask, vorrq_u64(t0, $row_self));
 
-            let diff = veorq_u64(next_rows, $row_self);
-            diff_acc = vorrq_u64(diff_acc, diff);
+            if TRACK_DIFF {
+                let diff = veorq_u64(next_rows, $row_self);
+                diff_acc = vorrq_u64(diff_acc, diff);
+            }
             live_acc = vorrq_u64(live_acc, next_rows);
 
             unsafe {
@@ -781,9 +783,33 @@ pub unsafe fn advance_core_neon(
     process_pair!(last_base, row_above_last, row_self_last, row_below_last);
 
     let border = BorderData::from_edges(border_north, border_south, border_west, border_east);
-    let changed = (vgetq_lane_u64(diff_acc, 0) | vgetq_lane_u64(diff_acc, 1)) != 0;
+    let changed = if TRACK_DIFF {
+        (vgetq_lane_u64(diff_acc, 0) | vgetq_lane_u64(diff_acc, 1)) != 0
+    } else {
+        true
+    };
     let has_live = (vgetq_lane_u64(live_acc, 0) | vgetq_lane_u64(live_acc, 1)) != 0;
     (changed, border, has_live)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn advance_core_neon(
+    current: &[u64; TILE_SIZE],
+    next: &mut [u64; TILE_SIZE],
+    ghost: &GhostZone,
+) -> (bool, BorderData, bool) {
+    unsafe { advance_core_neon_impl::<true>(current, next, ghost) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn advance_core_neon_assume_changed(
+    current: &[u64; TILE_SIZE],
+    next: &mut [u64; TILE_SIZE],
+    ghost: &GhostZone,
+) -> (bool, BorderData, bool) {
+    unsafe { advance_core_neon_impl::<false>(current, next, ghost) }
 }
 
 #[inline(always)]
@@ -827,11 +853,16 @@ const CORE_BACKEND_AVX2: u8 = 1;
 const CORE_BACKEND_NEON: u8 = 2;
 
 #[inline(always)]
-unsafe fn advance_core_const<const CORE_BACKEND: u8>(
+unsafe fn advance_core_const<const CORE_BACKEND: u8, const ASSUME_CHANGED: bool>(
     current: &[u64; TILE_SIZE],
     next: &mut [u64; TILE_SIZE],
     ghost: &GhostZone,
 ) -> (bool, BorderData, bool) {
+    debug_assert!(
+        !ASSUME_CHANGED || CORE_BACKEND == CORE_BACKEND_NEON,
+        "ASSUME_CHANGED is only supported for the NEON backend"
+    );
+
     if CORE_BACKEND == CORE_BACKEND_AVX2 {
         #[cfg(target_arch = "x86_64")]
         {
@@ -845,6 +876,9 @@ unsafe fn advance_core_const<const CORE_BACKEND: u8>(
     if CORE_BACKEND == CORE_BACKEND_NEON {
         #[cfg(target_arch = "aarch64")]
         {
+            if ASSUME_CHANGED {
+                return unsafe { advance_core_neon_assume_changed(current, next, ghost) };
+            }
             return unsafe { advance_core_neon(current, next, ghost) };
         }
         #[cfg(not(target_arch = "aarch64"))]
@@ -867,7 +901,7 @@ unsafe fn advance_core_const<const CORE_BACKEND: u8>(
 /// `meta_ptr[idx]`, `next_borders_ptr[idx]`, and `next_live_masks_ptr[idx]`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn advance_tile_fused_impl<const CORE_BACKEND: u8>(
+unsafe fn advance_tile_fused_impl<const CORE_BACKEND: u8, const ASSUME_CHANGED: bool>(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut TileMeta,
@@ -939,7 +973,7 @@ unsafe fn advance_tile_fused_impl<const CORE_BACKEND: u8>(
     };
 
     let (changed, border, has_live) = if tile_has_live {
-        unsafe { advance_core_const::<CORE_BACKEND>(current, next, &ghost) }
+        unsafe { advance_core_const::<CORE_BACKEND, ASSUME_CHANGED>(current, next, &ghost) }
     } else {
         debug_assert!(tile_is_empty(current));
         advance_core_empty(next, &ghost)
@@ -998,7 +1032,7 @@ pub unsafe fn advance_tile_fused_scalar(
     track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_SCALAR }>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_SCALAR }, false>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1041,7 +1075,7 @@ pub unsafe fn advance_tile_fused_avx2(
     track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_AVX2 }>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_AVX2 }, false>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1084,7 +1118,50 @@ pub unsafe fn advance_tile_fused_neon(
     track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, false>(
+            current_ptr,
+            next_ptr,
+            meta_ptr,
+            next_borders_north_ptr,
+            next_borders_south_ptr,
+            next_borders_west_ptr,
+            next_borders_east_ptr,
+            borders_north_read_ptr,
+            borders_south_read_ptr,
+            borders_west_read_ptr,
+            borders_east_read_ptr,
+            neighbors_ptr,
+            live_masks_read_ptr,
+            next_live_masks_ptr,
+            idx,
+            track_neighbor_influence,
+        )
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn advance_tile_fused_neon_assume_changed(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
+    meta_ptr: *mut TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+    track_neighbor_influence: bool,
+) -> TileAdvanceResult {
+    unsafe {
+        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, true>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1153,7 +1230,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use super::advance_core_avx2;
     #[cfg(target_arch = "aarch64")]
-    use super::advance_core_neon;
+    use super::{advance_core_neon, advance_core_neon_assume_changed};
 
     use rand::RngCore;
     use rand::SeedableRng;
@@ -1365,6 +1442,35 @@ mod tests {
             assert_eq!(scalar.1.west, neon.1.west);
             assert_eq!(scalar.1.east, neon.1.east);
             assert_eq!(scalar.1.live_mask(), neon.1.live_mask());
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_assume_changed_preserves_outputs() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xFACE_0000_A11C_0DE5);
+        for _ in 0..2048 {
+            let current = random_tile(&mut rng);
+            let ghost = random_ghost(&mut rng);
+            let mut next_neon = [0u64; TILE_SIZE];
+            let mut next_assume = [0u64; TILE_SIZE];
+
+            let neon = unsafe { advance_core_neon(&current, &mut next_neon, &ghost) };
+            let assume =
+                unsafe { advance_core_neon_assume_changed(&current, &mut next_assume, &ghost) };
+
+            assert_eq!(next_neon, next_assume);
+            assert!(assume.0);
+            assert_eq!(neon.2, assume.2);
+            assert_eq!(neon.1.north, assume.1.north);
+            assert_eq!(neon.1.south, assume.1.south);
+            assert_eq!(neon.1.west, assume.1.west);
+            assert_eq!(neon.1.east, assume.1.east);
+            assert_eq!(neon.1.live_mask(), assume.1.live_mask());
         }
     }
 

@@ -12,6 +12,8 @@ use super::kernel::advance_core;
 use super::kernel::advance_tile_fused_avx2;
 #[cfg(target_arch = "aarch64")]
 use super::kernel::advance_tile_fused_neon;
+#[cfg(target_arch = "aarch64")]
+use super::kernel::advance_tile_fused_neon_assume_changed;
 use super::kernel::{KernelBackend, advance_tile_fused_scalar};
 use super::tile::{self, Direction, NO_NEIGHBOR, POPULATION_UNKNOWN, TileIdx};
 #[cfg(target_arch = "x86_64")]
@@ -84,6 +86,8 @@ const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 512;
 #[cfg(target_arch = "x86_64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 const PRECISE_INFLUENCE_MAX_ACTIVE: usize = 256;
+const ASSUME_CHANGED_NEON_MIN_ACTIVE: usize = 2_048;
+const ASSUME_CHANGED_NEON_MIN_CHURN_PCT: usize = 85;
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -821,6 +825,11 @@ impl TurboLife {
         let effective_threads = tuned_parallel_threads(active_len, thread_count);
         let run_parallel = effective_threads > 1;
         let track_neighbor_influence = active_len <= PRECISE_INFLUENCE_MAX_ACTIVE;
+        let assume_changed_neon = !track_neighbor_influence
+            && backend == KernelBackend::Neon
+            && active_len >= ASSUME_CHANGED_NEON_MIN_ACTIVE
+            && changed_len.saturating_mul(100)
+                >= active_len.saturating_mul(ASSUME_CHANGED_NEON_MIN_CHURN_PCT);
 
         let (cb_lo, cb_hi) = self.arena.cell_bufs.split_at_mut(1);
         let (current_vec, next_vec) = if cp == 0 {
@@ -1113,7 +1122,11 @@ impl TurboLife {
                     KernelBackend::Neon => {
                         #[cfg(target_arch = "aarch64")]
                         {
-                            serial_loop_fused!(advance_tile_fused_neon, false);
+                            if assume_changed_neon {
+                                serial_loop_fused!(advance_tile_fused_neon_assume_changed, false);
+                            } else {
+                                serial_loop_fused!(advance_tile_fused_neon, false);
+                            }
                         }
                         #[cfg(not(target_arch = "aarch64"))]
                         {
@@ -1301,7 +1314,19 @@ impl TurboLife {
                         KernelBackend::Neon => {
                             #[cfg(target_arch = "aarch64")]
                             {
-                                parallel_kernel_static!(advance_tile_fused_neon, chunk_size, false)
+                                if assume_changed_neon {
+                                    parallel_kernel_static!(
+                                        advance_tile_fused_neon_assume_changed,
+                                        chunk_size,
+                                        false
+                                    )
+                                } else {
+                                    parallel_kernel_static!(
+                                        advance_tile_fused_neon,
+                                        chunk_size,
+                                        false
+                                    )
+                                }
                             }
                             #[cfg(not(target_arch = "aarch64"))]
                             {
@@ -1380,7 +1405,14 @@ impl TurboLife {
                         KernelBackend::Neon => {
                             #[cfg(target_arch = "aarch64")]
                             {
-                                parallel_kernel_lockfree!(advance_tile_fused_neon, false)
+                                if assume_changed_neon {
+                                    parallel_kernel_lockfree!(
+                                        advance_tile_fused_neon_assume_changed,
+                                        false
+                                    )
+                                } else {
+                                    parallel_kernel_lockfree!(advance_tile_fused_neon, false)
+                                }
                             }
                             #[cfg(not(target_arch = "aarch64"))]
                             {

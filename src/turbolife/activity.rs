@@ -124,6 +124,24 @@ fn active_set_is_sorted(active_set: &[TileIdx]) -> bool {
     true
 }
 
+#[inline(always)]
+fn active_set_is_dense_contiguous(active_set: &[TileIdx], occupied_count: usize) -> bool {
+    if occupied_count > u32::MAX as usize || active_set.len() != occupied_count {
+        return false;
+    }
+    if active_set.first().map(|idx| idx.0) != Some(1)
+        || active_set.last().map(|idx| idx.0) != Some(occupied_count as u32)
+    {
+        return false;
+    }
+    for (i, &idx) in active_set.iter().enumerate() {
+        if idx.0 != (i + 1) as u32 {
+            return false;
+        }
+    }
+    true
+}
+
 #[inline]
 fn radix_sort_active_set(arena: &mut TileArena) {
     let len = arena.active_set.len();
@@ -243,7 +261,6 @@ pub(crate) fn append_expand_candidates(
 /// Uses unsafe raw pointer access to meta/neighbors for the hot inner loop
 /// to eliminate bounds checks on every neighbor lookup.
 pub fn rebuild_active_set(arena: &mut TileArena) {
-    arena.active_set.clear();
     arena.changed_scratch.clear();
     arena.changed_influence_scratch.clear();
     let (had_synced_changed_bits, changed_influence_uniform_all) = arena.begin_changed_rebuild();
@@ -261,6 +278,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         debug_assert_eq!(changed_count, arena.changed_influence_scratch.len());
     }
     if changed_count == 0 {
+        arena.active_set.clear();
         return;
     }
     if had_synced_changed_bits {
@@ -275,6 +293,14 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     let dense_rebuild = arena.occupied_count >= 4096
         && changed_count.saturating_mul(100) >= arena.occupied_count.saturating_mul(95);
     if dense_rebuild {
+        let can_reuse_full_contiguous_active = arena.free_list.is_empty()
+            && arena.occupied_count + 1 == arena.meta.len()
+            && active_set_is_dense_contiguous(&arena.active_set, arena.occupied_count);
+        if can_reuse_full_contiguous_active {
+            return;
+        }
+
+        arena.active_set.clear();
         arena.active_set.reserve(arena.occupied_count);
         if arena.free_list.is_empty() && arena.occupied_count + 1 == arena.meta.len() {
             let count = arena.occupied_count;
@@ -307,6 +333,8 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         }
         return;
     }
+
+    arena.active_set.clear();
 
     let bitmap_rebuild = should_use_bitmap_active_rebuild(arena.occupied_count, changed_count);
     if bitmap_rebuild {
@@ -727,6 +755,35 @@ mod tests {
         rebuild_active_set(&mut arena);
 
         assert_eq!(arena.active_set.len(), tile_count);
+        for (i, idx) in arena.active_set.iter().enumerate() {
+            assert_eq!(idx.0, (i + 1) as u32);
+        }
+    }
+
+    #[test]
+    fn dense_rebuild_rebuilds_when_cached_active_set_is_corrupted() {
+        let mut arena = TileArena::new();
+        let tile_count = 4_096usize;
+        let mut tiles = Vec::with_capacity(tile_count);
+
+        for x in 0..tile_count {
+            let idx = arena.allocate((x as i64, 0));
+            arena.mark_changed(idx);
+            tiles.push(idx);
+        }
+
+        rebuild_active_set(&mut arena);
+        assert_eq!(arena.active_set.len(), tile_count);
+
+        // Simulate stale/corrupted cached ordering that can otherwise satisfy
+        // quick first/last checks.
+        arena.active_set[1] = TileIdx(1);
+
+        for &idx in tiles.iter().take(3_900) {
+            arena.mark_changed(idx);
+        }
+        rebuild_active_set(&mut arena);
+
         for (i, idx) in arena.active_set.iter().enumerate() {
             assert_eq!(idx.0, (i + 1) as u32);
         }
