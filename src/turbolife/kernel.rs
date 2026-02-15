@@ -109,24 +109,40 @@ pub(crate) unsafe fn ghost_is_empty_from_live_masks_ptr(
     live_masks_ptr: *const u8,
     neighbors: &[u32; 8],
 ) -> bool {
-    let north = unsafe { *live_masks_ptr.add(neighbors[0] as usize) };
-    let south = unsafe { *live_masks_ptr.add(neighbors[1] as usize) };
-    let west = unsafe { *live_masks_ptr.add(neighbors[2] as usize) };
-    let east = unsafe { *live_masks_ptr.add(neighbors[3] as usize) };
-    let nw = unsafe { *live_masks_ptr.add(neighbors[4] as usize) };
-    let ne = unsafe { *live_masks_ptr.add(neighbors[5] as usize) };
-    let sw = unsafe { *live_masks_ptr.add(neighbors[6] as usize) };
-    let se = unsafe { *live_masks_ptr.add(neighbors[7] as usize) };
-
-    let ghost_activity = (north & LIVE_S)
-        | (south & LIVE_N)
-        | (west & LIVE_E)
-        | (east & LIVE_W)
-        | (nw & LIVE_SE)
-        | (ne & LIVE_SW)
-        | (sw & LIVE_NE)
-        | (se & LIVE_NW);
-    ghost_activity == 0
+    // SAFETY: callers guarantee `live_masks_ptr` points to a live-mask array
+    // indexed by every value in `neighbors` (including sentinel slot 0).
+    unsafe {
+        let north = *live_masks_ptr.add(neighbors[0] as usize);
+        if (north & LIVE_S) != 0 {
+            return false;
+        }
+        let south = *live_masks_ptr.add(neighbors[1] as usize);
+        if (south & LIVE_N) != 0 {
+            return false;
+        }
+        let west = *live_masks_ptr.add(neighbors[2] as usize);
+        if (west & LIVE_E) != 0 {
+            return false;
+        }
+        let east = *live_masks_ptr.add(neighbors[3] as usize);
+        if (east & LIVE_W) != 0 {
+            return false;
+        }
+        let nw = *live_masks_ptr.add(neighbors[4] as usize);
+        if (nw & LIVE_SE) != 0 {
+            return false;
+        }
+        let ne = *live_masks_ptr.add(neighbors[5] as usize);
+        if (ne & LIVE_SW) != 0 {
+            return false;
+        }
+        let sw = *live_masks_ptr.add(neighbors[6] as usize);
+        if (sw & LIVE_NE) != 0 {
+            return false;
+        }
+        let se = *live_masks_ptr.add(neighbors[7] as usize);
+        (se & LIVE_NW) == 0
+    }
 }
 
 #[inline(always)]
@@ -671,8 +687,8 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool>(
     ghost: &GhostZone,
 ) -> (bool, BorderData, bool) {
     use std::arch::aarch64::{
-        vandq_u64, vdupq_n_u64, veorq_u64, vgetq_lane_u64, vld1q_u64, vorrq_u64, vshlq_n_u64,
-        vshrq_n_u64, vst1q_u64,
+        vandq_u64, vbicq_u64, vdupq_n_u64, veorq_u64, vgetq_lane_u64, vld1q_u64, vorrq_u64,
+        vshlq_n_u64, vshrq_n_u64, vst1q_u64,
     };
 
     let mut diff_acc = vdupq_n_u64(0);
@@ -730,7 +746,7 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool>(
             let (t1, t1c) = unsafe { neon_half_add(u0, t0c) };
             let (t2, _) = unsafe { neon_half_add(u0c, t1c) };
 
-            let alive_mask = vandq_u64(veorq_u64(t2, vdupq_n_u64(u64::MAX)), t1);
+            let alive_mask = vbicq_u64(t1, t2);
             let next_rows = vandq_u64(alive_mask, vorrq_u64(t0, $row_self));
 
             if TRACK_DIFF {
