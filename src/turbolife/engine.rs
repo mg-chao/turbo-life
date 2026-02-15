@@ -87,6 +87,7 @@ const PARALLEL_DYNAMIC_TARGET_CHUNKS_HIGH: usize = 2;
 const PARALLEL_DYNAMIC_TARGET_CHUNKS_MID_ACTIVE: usize = 2_048;
 const PARALLEL_DYNAMIC_TARGET_CHUNKS_HIGH_ACTIVE: usize = 16_384;
 const PARALLEL_DYNAMIC_MID_CHURN_PCT: usize = 35;
+const _: [(); 1] = [(); (PARALLEL_DYNAMIC_MID_CHURN_PCT <= 100) as usize];
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 16;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 512;
 #[cfg(target_arch = "x86_64")]
@@ -96,6 +97,9 @@ const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 // to do as well or better for this workload in current benchmarks.
 const PREFETCH_TILE_DATA_AARCH64: bool = false;
 const PRECISE_INFLUENCE_MAX_ACTIVE: usize = 256;
+const PRECISE_INFLUENCE_DYNAMIC_MAX_ACTIVE: usize = 4_096;
+const PRECISE_INFLUENCE_DYNAMIC_MAX_CHURN_PCT: usize = 65;
+const _: [(); 1] = [(); (PRECISE_INFLUENCE_DYNAMIC_MAX_CHURN_PCT <= 100) as usize];
 #[cfg(target_arch = "aarch64")]
 const ASSUME_CHANGED_NEON_MIN_ACTIVE: usize = 2_048;
 // `assume_changed` reports every live tile as changed; once enabled it can
@@ -487,13 +491,21 @@ fn tuned_parallel_threads(active_len: usize, thread_count: usize) -> usize {
 }
 
 #[inline]
+fn churn_at_most_percent(changed_len: usize, active_len: usize, max_churn_pct: usize) -> bool {
+    (changed_len as u128) * 100 <= (active_len as u128) * (max_churn_pct as u128)
+}
+
+#[inline]
+fn churn_below_percent(changed_len: usize, active_len: usize, churn_pct_threshold: usize) -> bool {
+    (changed_len as u128) * 100 < (active_len as u128) * (churn_pct_threshold as u128)
+}
+
+#[inline]
 fn dynamic_target_chunks_per_worker(active_len: usize, changed_len: usize) -> usize {
     if active_len < PARALLEL_DYNAMIC_TARGET_CHUNKS_MID_ACTIVE {
         PARALLEL_DYNAMIC_TARGET_CHUNKS_BASE
     } else if active_len < PARALLEL_DYNAMIC_TARGET_CHUNKS_HIGH_ACTIVE {
-        if changed_len.saturating_mul(100)
-            < active_len.saturating_mul(PARALLEL_DYNAMIC_MID_CHURN_PCT)
-        {
+        if churn_below_percent(changed_len, active_len, PARALLEL_DYNAMIC_MID_CHURN_PCT) {
             PARALLEL_DYNAMIC_TARGET_CHUNKS_BASE
         } else {
             PARALLEL_DYNAMIC_TARGET_CHUNKS_MID
@@ -1005,13 +1017,18 @@ impl TurboLife {
         let thread_count = rayon::current_num_threads().max(1);
         let effective_threads = tuned_parallel_threads(active_len, thread_count);
         let run_parallel = effective_threads > 1;
-        let track_neighbor_influence = active_len <= PRECISE_INFLUENCE_MAX_ACTIVE;
+        let track_neighbor_influence = active_len <= PRECISE_INFLUENCE_MAX_ACTIVE
+            || (active_len <= PRECISE_INFLUENCE_DYNAMIC_MAX_ACTIVE
+                && churn_at_most_percent(
+                    changed_len,
+                    active_len,
+                    PRECISE_INFLUENCE_DYNAMIC_MAX_CHURN_PCT,
+                ));
         #[cfg(target_arch = "aarch64")]
         let assume_changed_neon = !track_neighbor_influence
             && backend == KernelBackend::Neon
             && active_len >= ASSUME_CHANGED_NEON_MIN_ACTIVE
-            && changed_len.saturating_mul(100)
-                >= active_len.saturating_mul(ASSUME_CHANGED_NEON_MIN_CHURN_PCT);
+            && !churn_below_percent(changed_len, active_len, ASSUME_CHANGED_NEON_MIN_CHURN_PCT);
 
         let (cb_lo, cb_hi) = self.arena.cell_bufs.split_at_mut(1);
         let (current_vec, next_vec) = if cp == 0 {
@@ -1976,8 +1993,8 @@ mod tests {
 
     use super::{
         KernelBackend, PARALLEL_KERNEL_MIN_ACTIVE, TILE_SIZE_I64, TurboLife, TurboLifeConfig,
-        auto_pool_thread_count_for_physical, dynamic_parallel_chunk_size,
-        dynamic_target_chunks_per_worker, memory_parallel_cap,
+        auto_pool_thread_count_for_physical, churn_at_most_percent, churn_below_percent,
+        dynamic_parallel_chunk_size, dynamic_target_chunks_per_worker, memory_parallel_cap,
     };
 
     const PARALLEL_TEST_TILE_GRID: i64 = 12;
@@ -2083,6 +2100,17 @@ mod tests {
         assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 4);
         assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 4);
         assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 2);
+    }
+
+    #[test]
+    fn churn_helpers_handle_large_frontiers_without_saturation_bias() {
+        assert!(churn_at_most_percent(6_500, 10_000, 65));
+        assert!(!churn_below_percent(6_500, 10_000, 65));
+        assert!(churn_below_percent(6_499, 10_000, 65));
+
+        assert!(!churn_at_most_percent(usize::MAX, usize::MAX, 65));
+        assert!(!churn_below_percent(usize::MAX, usize::MAX, 65));
+        assert!(churn_at_most_percent(usize::MAX / 2, usize::MAX, 65));
     }
 
     #[test]
