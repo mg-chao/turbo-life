@@ -13,6 +13,7 @@ use super::tilemap::TileMap;
 const INITIAL_TILE_CAPACITY: usize = 256;
 const MIN_GROW_TILES: usize = 256;
 const ACTIVE_SORT_RADIX_BUCKETS: usize = 1 << 16;
+pub(crate) const CHANGED_INFLUENCE_ALL: u8 = 0xFF;
 
 #[derive(Clone)]
 pub struct BorderPlanes {
@@ -140,6 +141,7 @@ pub struct TileArena {
     pub coord_to_idx: TileMap,
     pub free_list: Vec<TileIdx>,
     pub changed_list: Vec<TileIdx>,
+    pub changed_influence: Vec<u8>,
     changed_bits: Vec<u64>,
     changed_bitmap_synced: bool,
     pub occupied_count: usize,
@@ -158,6 +160,7 @@ pub struct TileArena {
     pub prune_marks: Vec<u8>,
     pub prune_marks_words: Vec<u64>,
     pub changed_scratch: Vec<TileIdx>,
+    pub changed_influence_scratch: Vec<u8>,
 }
 
 impl TileArena {
@@ -200,6 +203,7 @@ impl TileArena {
             coord_to_idx: TileMap::with_capacity(INITIAL_TILE_CAPACITY),
             free_list: Vec::new(),
             changed_list: Vec::new(),
+            changed_influence: Vec::new(),
             changed_bits: vec![0],
             changed_bitmap_synced: true,
             occupied_count: 0,
@@ -215,6 +219,7 @@ impl TileArena {
             prune_marks: Vec::new(),
             prune_marks_words: Vec::new(),
             changed_scratch: Vec::new(),
+            changed_influence_scratch: Vec::new(),
         }
     }
 
@@ -294,15 +299,47 @@ impl TileArena {
 
     #[inline]
     pub fn mark_changed(&mut self, idx: TileIdx) {
+        self.mark_changed_with_influence(idx, CHANGED_INFLUENCE_ALL);
+    }
+
+    #[inline]
+    pub fn mark_changed_with_influence(&mut self, idx: TileIdx, influence_mask: u8) {
         self.sync_changed_bitmap_if_needed();
         let i = idx.index();
         if !self.changed_test_and_set(i) {
             self.changed_list.push(idx);
+            self.changed_influence.push(influence_mask);
+        } else {
+            self.merge_changed_influence_for_existing(idx, influence_mask);
+        }
+    }
+
+    #[inline]
+    fn merge_changed_influence_for_existing(&mut self, idx: TileIdx, influence_mask: u8) {
+        if influence_mask == 0 {
+            return;
+        }
+        if let Some(pos) = self.changed_list.iter().rposition(|&queued| queued == idx) {
+            self.changed_influence[pos] |= influence_mask;
+        } else {
+            debug_assert!(
+                false,
+                "changed bitmap contained an index that was missing from changed_list"
+            );
         }
     }
 
     #[inline(always)]
     pub(crate) fn mark_changed_new_unique(&mut self, idx: TileIdx) {
+        self.mark_changed_new_unique_with_influence(idx, CHANGED_INFLUENCE_ALL);
+    }
+
+    #[inline(always)]
+    pub(crate) fn mark_changed_new_unique_with_influence(
+        &mut self,
+        idx: TileIdx,
+        influence_mask: u8,
+    ) {
         if self.changed_bitmap_synced {
             let duplicate = self.changed_test_and_set(idx.index());
             debug_assert!(
@@ -310,22 +347,26 @@ impl TileArena {
                 "mark_changed_new_unique received a duplicate tile index"
             );
             if duplicate {
+                self.merge_changed_influence_for_existing(idx, influence_mask);
                 return;
             }
         }
         self.changed_list.push(idx);
+        self.changed_influence.push(influence_mask);
     }
 
     #[cfg(test)]
     #[inline(always)]
     pub fn push_changed_from_kernel(&mut self, idx: TileIdx) {
         self.changed_list.push(idx);
+        self.changed_influence.push(CHANGED_INFLUENCE_ALL);
         self.changed_bitmap_synced = false;
     }
 
     #[inline(always)]
     pub(crate) fn mark_changed_bitmap_unsynced(&mut self) {
         self.changed_bitmap_synced = false;
+        debug_assert_eq!(self.changed_list.len(), self.changed_influence.len());
     }
 
     #[inline]
@@ -386,6 +427,7 @@ impl TileArena {
         if self.changed_bitmap_synced {
             return;
         }
+        debug_assert_eq!(self.changed_list.len(), self.changed_influence.len());
         let len = self.changed_list.len();
         for i in 0..len {
             let idx = self.changed_list[i].index();
@@ -458,6 +500,7 @@ impl TileArena {
 
     #[inline]
     pub(crate) fn begin_changed_rebuild(&mut self) -> bool {
+        debug_assert_eq!(self.changed_list.len(), self.changed_influence.len());
         let was_synced = self.changed_bitmap_synced;
         self.changed_bitmap_synced = true;
         was_synced
@@ -663,6 +706,35 @@ mod tests {
 
         arena.mark_changed(idx);
         assert_eq!(arena.changed_list.len(), 1);
+    }
+
+    #[test]
+    fn mark_changed_with_influence_merges_duplicate_masks() {
+        let mut arena = TileArena::new();
+        let idx = arena.allocate((0, 0));
+
+        arena.mark_changed_with_influence(idx, 1 << 0);
+        arena.mark_changed_with_influence(idx, (1 << 2) | (1 << 4));
+
+        assert_eq!(arena.changed_list, vec![idx]);
+        assert_eq!(
+            arena.changed_influence,
+            vec![(1 << 0) | (1 << 2) | (1 << 4)]
+        );
+    }
+
+    #[test]
+    fn mark_changed_with_influence_merges_duplicate_masks_after_unsynced_queue() {
+        let mut arena = TileArena::new();
+        let idx = arena.allocate((0, 0));
+
+        arena.mark_changed_with_influence(idx, 1 << 1);
+        arena.mark_changed_bitmap_unsynced();
+        arena.mark_changed_with_influence(idx, 1 << 3);
+
+        assert_eq!(arena.changed_list, vec![idx]);
+        assert_eq!(arena.changed_influence, vec![(1 << 1) | (1 << 3)]);
+        assert!(arena.changed_bitmap_synced);
     }
 
     #[test]

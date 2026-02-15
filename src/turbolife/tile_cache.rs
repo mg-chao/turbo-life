@@ -23,6 +23,7 @@ struct CacheEntry {
     changed: bool,
     has_live: bool,
     live_mask: u8,
+    neighbor_influence_mask: u8,
 }
 
 impl CacheEntry {
@@ -50,6 +51,7 @@ impl CacheEntry {
         changed: false,
         has_live: false,
         live_mask: 0,
+        neighbor_influence_mask: 0,
     };
 }
 
@@ -119,6 +121,31 @@ fn hash_input(cells: &[u64; TILE_SIZE], ghost: &GhostZone) -> (u64, u64) {
     h1 ^= h1 >> 31;
 
     (h0 | 1, h1 | 1)
+}
+
+#[inline(always)]
+unsafe fn neighbor_influence_mask_for_result(
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    idx: usize,
+    border: &BorderData,
+    changed: bool,
+) -> u8 {
+    if !changed {
+        return 0;
+    }
+    let prev_north = unsafe { *borders_north_read_ptr.add(idx) };
+    let prev_south = unsafe { *borders_south_read_ptr.add(idx) };
+    let prev_west = unsafe { *borders_west_read_ptr.add(idx) };
+    let prev_east = unsafe { *borders_east_read_ptr.add(idx) };
+    BorderData::compute_live_mask(
+        border.north ^ prev_north,
+        border.south ^ prev_south,
+        border.west ^ prev_west,
+        border.east ^ prev_east,
+    )
 }
 
 pub struct TileCache {
@@ -232,6 +259,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
     next_live_masks_ptr: *mut u8,
     idx: usize,
     cache: *mut TileCache,
+    track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     let nb = unsafe { &*neighbors_ptr.add(idx) };
     let current = unsafe { &(*current_ptr.add(idx)).0 };
@@ -252,7 +280,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
                 *next_live_masks_ptr.add(idx) = 0;
             }
             meta.update_after_step(false, false);
-            return TileAdvanceResult::new(false, false, missing_mask, 0);
+            return TileAdvanceResult::new(false, false, missing_mask, 0, 0);
         }
 
         // Ultra-fast path: metadata says current tile is empty and halo has no
@@ -270,7 +298,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
                 *next_live_masks_ptr.add(idx) = 0;
             }
             meta.update_after_step(false, false);
-            return TileAdvanceResult::new(false, false, missing_mask, 0);
+            return TileAdvanceResult::new(false, false, missing_mask, 0, 0);
         }
     }
 
@@ -296,8 +324,31 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
             *next_borders_east_ptr.add(idx) = border.east;
             *next_live_masks_ptr.add(idx) = live_mask;
         }
+        let neighbor_influence_mask = if changed && track_neighbor_influence {
+            unsafe {
+                neighbor_influence_mask_for_result(
+                    borders_north_read_ptr,
+                    borders_south_read_ptr,
+                    borders_west_read_ptr,
+                    borders_east_read_ptr,
+                    idx,
+                    &border,
+                    changed,
+                )
+            }
+        } else if changed {
+            u8::MAX
+        } else {
+            0
+        };
         meta.update_after_step(changed, has_live);
-        return TileAdvanceResult::new(changed, has_live, missing_mask, live_mask);
+        return TileAdvanceResult::new(
+            changed,
+            has_live,
+            missing_mask,
+            live_mask,
+            neighbor_influence_mask,
+        );
     }
 
     let cr = unsafe { &mut *cache };
@@ -326,9 +377,22 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
             let changed = entry.changed;
             let has_live = entry.has_live;
             let live_mask = entry.live_mask;
+            let neighbor_influence_mask = if changed && track_neighbor_influence {
+                entry.neighbor_influence_mask
+            } else if changed {
+                u8::MAX
+            } else {
+                0
+            };
             meta.update_after_step(changed, has_live);
             cr.record_hit();
-            return TileAdvanceResult::new(changed, has_live, missing_mask, live_mask);
+            return TileAdvanceResult::new(
+                changed,
+                has_live,
+                missing_mask,
+                live_mask,
+                neighbor_influence_mask,
+            );
         }
         let (changed, border, has_live) =
             unsafe { advance_core_const::<USE_AVX2>(current, next, &ghost) };
@@ -340,6 +404,23 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
             *next_borders_east_ptr.add(idx) = border.east;
             *next_live_masks_ptr.add(idx) = live_mask;
         }
+        let neighbor_influence_mask = if changed && track_neighbor_influence {
+            unsafe {
+                neighbor_influence_mask_for_result(
+                    borders_north_read_ptr,
+                    borders_south_read_ptr,
+                    borders_west_read_ptr,
+                    borders_east_read_ptr,
+                    idx,
+                    &border,
+                    changed,
+                )
+            }
+        } else if changed {
+            u8::MAX
+        } else {
+            0
+        };
         meta.update_after_step(changed, has_live);
         let em = unsafe { cr.entries.get_unchecked_mut(slot) };
         em.key_lo = key_lo;
@@ -355,8 +436,15 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
         em.changed = changed;
         em.has_live = has_live;
         em.live_mask = live_mask;
+        em.neighbor_influence_mask = neighbor_influence_mask;
         cr.record_miss();
-        return TileAdvanceResult::new(changed, has_live, missing_mask, live_mask);
+        return TileAdvanceResult::new(
+            changed,
+            has_live,
+            missing_mask,
+            live_mask,
+            neighbor_influence_mask,
+        );
     }
 
     // Cache disabled path.
@@ -370,8 +458,31 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
         *next_borders_east_ptr.add(idx) = border.east;
         *next_live_masks_ptr.add(idx) = live_mask;
     }
+    let neighbor_influence_mask = if changed && track_neighbor_influence {
+        unsafe {
+            neighbor_influence_mask_for_result(
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                idx,
+                &border,
+                changed,
+            )
+        }
+    } else if changed {
+        u8::MAX
+    } else {
+        0
+    };
     meta.update_after_step(changed, has_live);
-    TileAdvanceResult::new(changed, has_live, missing_mask, live_mask)
+    TileAdvanceResult::new(
+        changed,
+        has_live,
+        missing_mask,
+        live_mask,
+        neighbor_influence_mask,
+    )
 }
 
 /// # Safety
@@ -395,6 +506,7 @@ pub unsafe fn advance_tile_cached_scalar(
     next_live_masks_ptr: *mut u8,
     idx: usize,
     cache: *mut TileCache,
+    track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
         advance_tile_cached_impl::<false>(
@@ -414,6 +526,7 @@ pub unsafe fn advance_tile_cached_scalar(
             next_live_masks_ptr,
             idx,
             cache,
+            track_neighbor_influence,
         )
     }
 }
@@ -440,6 +553,7 @@ pub unsafe fn advance_tile_cached_avx2(
     next_live_masks_ptr: *mut u8,
     idx: usize,
     cache: *mut TileCache,
+    track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
         advance_tile_cached_impl::<true>(
@@ -459,6 +573,7 @@ pub unsafe fn advance_tile_cached_avx2(
             next_live_masks_ptr,
             idx,
             cache,
+            track_neighbor_influence,
         )
     }
 }

@@ -4,7 +4,7 @@ use rayon::prelude::*;
 
 use super::arena::TileArena;
 use super::kernel::ghost_is_empty_from_live_masks_ptr;
-use super::tile::{BorderData, MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
+use super::tile::{MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
 
 const EXPAND_OFFSETS: [(i64, i64); 8] = [
     (0, 1),   // N
@@ -30,11 +30,6 @@ const ACTIVE_BITMAP_REBUILD_MIN_OCCUPIED: usize = 2_048;
 const ACTIVE_BITMAP_REBUILD_MAX_OCCUPIED: usize = 8_192;
 const ACTIVE_BITMAP_REBUILD_MIN_CHANGED: usize = 1_024;
 const ACTIVE_BITMAP_REBUILD_DENSE_CHANGED_PCT: usize = 45;
-const DIRECTIONAL_FILTER_ALWAYS_ON_MAX_CHANGED: usize = 64;
-const DIRECTIONAL_FILTER_PROBE_MAX_CHANGED: usize = 256;
-const DIRECTIONAL_FILTER_SAMPLE_MAX: usize = 256;
-const DIRECTIONAL_FILTER_DENSE_CHANGED_PCT: usize = 80;
-const DIRECTIONAL_FILTER_MAX_AVG_DIRS_X10: usize = 45;
 const _: [(); 1] = [(); (ACTIVE_SORT_SKIP_MIN <= ACTIVE_SORT_SKIP_MAX) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_SKIP_MAX <= ACTIVE_SORT_STD_MAX) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_LOW_CHURN_PCT <= 100) as usize];
@@ -44,12 +39,6 @@ const _: [(); 1] = [(); (ACTIVE_BITMAP_REBUILD_DENSE_CHANGED_PCT <= 100) as usiz
 const _: [(); 1] = [(); (ACTIVE_BITMAP_REBUILD_MIN_CHANGED > 0) as usize];
 const _: [(); 1] =
     [(); (ACTIVE_BITMAP_REBUILD_MIN_OCCUPIED <= ACTIVE_BITMAP_REBUILD_MAX_OCCUPIED) as usize];
-const _: [(); 1] = [(); (DIRECTIONAL_FILTER_ALWAYS_ON_MAX_CHANGED
-    <= DIRECTIONAL_FILTER_PROBE_MAX_CHANGED) as usize];
-const _: [(); 1] =
-    [(); (DIRECTIONAL_FILTER_PROBE_MAX_CHANGED <= DIRECTIONAL_FILTER_SAMPLE_MAX) as usize];
-const _: [(); 1] = [(); (DIRECTIONAL_FILTER_DENSE_CHANGED_PCT <= 100) as usize];
-const _: [(); 1] = [(); (DIRECTIONAL_FILTER_MAX_AVG_DIRS_X10 <= 80) as usize];
 
 struct SendConstPtr<T> {
     inner: *const T,
@@ -133,103 +122,6 @@ fn active_set_is_sorted(active_set: &[TileIdx]) -> bool {
         }
     }
     true
-}
-
-#[derive(Clone, Copy)]
-struct BorderEdges {
-    north: u64,
-    south: u64,
-    west: u64,
-    east: u64,
-}
-
-#[inline(always)]
-unsafe fn load_border_edges(
-    north_ptr: *const u64,
-    south_ptr: *const u64,
-    west_ptr: *const u64,
-    east_ptr: *const u64,
-    idx: usize,
-) -> BorderEdges {
-    BorderEdges {
-        north: unsafe { *north_ptr.add(idx) },
-        south: unsafe { *south_ptr.add(idx) },
-        west: unsafe { *west_ptr.add(idx) },
-        east: unsafe { *east_ptr.add(idx) },
-    }
-}
-
-#[inline(always)]
-fn border_neighbor_influence_mask(current: BorderEdges, previous: BorderEdges) -> u8 {
-    BorderData::compute_live_mask(
-        current.north ^ previous.north,
-        current.south ^ previous.south,
-        current.west ^ previous.west,
-        current.east ^ previous.east,
-    )
-}
-
-#[inline]
-fn should_use_directional_neighbor_filter(
-    arena: &TileArena,
-    changed_tiles: &[TileIdx],
-    border_phase: usize,
-) -> bool {
-    let changed_len = changed_tiles.len();
-    if changed_len <= DIRECTIONAL_FILTER_ALWAYS_ON_MAX_CHANGED {
-        return true;
-    }
-    if changed_len > DIRECTIONAL_FILTER_PROBE_MAX_CHANGED {
-        return false;
-    }
-    if arena.occupied_count > 0
-        && changed_len.saturating_mul(100)
-            >= arena
-                .occupied_count
-                .saturating_mul(DIRECTIONAL_FILTER_DENSE_CHANGED_PCT)
-    {
-        return false;
-    }
-
-    let sample_len = changed_len.min(DIRECTIONAL_FILTER_SAMPLE_MAX);
-    let borders_current = &arena.borders[border_phase];
-    let borders_prev = &arena.borders[1 - border_phase];
-    let current_north_ptr = borders_current.north_ptr();
-    let current_south_ptr = borders_current.south_ptr();
-    let current_west_ptr = borders_current.west_ptr();
-    let current_east_ptr = borders_current.east_ptr();
-    let prev_north_ptr = borders_prev.north_ptr();
-    let prev_south_ptr = borders_prev.south_ptr();
-    let prev_west_ptr = borders_prev.west_ptr();
-    let prev_east_ptr = borders_prev.east_ptr();
-    let changed_ptr = changed_tiles.as_ptr();
-    let mut influence_dirs = 0usize;
-
-    for i in 0..sample_len {
-        let idx = unsafe { *changed_ptr.add(i) }.index();
-        let influence = unsafe {
-            border_neighbor_influence_mask(
-                load_border_edges(
-                    current_north_ptr,
-                    current_south_ptr,
-                    current_west_ptr,
-                    current_east_ptr,
-                    idx,
-                ),
-                load_border_edges(
-                    prev_north_ptr,
-                    prev_south_ptr,
-                    prev_west_ptr,
-                    prev_east_ptr,
-                    idx,
-                ),
-            )
-        };
-        influence_dirs += influence.count_ones() as usize;
-    }
-
-    influence_dirs.saturating_mul(10)
-        <= sample_len.saturating_mul(DIRECTIONAL_FILTER_MAX_AVG_DIRS_X10)
 }
 
 #[inline]
@@ -353,11 +245,17 @@ pub(crate) fn append_expand_candidates(
 pub fn rebuild_active_set(arena: &mut TileArena) {
     arena.active_set.clear();
     arena.changed_scratch.clear();
+    arena.changed_influence_scratch.clear();
     // Swap instead of copy to avoid O(n) memcpy.
     std::mem::swap(&mut arena.changed_scratch, &mut arena.changed_list);
+    std::mem::swap(
+        &mut arena.changed_influence_scratch,
+        &mut arena.changed_influence,
+    );
     let had_synced_changed_bits = arena.begin_changed_rebuild();
 
     let changed_count = arena.changed_scratch.len();
+    debug_assert_eq!(changed_count, arena.changed_influence_scratch.len());
     if changed_count == 0 {
         return;
     }
@@ -418,22 +316,41 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         let marks_ptr = arena.active_marks_words.as_mut_ptr();
         let neighbors_ptr = arena.neighbors.as_ptr();
         let changed_ptr = arena.changed_scratch.as_ptr();
+        let influence_ptr = arena.changed_influence_scratch.as_ptr();
         for changed_i in 0..changed_count {
             let idx = unsafe { *changed_ptr.add(changed_i) };
+            let influence_mask = unsafe { *influence_ptr.add(changed_i) };
             let i = idx.index();
 
             unsafe {
                 let word = i >> 6;
                 *marks_ptr.add(word) |= 1u64 << (i & 63);
 
+                if influence_mask == 0 {
+                    continue;
+                }
                 let nb = *neighbors_ptr.add(i);
-                for &ni_raw in nb.iter() {
-                    if ni_raw == NO_NEIGHBOR {
-                        continue;
+                if influence_mask == u8::MAX {
+                    for &ni_raw in nb.iter() {
+                        if ni_raw == NO_NEIGHBOR {
+                            continue;
+                        }
+                        let ni = ni_raw as usize;
+                        let ni_word = ni >> 6;
+                        *marks_ptr.add(ni_word) |= 1u64 << (ni & 63);
                     }
-                    let ni = ni_raw as usize;
-                    let ni_word = ni >> 6;
-                    *marks_ptr.add(ni_word) |= 1u64 << (ni & 63);
+                } else {
+                    let dirs = &EXPAND_MASK_TABLE.dirs[influence_mask as usize];
+                    let count = EXPAND_MASK_TABLE.len[influence_mask as usize] as usize;
+                    for &dir in dirs[..count].iter() {
+                        let ni_raw = nb[dir as usize];
+                        if ni_raw == NO_NEIGHBOR {
+                            continue;
+                        }
+                        let ni = ni_raw as usize;
+                        let ni_word = ni >> 6;
+                        *marks_ptr.add(ni_word) |= 1u64 << (ni & 63);
+                    }
                 }
             }
         }
@@ -470,61 +387,27 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         .reserve(changed_count.saturating_mul(9).min(arena.occupied_count));
     let neighbors_ptr = arena.neighbors.as_ptr();
     let meta_ptr = arena.meta.as_ptr();
-    let border_phase = arena.border_phase;
-    let borders_current = &arena.borders[border_phase];
-    let borders_prev = &arena.borders[1 - border_phase];
-    let current_north_ptr = borders_current.north_ptr();
-    let current_south_ptr = borders_current.south_ptr();
-    let current_west_ptr = borders_current.west_ptr();
-    let current_east_ptr = borders_current.east_ptr();
-    let prev_north_ptr = borders_prev.north_ptr();
-    let prev_south_ptr = borders_prev.south_ptr();
-    let prev_west_ptr = borders_prev.west_ptr();
-    let prev_east_ptr = borders_prev.east_ptr();
-    let directional_neighbor_filter =
-        should_use_directional_neighbor_filter(arena, &arena.changed_scratch, border_phase);
-
     let changed_ptr = arena.changed_scratch.as_ptr();
+    let influence_ptr = arena.changed_influence_scratch.as_ptr();
     for changed_i in 0..changed_count {
         let idx = unsafe { *changed_ptr.add(changed_i) };
+        let influence_mask = unsafe { *influence_ptr.add(changed_i) };
         let i = idx.index();
         debug_assert!(i < meta_len);
         debug_assert!(unsafe { (*meta_ptr.add(i)).occupied() });
         if unsafe { !arena.active_test_and_set_unchecked(i) } {
             arena.active_set.push(idx);
         }
+        if influence_mask == 0 {
+            continue;
+        }
 
-        if directional_neighbor_filter {
-            let influence_mask = unsafe {
-                border_neighbor_influence_mask(
-                    load_border_edges(
-                        current_north_ptr,
-                        current_south_ptr,
-                        current_west_ptr,
-                        current_east_ptr,
-                        i,
-                    ),
-                    load_border_edges(
-                        prev_north_ptr,
-                        prev_south_ptr,
-                        prev_west_ptr,
-                        prev_east_ptr,
-                        i,
-                    ),
-                )
-            };
-            if influence_mask == 0 {
-                continue;
-            }
-
-            // SAFETY: i < meta_len guaranteed by arena invariants
-            // (idx came from changed_list).
-            unsafe {
-                let nb = *neighbors_ptr.add(i);
-                let dirs = &EXPAND_MASK_TABLE.dirs[influence_mask as usize];
-                let count = EXPAND_MASK_TABLE.len[influence_mask as usize] as usize;
-                for &dir in dirs[..count].iter() {
-                    let ni_raw = nb[dir as usize];
+        // SAFETY: i < meta_len guaranteed by arena invariants
+        // (idx came from changed_list).
+        unsafe {
+            let nb = *neighbors_ptr.add(i);
+            if influence_mask == u8::MAX {
+                for &ni_raw in nb.iter() {
                     if ni_raw == NO_NEIGHBOR {
                         continue;
                     }
@@ -535,13 +418,11 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                         arena.active_set.push(TileIdx(ni_raw));
                     }
                 }
-            }
-        } else {
-            // SAFETY: i < meta_len guaranteed by arena invariants
-            // (idx came from changed_list).
-            unsafe {
-                let nb = *neighbors_ptr.add(i);
-                for &ni_raw in nb.iter() {
+            } else {
+                let dirs = &EXPAND_MASK_TABLE.dirs[influence_mask as usize];
+                let count = EXPAND_MASK_TABLE.len[influence_mask as usize] as usize;
+                for &dir in dirs[..count].iter() {
+                    let ni_raw = nb[dir as usize];
                     if ni_raw == NO_NEIGHBOR {
                         continue;
                     }
@@ -735,12 +616,11 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        BorderEdges, PARALLEL_PRUNE_BITMAP_MIN, PARALLEL_PRUNE_CANDIDATES_MIN, TileArena,
-        active_set_is_sorted, border_neighbor_influence_mask, finalize_prune_and_expand,
-        rebuild_active_set, should_probe_std_active_sort, should_skip_std_active_sort,
-        should_use_bitmap_active_rebuild,
+        PARALLEL_PRUNE_BITMAP_MIN, PARALLEL_PRUNE_CANDIDATES_MIN, TileArena, active_set_is_sorted,
+        finalize_prune_and_expand, rebuild_active_set, should_probe_std_active_sort,
+        should_skip_std_active_sort, should_use_bitmap_active_rebuild,
     };
-    use crate::turbolife::tile::{BorderData, MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
+    use crate::turbolife::tile::{MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
 
     #[test]
     fn rebuild_active_set_stays_empty_without_changes() {
@@ -942,31 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn border_neighbor_influence_mask_tracks_edges_and_corners() {
-        let prev = BorderData::default();
-        let cur = BorderData::from_edges(1u64 << 5, 1u64 << 63, 0, 0);
-        let mask = border_neighbor_influence_mask(
-            BorderEdges {
-                north: cur.north,
-                south: cur.south,
-                west: cur.west,
-                east: cur.east,
-            },
-            BorderEdges {
-                north: prev.north,
-                south: prev.south,
-                west: prev.west,
-                east: prev.east,
-            },
-        );
-        assert_eq!(mask & (1 << 0), 1 << 0); // N
-        assert_eq!(mask & (1 << 1), 1 << 1); // S
-        assert_eq!(mask & (1 << 5), 0); // NE corner unchanged
-        assert_eq!(mask & (1 << 7), 1 << 7); // SE corner changed
-    }
-
-    #[test]
-    fn rebuild_active_set_skips_neighbors_when_border_is_unchanged() {
+    fn rebuild_active_set_respects_zero_influence_masks() {
         let mut arena = TileArena::new();
         let center = arena.allocate((0, 0));
         let _north = arena.allocate((0, 1));
@@ -978,38 +834,55 @@ mod tests {
         let _sw = arena.allocate((-1, -1));
         let _se = arena.allocate((1, -1));
 
-        let bp = arena.border_phase;
-        arena.borders[bp].set(center.index(), BorderData::default());
-        arena.borders[1 - bp].set(center.index(), BorderData::default());
-        arena.mark_changed(center);
-
+        arena.mark_changed_with_influence(center, 0);
         rebuild_active_set(&mut arena);
 
         assert_eq!(arena.active_set, vec![center]);
     }
 
     #[test]
-    fn rebuild_active_set_only_activates_impacted_neighbors() {
+    fn rebuild_active_set_activates_only_masked_neighbors() {
         let mut arena = TileArena::new();
         let center = arena.allocate((0, 0));
         let north = arena.allocate((0, 1));
         let _south = arena.allocate((0, -1));
-        let _west = arena.allocate((-1, 0));
+        let west = arena.allocate((-1, 0));
         let _east = arena.allocate((1, 0));
         let nw = arena.allocate((-1, 1));
         let _ne = arena.allocate((1, 1));
         let _sw = arena.allocate((-1, -1));
         let _se = arena.allocate((1, -1));
 
-        let bp = arena.border_phase;
-        arena.borders[bp].set(center.index(), BorderData::from_edges(1, 0, 0, 0));
-        arena.borders[1 - bp].set(center.index(), BorderData::default());
-        arena.mark_changed(center);
+        // North + West + NW influence.
+        arena.mark_changed_with_influence(center, (1 << 0) | (1 << 2) | (1 << 4));
 
         rebuild_active_set(&mut arena);
 
         let mut active = arena.active_set.clone();
         active.sort_unstable_by_key(|idx| idx.0);
-        assert_eq!(active, vec![center, north, nw]);
+        assert_eq!(active, vec![center, north, west, nw]);
+    }
+
+    #[test]
+    fn bitmap_rebuild_respects_zero_influence_masks() {
+        let mut arena = TileArena::new();
+        let width = 64i64;
+        let height = 32i64;
+        let mut tiles = Vec::new();
+
+        for y in 0..height {
+            for x in 0..width {
+                tiles.push(arena.allocate((x, y)));
+            }
+        }
+
+        for &idx in tiles.iter().take(1_024) {
+            arena.mark_changed_with_influence(idx, 0);
+        }
+
+        rebuild_active_set(&mut arena);
+
+        assert_eq!(arena.active_set.len(), 1_024);
+        assert!(active_set_is_sorted(&arena.active_set));
     }
 }

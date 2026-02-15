@@ -69,6 +69,7 @@ const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 2;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 16;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 512;
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
+const PRECISE_INFLUENCE_MAX_ACTIVE: usize = 256;
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -126,6 +127,7 @@ static AUTO_KERNEL_BACKEND: OnceLock<KernelBackend> = OnceLock::new();
 #[repr(align(64))]
 struct WorkerScratch {
     changed: Vec<TileIdx>,
+    changed_influence: Vec<u8>,
     expand: Vec<u32>,
     prune: Vec<TileIdx>,
 }
@@ -141,6 +143,7 @@ impl WorkerScratch {
     #[inline]
     fn clear(&mut self) {
         self.changed.clear();
+        self.changed_influence.clear();
         self.expand.clear();
         self.prune.clear();
     }
@@ -148,6 +151,7 @@ impl WorkerScratch {
     #[inline]
     fn reserve_for_chunk(&mut self, chunk_len: usize) {
         Self::reserve_capacity(&mut self.changed, chunk_len);
+        Self::reserve_capacity(&mut self.changed_influence, chunk_len);
         Self::reserve_capacity(&mut self.prune, chunk_len);
         let expand_target = chunk_len.saturating_mul(3);
         Self::reserve_capacity(&mut self.expand, expand_target);
@@ -750,6 +754,7 @@ impl TurboLife {
         let thread_count = rayon::current_num_threads().max(1);
         let effective_threads = tuned_parallel_threads(active_len, thread_count);
         let run_parallel = effective_threads > 1;
+        let track_neighbor_influence = active_len <= PRECISE_INFLUENCE_MAX_ACTIVE;
 
         let (cb_lo, cb_hi) = self.arena.cell_bufs.split_at_mut(1);
         let (current_vec, next_vec) = if cp == 0 {
@@ -852,11 +857,15 @@ impl TurboLife {
                                 next_live_masks_ptr,
                                 ii,
                                 cache_ptr,
+                                track_neighbor_influence,
                             )
                         };
 
                         if result.changed {
                             self.arena.changed_list.push(idx);
+                            self.arena
+                                .changed_influence
+                                .push(result.neighbor_influence_mask);
                         } else if !result.has_live {
                             self.arena.prune_buf.push(idx);
                         }
@@ -927,11 +936,15 @@ impl TurboLife {
                                 live_masks_read_ptr,
                                 next_live_masks_ptr,
                                 ii,
+                                track_neighbor_influence,
                             )
                         };
 
                         if result.changed {
                             self.arena.changed_list.push(idx);
+                            self.arena
+                                .changed_influence
+                                .push(result.neighbor_influence_mask);
                         } else if !result.has_live {
                             self.arena.prune_buf.push(idx);
                         }
@@ -1062,11 +1075,15 @@ impl TurboLife {
                             live_masks_read_ptr.get(),
                             next_live_masks_ptr.get(),
                             ii,
+                            track_neighbor_influence,
                         )
                     };
 
                     if result.changed {
                         ($scratch).changed.push(idx);
+                        ($scratch)
+                            .changed_influence
+                            .push(result.neighbor_influence_mask);
                     } else if !result.has_live {
                         ($scratch).prune.push(idx);
                     }
@@ -1161,19 +1178,28 @@ impl TurboLife {
                 reserve_expand = reserve_expand.saturating_add(scratch.expand.len());
                 reserve_prune = reserve_prune.saturating_add(scratch.prune.len());
                 reserve_changed = reserve_changed.saturating_add(scratch.changed.len());
+                debug_assert_eq!(scratch.changed.len(), scratch.changed_influence.len());
             }
             self.arena.expand_buf.reserve(reserve_expand);
             self.arena.prune_buf.reserve(reserve_prune);
             self.arena.changed_list.reserve(reserve_changed);
+            self.arena.changed_influence.reserve(reserve_changed);
 
             for worker_id in 0..worker_count {
                 let scratch = &mut self.worker_scratch[worker_id];
                 self.arena.expand_buf.append(&mut scratch.expand);
                 self.arena.prune_buf.append(&mut scratch.prune);
                 self.arena.changed_list.append(&mut scratch.changed);
+                self.arena
+                    .changed_influence
+                    .append(&mut scratch.changed_influence);
             }
         }
         if !self.arena.changed_list.is_empty() {
+            debug_assert_eq!(
+                self.arena.changed_list.len(),
+                self.arena.changed_influence.len()
+            );
             self.arena.mark_changed_bitmap_unsynced();
         }
 

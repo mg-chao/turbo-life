@@ -19,16 +19,24 @@ pub struct TileAdvanceResult {
     pub has_live: bool,
     pub missing_mask: u8,
     pub live_mask: u8,
+    pub neighbor_influence_mask: u8,
 }
 
 impl TileAdvanceResult {
     #[inline(always)]
-    pub const fn new(changed: bool, has_live: bool, missing_mask: u8, live_mask: u8) -> Self {
+    pub const fn new(
+        changed: bool,
+        has_live: bool,
+        missing_mask: u8,
+        live_mask: u8,
+        neighbor_influence_mask: u8,
+    ) -> Self {
         Self {
             changed,
             has_live,
             missing_mask,
             live_mask,
+            neighbor_influence_mask,
         }
     }
 }
@@ -118,6 +126,22 @@ pub(crate) unsafe fn ghost_is_empty_from_live_masks_ptr(
         | (sw & LIVE_NE)
         | (se & LIVE_NW);
     ghost_activity == 0
+}
+
+#[inline(always)]
+fn neighbor_influence_mask_from_borders(
+    prev_north: u64,
+    prev_south: u64,
+    prev_west: u64,
+    prev_east: u64,
+    next_border: &BorderData,
+) -> u8 {
+    BorderData::compute_live_mask(
+        next_border.north ^ prev_north,
+        next_border.south ^ prev_south,
+        next_border.west ^ prev_west,
+        next_border.east ^ prev_east,
+    )
 }
 
 #[inline(always)]
@@ -628,6 +652,7 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
+    track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     let nb = unsafe { &*neighbors_ptr.add(idx) };
     let current = unsafe { &(*current_ptr.add(idx)).0 };
@@ -648,7 +673,7 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
                 *next_live_masks_ptr.add(idx) = 0;
             }
             meta.update_after_step(false, false);
-            return TileAdvanceResult::new(false, false, missing_mask, 0);
+            return TileAdvanceResult::new(false, false, missing_mask, 0, 0);
         }
 
         // Ultra-fast path: metadata says current tile is empty and halo has no
@@ -666,7 +691,7 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
                 *next_live_masks_ptr.add(idx) = 0;
             }
             meta.update_after_step(false, false);
-            return TileAdvanceResult::new(false, false, missing_mask, 0);
+            return TileAdvanceResult::new(false, false, missing_mask, 0, 0);
         }
     }
 
@@ -698,9 +723,27 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
         *next_live_masks_ptr.add(idx) = live_mask;
     }
 
+    let neighbor_influence_mask = if changed && track_neighbor_influence {
+        let prev_north = unsafe { *borders_north_read_ptr.add(idx) };
+        let prev_south = unsafe { *borders_south_read_ptr.add(idx) };
+        let prev_west = unsafe { *borders_west_read_ptr.add(idx) };
+        let prev_east = unsafe { *borders_east_read_ptr.add(idx) };
+        neighbor_influence_mask_from_borders(prev_north, prev_south, prev_west, prev_east, &border)
+    } else if changed {
+        u8::MAX
+    } else {
+        0
+    };
+
     meta.update_after_step(changed, has_live);
 
-    TileAdvanceResult::new(changed, has_live, missing_mask, live_mask)
+    TileAdvanceResult::new(
+        changed,
+        has_live,
+        missing_mask,
+        live_mask,
+        neighbor_influence_mask,
+    )
 }
 
 #[inline(always)]
@@ -721,6 +764,7 @@ pub unsafe fn advance_tile_fused_scalar(
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
+    track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
         advance_tile_fused_impl::<false>(
@@ -739,6 +783,7 @@ pub unsafe fn advance_tile_fused_scalar(
             live_masks_read_ptr,
             next_live_masks_ptr,
             idx,
+            track_neighbor_influence,
         )
     }
 }
@@ -762,6 +807,7 @@ pub unsafe fn advance_tile_fused_avx2(
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
+    track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
         advance_tile_fused_impl::<true>(
@@ -780,6 +826,7 @@ pub unsafe fn advance_tile_fused_avx2(
             live_masks_read_ptr,
             next_live_masks_ptr,
             idx,
+            track_neighbor_influence,
         )
     }
 }
