@@ -62,7 +62,7 @@ fn main() {
         for x in 0..=4096 {
             if rng.next_u64() <= threshold {
                 quick.set_cell(x, y, true);
-                turbo.set_cell(x as i64, y as i64, true);
+                turbo.set_cell_alive(x as i64, y as i64);
             }
         }
     }

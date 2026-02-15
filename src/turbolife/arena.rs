@@ -252,7 +252,6 @@ impl TileArena {
 
     /// Current-gen border for a tile.
     #[inline(always)]
-    #[allow(dead_code)]
     pub fn border(&self, idx: TileIdx) -> BorderData {
         self.borders[self.border_phase].get(idx.index())
     }
@@ -263,19 +262,6 @@ impl TileArena {
         let i = idx.index();
         self.borders[self.border_phase].set(i, border);
         self.border_live_masks[self.border_phase][i] = border.live_mask();
-    }
-
-    /// Refresh cached live-mask from current-gen border after in-place edits.
-    #[inline(always)]
-    pub fn sync_current_border_live_mask(&mut self, idx: TileIdx) {
-        let i = idx.index();
-        let borders = &self.borders[self.border_phase];
-        self.border_live_masks[self.border_phase][i] = BorderData::compute_live_mask(
-            borders.north[i],
-            borders.south[i],
-            borders.west[i],
-            borders.east[i],
-        );
     }
 
     /// Flip border phase.

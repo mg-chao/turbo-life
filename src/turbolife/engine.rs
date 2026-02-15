@@ -694,86 +694,126 @@ impl TurboLife {
         }
     }
 
-    pub fn set_cell(&mut self, x: i64, y: i64, alive: bool) {
+    #[inline(always)]
+    fn touches_tile_border(local_x: usize, local_y: usize) -> bool {
+        local_x == 0
+            || local_x == tile::TILE_SIZE - 1
+            || local_y == 0
+            || local_y == tile::TILE_SIZE - 1
+    }
+
+    #[inline(always)]
+    fn update_current_border_for_row_mutation(
+        &mut self,
+        idx: TileIdx,
+        local_x: usize,
+        local_y: usize,
+        row_after: u64,
+    ) {
+        if !Self::touches_tile_border(local_x, local_y) {
+            return;
+        }
+
+        let mut border = self.arena.border(idx);
+
+        if local_y == 0 {
+            border.south = row_after;
+        }
+        if local_y == tile::TILE_SIZE - 1 {
+            border.north = row_after;
+        }
+
+        if local_x == 0 {
+            let row_bit = 1u64 << local_y;
+            border.west = (border.west & !row_bit) | ((row_after & 1) << local_y);
+        }
+        if local_x == tile::TILE_SIZE - 1 {
+            let row_bit = 1u64 << local_y;
+            border.east =
+                (border.east & !row_bit) | (((row_after >> (tile::TILE_SIZE - 1)) & 1) << local_y);
+        }
+
+        self.arena.set_current_border(idx, border);
+    }
+
+    #[inline]
+    pub fn set_cell_alive(&mut self, x: i64, y: i64) {
         let tile_coord = (x.div_euclid(TILE_SIZE_I64), y.div_euclid(TILE_SIZE_I64));
         let local_x = x.rem_euclid(TILE_SIZE_I64) as usize;
         let local_y = y.rem_euclid(TILE_SIZE_I64) as usize;
 
-        let idx = match self.arena.idx_at(tile_coord) {
-            Some(existing) => existing,
-            None if alive => self.arena.allocate_absent(tile_coord),
-            None => return,
+        let idx = self
+            .arena
+            .idx_at(tile_coord)
+            .unwrap_or_else(|| self.arena.allocate_absent(tile_coord));
+
+        let row_after: u64;
+        {
+            let buf = self.arena.current_buf_mut(idx);
+            let mask = 1u64 << local_x;
+            let row = &mut buf[local_y];
+            if (*row & mask) != 0 {
+                return;
+            }
+            *row |= mask;
+            row_after = *row;
+        }
+
+        self.update_current_border_for_row_mutation(idx, local_x, local_y, row_after);
+
+        {
+            let meta = self.arena.meta_mut(idx);
+            meta.population = POPULATION_UNKNOWN;
+            meta.set_has_live(true);
+        }
+        self.population_cache = None;
+        self.arena.mark_changed(idx);
+        self.ensure_frontier_neighbors(idx, tile_coord, local_x, local_y);
+    }
+
+    #[inline]
+    pub fn set_cell(&mut self, x: i64, y: i64, alive: bool) {
+        if alive {
+            self.set_cell_alive(x, y);
+            return;
+        }
+
+        let tile_coord = (x.div_euclid(TILE_SIZE_I64), y.div_euclid(TILE_SIZE_I64));
+        let local_x = x.rem_euclid(TILE_SIZE_I64) as usize;
+        let local_y = y.rem_euclid(TILE_SIZE_I64) as usize;
+
+        let Some(idx) = self.arena.idx_at(tile_coord) else {
+            return;
         };
 
         let row_after: u64;
-        let mut has_live_after_clear = true;
+        let has_live_after_clear;
 
         {
             let buf = self.arena.current_buf_mut(idx);
             let mask = 1u64 << local_x;
             let row = &mut buf[local_y];
-            let was_alive = (*row & mask) != 0;
-            if was_alive == alive {
+            if (*row & mask) == 0 {
                 return;
             }
-
-            if alive {
-                *row |= mask;
-            } else {
-                *row &= !mask;
-            }
+            *row &= !mask;
             row_after = *row;
-
-            if !alive {
-                has_live_after_clear = if row_after != 0 {
-                    true
-                } else {
-                    buf.iter().any(|&r| r != 0)
-                };
-            }
+            has_live_after_clear = if row_after != 0 {
+                true
+            } else {
+                buf.iter().any(|&r| r != 0)
+            };
         }
 
-        {
-            let i = idx.index();
-            let bp = self.arena.border_phase;
-            let borders = &mut self.arena.borders[bp];
-            let mut border = borders.get(i);
-
-            if local_y == 0 {
-                border.south = row_after;
-            }
-            if local_y == tile::TILE_SIZE - 1 {
-                border.north = row_after;
-            }
-
-            if local_x == 0 {
-                let row_bit = 1u64 << local_y;
-                border.west = (border.west & !row_bit) | ((row_after & 1) << local_y);
-            }
-            if local_x == tile::TILE_SIZE - 1 {
-                let row_bit = 1u64 << local_y;
-                border.east = (border.east & !row_bit) | (((row_after >> 63) & 1) << local_y);
-            }
-
-            borders.set(i, border);
-        }
-        self.arena.sync_current_border_live_mask(idx);
+        self.update_current_border_for_row_mutation(idx, local_x, local_y, row_after);
 
         {
             let meta = self.arena.meta_mut(idx);
             meta.population = POPULATION_UNKNOWN;
-            if alive {
-                meta.set_has_live(true);
-            } else {
-                meta.set_has_live(has_live_after_clear);
-            }
+            meta.set_has_live(has_live_after_clear);
         }
         self.population_cache = None;
         self.arena.mark_changed(idx);
-
-        if alive {
-            self.ensure_frontier_neighbors(idx, tile_coord, local_x, local_y);
-        }
     }
 
     /// Batch-update many cells, amortizing per-tile metadata recompute.
@@ -1996,6 +2036,25 @@ mod tests {
             changed_before + 1,
             "set_cell should requeue a stable tile even after unrelated steps"
         );
+    }
+
+    #[test]
+    fn set_cell_alive_fast_path_updates_frontier_and_border_cache() {
+        let mut engine = TurboLife::new();
+
+        engine.set_cell_alive(5, 5);
+        assert!(engine.get_cell(5, 5));
+        assert!(engine.arena.idx_at((1, 0)).is_none());
+        assert_border_live_mask_cache_sync(&engine);
+
+        engine.set_cell_alive(63, 5);
+        assert!(engine.get_cell(63, 5));
+        assert!(engine.arena.idx_at((1, 0)).is_some());
+        assert_border_live_mask_cache_sync(&engine);
+
+        let changed_before = engine.arena.changed_list.len();
+        engine.set_cell_alive(63, 5);
+        assert_eq!(engine.arena.changed_list.len(), changed_before);
     }
 
     #[test]
