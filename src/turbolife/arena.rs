@@ -148,6 +148,7 @@ pub struct TileArena {
     pub active_set: Vec<TileIdx>,
     active_epoch: u16,
     active_tags: Vec<u16>,
+    pub active_marks_words: Vec<u64>,
     pub active_sort_scratch: Vec<TileIdx>,
     pub active_sort_counts: Vec<u32>,
     /// Pending directional frontier-expansion candidates.
@@ -206,6 +207,7 @@ impl TileArena {
             active_set: Vec::new(),
             active_epoch: 1,
             active_tags: vec![0],
+            active_marks_words: vec![0],
             active_sort_scratch: Vec::new(),
             active_sort_counts: vec![0u32; ACTIVE_SORT_RADIX_BUCKETS],
             expand_buf: Vec::new(),
@@ -354,6 +356,10 @@ impl TileArena {
         if self.active_tags.len() < target_slots {
             self.active_tags
                 .reserve(target_slots - self.active_tags.len());
+        }
+        if self.active_marks_words.len() < target_words {
+            self.active_marks_words
+                .reserve(target_words - self.active_marks_words.len());
         }
     }
 

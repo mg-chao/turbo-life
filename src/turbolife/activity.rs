@@ -26,6 +26,10 @@ const ACTIVE_SORT_LOW_CHURN_PCT: usize = 20;
 const ACTIVE_SORT_SKIP_MIN: usize = 2_048;
 const ACTIVE_SORT_SKIP_MAX: usize = 8_192;
 const ACTIVE_SORT_PROBE_CHURN_PCT: usize = 40;
+const ACTIVE_BITMAP_REBUILD_MIN_OCCUPIED: usize = 2_048;
+const ACTIVE_BITMAP_REBUILD_MAX_OCCUPIED: usize = 8_192;
+const ACTIVE_BITMAP_REBUILD_MIN_CHANGED: usize = 1_024;
+const ACTIVE_BITMAP_REBUILD_DENSE_CHANGED_PCT: usize = 45;
 const DIRECTIONAL_FILTER_ALWAYS_ON_MAX_CHANGED: usize = 64;
 const DIRECTIONAL_FILTER_PROBE_MAX_CHANGED: usize = 256;
 const DIRECTIONAL_FILTER_SAMPLE_MAX: usize = 256;
@@ -36,6 +40,10 @@ const _: [(); 1] = [(); (ACTIVE_SORT_SKIP_MAX <= ACTIVE_SORT_STD_MAX) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_LOW_CHURN_PCT <= 100) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_PROBE_CHURN_PCT <= 100) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_LOW_CHURN_PCT < ACTIVE_SORT_PROBE_CHURN_PCT) as usize];
+const _: [(); 1] = [(); (ACTIVE_BITMAP_REBUILD_DENSE_CHANGED_PCT <= 100) as usize];
+const _: [(); 1] = [(); (ACTIVE_BITMAP_REBUILD_MIN_CHANGED > 0) as usize];
+const _: [(); 1] =
+    [(); (ACTIVE_BITMAP_REBUILD_MIN_OCCUPIED <= ACTIVE_BITMAP_REBUILD_MAX_OCCUPIED) as usize];
 const _: [(); 1] = [(); (DIRECTIONAL_FILTER_ALWAYS_ON_MAX_CHANGED
     <= DIRECTIONAL_FILTER_PROBE_MAX_CHANGED) as usize];
 const _: [(); 1] =
@@ -91,6 +99,15 @@ fn should_probe_std_active_sort(active_len: usize, changed_count: usize) -> bool
     }
 
     changed_count.saturating_mul(100) <= active_len.saturating_mul(ACTIVE_SORT_PROBE_CHURN_PCT)
+}
+
+#[inline(always)]
+fn should_use_bitmap_active_rebuild(occupied_count: usize, changed_count: usize) -> bool {
+    (ACTIVE_BITMAP_REBUILD_MIN_OCCUPIED..=ACTIVE_BITMAP_REBUILD_MAX_OCCUPIED)
+        .contains(&occupied_count)
+        && changed_count >= ACTIVE_BITMAP_REBUILD_MIN_CHANGED
+        && changed_count.saturating_mul(100)
+            >= occupied_count.saturating_mul(ACTIVE_BITMAP_REBUILD_DENSE_CHANGED_PCT)
 }
 
 #[inline(always)]
@@ -389,6 +406,65 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         return;
     }
 
+    let bitmap_rebuild = should_use_bitmap_active_rebuild(arena.occupied_count, changed_count);
+    if bitmap_rebuild {
+        let word_len = meta_len.div_ceil(64);
+        if arena.active_marks_words.len() < word_len {
+            arena.active_marks_words.resize(word_len, 0);
+        } else {
+            arena.active_marks_words[..word_len].fill(0);
+        }
+
+        let marks_ptr = arena.active_marks_words.as_mut_ptr();
+        let neighbors_ptr = arena.neighbors.as_ptr();
+        let changed_ptr = arena.changed_scratch.as_ptr();
+        for changed_i in 0..changed_count {
+            let idx = unsafe { *changed_ptr.add(changed_i) };
+            let i = idx.index();
+
+            unsafe {
+                let word = i >> 6;
+                *marks_ptr.add(word) |= 1u64 << (i & 63);
+
+                let nb = *neighbors_ptr.add(i);
+                for &ni_raw in nb.iter() {
+                    if ni_raw == NO_NEIGHBOR {
+                        continue;
+                    }
+                    let ni = ni_raw as usize;
+                    let ni_word = ni >> 6;
+                    *marks_ptr.add(ni_word) |= 1u64 << (ni & 63);
+                }
+            }
+        }
+
+        if word_len != 0 {
+            arena.active_marks_words[0] &= !1u64;
+            let tail_bits = meta_len & 63;
+            if tail_bits != 0 {
+                let tail_mask = (1u64 << tail_bits) - 1;
+                let last_word = word_len - 1;
+                arena.active_marks_words[last_word] &= tail_mask;
+            }
+        }
+
+        arena
+            .active_set
+            .reserve(changed_count.saturating_mul(9).min(arena.occupied_count));
+        for word_idx in 0..word_len {
+            let mut bits = arena.active_marks_words[word_idx];
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let i = (word_idx << 6) + bit;
+                debug_assert!(i < meta_len);
+                debug_assert!(arena.meta[i].occupied());
+                arena.active_set.push(TileIdx(i as u32));
+                bits &= bits - 1;
+            }
+        }
+        return;
+    }
+
     arena
         .active_set
         .reserve(changed_count.saturating_mul(9).min(arena.occupied_count));
@@ -656,12 +732,15 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         BorderEdges, PARALLEL_PRUNE_BITMAP_MIN, PARALLEL_PRUNE_CANDIDATES_MIN, TileArena,
         active_set_is_sorted, border_neighbor_influence_mask, finalize_prune_and_expand,
         rebuild_active_set, should_probe_std_active_sort, should_skip_std_active_sort,
+        should_use_bitmap_active_rebuild,
     };
-    use crate::turbolife::tile::{BorderData, MISSING_ALL_NEIGHBORS, TileIdx};
+    use crate::turbolife::tile::{BorderData, MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
 
     #[test]
     fn rebuild_active_set_stays_empty_without_changes() {
@@ -719,6 +798,53 @@ mod tests {
         for (i, idx) in arena.active_set.iter().enumerate() {
             assert_eq!(idx.0, (i + 1) as u32);
         }
+    }
+
+    #[test]
+    fn bitmap_rebuild_gate_targets_mid_large_dense_frontiers() {
+        assert!(!should_use_bitmap_active_rebuild(2_047, 1_024));
+        assert!(!should_use_bitmap_active_rebuild(2_048, 1_023));
+        assert!(should_use_bitmap_active_rebuild(2_048, 1_024));
+        assert!(!should_use_bitmap_active_rebuild(8_193, 4_096));
+        assert!(!should_use_bitmap_active_rebuild(4_096, 1_000));
+    }
+
+    #[test]
+    fn bitmap_rebuild_matches_reference_neighbor_expansion() {
+        let mut arena = TileArena::new();
+        let width = 64i64;
+        let height = 32i64;
+        let mut tiles = Vec::new();
+
+        for y in 0..height {
+            for x in 0..width {
+                tiles.push(arena.allocate((x, y)));
+            }
+        }
+
+        let changed = 1_024usize;
+        for &idx in tiles.iter().take(changed) {
+            arena.mark_changed(idx);
+        }
+
+        let mut expected = BTreeSet::new();
+        for &idx in tiles.iter().take(changed) {
+            expected.insert(idx.0);
+            for &ni in arena.neighbors[idx.index()].iter() {
+                if ni != NO_NEIGHBOR {
+                    expected.insert(ni);
+                }
+            }
+        }
+
+        rebuild_active_set(&mut arena);
+
+        let active_raw: Vec<u32> = arena.active_set.iter().map(|idx| idx.0).collect();
+        let mut expected_vec: Vec<u32> = expected.into_iter().collect();
+        expected_vec.retain(|&idx| idx != 0);
+
+        assert!(active_set_is_sorted(&arena.active_set));
+        assert_eq!(active_raw, expected_vec);
     }
 
     #[test]
