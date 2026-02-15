@@ -142,6 +142,7 @@ pub struct TileArena {
     pub free_list: Vec<TileIdx>,
     pub changed_list: Vec<TileIdx>,
     pub changed_influence: Vec<u8>,
+    changed_influence_uniform_all: bool,
     changed_bits: Vec<u64>,
     changed_bitmap_synced: bool,
     pub occupied_count: usize,
@@ -204,6 +205,7 @@ impl TileArena {
             free_list: Vec::new(),
             changed_list: Vec::new(),
             changed_influence: Vec::new(),
+            changed_influence_uniform_all: false,
             changed_bits: vec![0],
             changed_bitmap_synced: true,
             occupied_count: 0,
@@ -302,13 +304,38 @@ impl TileArena {
         self.mark_changed_with_influence(idx, CHANGED_INFLUENCE_ALL);
     }
 
+    #[inline(always)]
+    fn debug_assert_changed_influence_layout(&self) {
+        debug_assert!(
+            (self.changed_influence_uniform_all && self.changed_influence.is_empty())
+                || (!self.changed_influence_uniform_all
+                    && self.changed_list.len() == self.changed_influence.len())
+        );
+    }
+
+    #[inline]
+    fn materialize_changed_influence_if_uniform(&mut self) {
+        if self.changed_influence_uniform_all {
+            self.changed_influence
+                .resize(self.changed_list.len(), CHANGED_INFLUENCE_ALL);
+            self.changed_influence_uniform_all = false;
+        }
+    }
+
     #[inline]
     pub fn mark_changed_with_influence(&mut self, idx: TileIdx, influence_mask: u8) {
+        if influence_mask != CHANGED_INFLUENCE_ALL {
+            self.materialize_changed_influence_if_uniform();
+        }
         self.sync_changed_bitmap_if_needed();
         let i = idx.index();
         if !self.changed_test_and_set(i) {
             self.changed_list.push(idx);
-            self.changed_influence.push(influence_mask);
+            if self.changed_influence_uniform_all {
+                debug_assert_eq!(influence_mask, CHANGED_INFLUENCE_ALL);
+            } else {
+                self.changed_influence.push(influence_mask);
+            }
         } else {
             self.merge_changed_influence_for_existing(idx, influence_mask);
         }
@@ -318,6 +345,12 @@ impl TileArena {
     fn merge_changed_influence_for_existing(&mut self, idx: TileIdx, influence_mask: u8) {
         if influence_mask == 0 {
             return;
+        }
+        if self.changed_influence_uniform_all {
+            if influence_mask == CHANGED_INFLUENCE_ALL {
+                return;
+            }
+            self.materialize_changed_influence_if_uniform();
         }
         if let Some(pos) = self.changed_list.iter().rposition(|&queued| queued == idx) {
             self.changed_influence[pos] |= influence_mask;
@@ -340,6 +373,9 @@ impl TileArena {
         idx: TileIdx,
         influence_mask: u8,
     ) {
+        if influence_mask != CHANGED_INFLUENCE_ALL {
+            self.materialize_changed_influence_if_uniform();
+        }
         if self.changed_bitmap_synced {
             let duplicate = self.changed_test_and_set(idx.index());
             debug_assert!(
@@ -352,21 +388,35 @@ impl TileArena {
             }
         }
         self.changed_list.push(idx);
-        self.changed_influence.push(influence_mask);
+        if self.changed_influence_uniform_all {
+            debug_assert_eq!(influence_mask, CHANGED_INFLUENCE_ALL);
+        } else {
+            self.changed_influence.push(influence_mask);
+        }
     }
 
     #[cfg(test)]
     #[inline(always)]
     pub fn push_changed_from_kernel(&mut self, idx: TileIdx) {
         self.changed_list.push(idx);
-        self.changed_influence.push(CHANGED_INFLUENCE_ALL);
+        self.changed_influence.clear();
+        self.changed_influence_uniform_all = true;
         self.changed_bitmap_synced = false;
     }
 
     #[inline(always)]
     pub(crate) fn mark_changed_bitmap_unsynced(&mut self) {
+        self.materialize_changed_influence_if_uniform();
         self.changed_bitmap_synced = false;
-        debug_assert_eq!(self.changed_list.len(), self.changed_influence.len());
+        self.debug_assert_changed_influence_layout();
+    }
+
+    #[inline(always)]
+    pub(crate) fn mark_changed_bitmap_unsynced_uniform_all(&mut self) {
+        self.changed_bitmap_synced = false;
+        self.changed_influence_uniform_all = true;
+        self.changed_influence.clear();
+        self.debug_assert_changed_influence_layout();
     }
 
     #[inline]
@@ -427,7 +477,7 @@ impl TileArena {
         if self.changed_bitmap_synced {
             return;
         }
-        debug_assert_eq!(self.changed_list.len(), self.changed_influence.len());
+        self.debug_assert_changed_influence_layout();
         let len = self.changed_list.len();
         for i in 0..len {
             let idx = self.changed_list[i].index();
@@ -499,11 +549,13 @@ impl TileArena {
     }
 
     #[inline]
-    pub(crate) fn begin_changed_rebuild(&mut self) -> bool {
-        debug_assert_eq!(self.changed_list.len(), self.changed_influence.len());
+    pub(crate) fn begin_changed_rebuild(&mut self) -> (bool, bool) {
+        self.debug_assert_changed_influence_layout();
         let was_synced = self.changed_bitmap_synced;
+        let uniform_influence = self.changed_influence_uniform_all;
         self.changed_bitmap_synced = true;
-        was_synced
+        self.changed_influence_uniform_all = false;
+        (was_synced, uniform_influence)
     }
 
     #[inline]
@@ -678,7 +730,7 @@ impl TileArena {
 
 #[cfg(test)]
 mod tests {
-    use super::TileArena;
+    use super::{CHANGED_INFLUENCE_ALL, TileArena};
     use crate::turbolife::tile::BorderData;
 
     #[test]
@@ -735,6 +787,24 @@ mod tests {
         assert_eq!(arena.changed_list, vec![idx]);
         assert_eq!(arena.changed_influence, vec![(1 << 1) | (1 << 3)]);
         assert!(arena.changed_bitmap_synced);
+    }
+
+    #[test]
+    fn mark_changed_bitmap_unsynced_materializes_uniform_influence_layout() {
+        let mut arena = TileArena::new();
+        let idx = arena.allocate((0, 0));
+
+        arena.mark_changed(idx);
+        arena.mark_changed_bitmap_unsynced_uniform_all();
+        assert!(arena.changed_influence_uniform_all);
+        assert!(arena.changed_influence.is_empty());
+
+        arena.mark_changed_bitmap_unsynced();
+
+        assert!(!arena.changed_influence_uniform_all);
+        assert_eq!(arena.changed_list, vec![idx]);
+        assert_eq!(arena.changed_influence, vec![CHANGED_INFLUENCE_ALL]);
+        assert!(!arena.changed_bitmap_synced);
     }
 
     #[test]

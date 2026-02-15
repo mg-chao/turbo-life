@@ -157,9 +157,11 @@ impl WorkerScratch {
     }
 
     #[inline]
-    fn reserve_for_chunk(&mut self, chunk_len: usize) {
+    fn reserve_for_chunk(&mut self, chunk_len: usize, track_neighbor_influence: bool) {
         Self::reserve_capacity(&mut self.changed, chunk_len);
-        Self::reserve_capacity(&mut self.changed_influence, chunk_len);
+        if track_neighbor_influence {
+            Self::reserve_capacity(&mut self.changed_influence, chunk_len);
+        }
         Self::reserve_capacity(&mut self.prune, chunk_len);
         let expand_target = chunk_len.saturating_mul(3);
         Self::reserve_capacity(&mut self.expand, expand_target);
@@ -492,7 +494,12 @@ impl TurboLife {
     }
 
     #[inline]
-    fn prepare_worker_scratch(&mut self, worker_count: usize, active_len: usize) {
+    fn prepare_worker_scratch(
+        &mut self,
+        worker_count: usize,
+        active_len: usize,
+        track_neighbor_influence: bool,
+    ) {
         if self.worker_scratch.len() < worker_count {
             self.worker_scratch
                 .resize_with(worker_count, WorkerScratch::default);
@@ -503,7 +510,7 @@ impl TurboLife {
         let chunk_len = active_len.div_ceil(worker_count);
         for scratch in self.worker_scratch.iter_mut().take(worker_count) {
             scratch.clear();
-            scratch.reserve_for_chunk(chunk_len);
+            scratch.reserve_for_chunk(chunk_len, track_neighbor_influence);
         }
     }
 
@@ -834,7 +841,7 @@ impl TurboLife {
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
 
             macro_rules! serial_loop_cached {
-                ($advance:path) => {{
+                ($advance:path, $track:expr) => {{
                     for i in 0..active_len {
                         let idx = unsafe { *active_ptr.add(i) };
                         let ii = idx.index();
@@ -887,15 +894,17 @@ impl TurboLife {
                                 next_live_masks_ptr,
                                 ii,
                                 cache_ptr,
-                                track_neighbor_influence,
+                                $track,
                             )
                         };
 
                         if result.changed {
                             self.arena.changed_list.push(idx);
-                            self.arena
-                                .changed_influence
-                                .push(result.neighbor_influence_mask);
+                            if $track {
+                                self.arena
+                                    .changed_influence
+                                    .push(result.neighbor_influence_mask);
+                            }
                         } else if !result.has_live {
                             self.arena.prune_buf.push(idx);
                         }
@@ -914,7 +923,7 @@ impl TurboLife {
             }
 
             macro_rules! serial_loop_fused {
-                ($advance:path) => {{
+                ($advance:path, $track:expr) => {{
                     for i in 0..active_len {
                         let idx = unsafe { *active_ptr.add(i) };
                         let ii = idx.index();
@@ -966,15 +975,17 @@ impl TurboLife {
                                 live_masks_read_ptr,
                                 next_live_masks_ptr,
                                 ii,
-                                track_neighbor_influence,
+                                $track,
                             )
                         };
 
                         if result.changed {
                             self.arena.changed_list.push(idx);
-                            self.arena
-                                .changed_influence
-                                .push(result.neighbor_influence_mask);
+                            if $track {
+                                self.arena
+                                    .changed_influence
+                                    .push(result.neighbor_influence_mask);
+                            }
                         } else if !result.has_live {
                             self.arena.prune_buf.push(idx);
                         }
@@ -993,30 +1004,70 @@ impl TurboLife {
             }
 
             if use_serial_cache {
-                match backend {
-                    KernelBackend::Scalar => serial_loop_cached!(advance_tile_cached_scalar),
-                    KernelBackend::Avx2 => {
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            serial_loop_cached!(advance_tile_cached_avx2);
+                if track_neighbor_influence {
+                    match backend {
+                        KernelBackend::Scalar => {
+                            serial_loop_cached!(advance_tile_cached_scalar, true)
                         }
-                        #[cfg(not(target_arch = "x86_64"))]
-                        {
-                            serial_loop_cached!(advance_tile_cached_scalar);
+                        KernelBackend::Avx2 => {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                serial_loop_cached!(advance_tile_cached_avx2, true);
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                serial_loop_cached!(advance_tile_cached_scalar, true);
+                            }
+                        }
+                    }
+                } else {
+                    match backend {
+                        KernelBackend::Scalar => {
+                            serial_loop_cached!(advance_tile_cached_scalar, false)
+                        }
+                        KernelBackend::Avx2 => {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                serial_loop_cached!(advance_tile_cached_avx2, false);
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                serial_loop_cached!(advance_tile_cached_scalar, false);
+                            }
                         }
                     }
                 }
             } else {
-                match backend {
-                    KernelBackend::Scalar => serial_loop_fused!(advance_tile_fused_scalar),
-                    KernelBackend::Avx2 => {
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            serial_loop_fused!(advance_tile_fused_avx2);
+                if track_neighbor_influence {
+                    match backend {
+                        KernelBackend::Scalar => {
+                            serial_loop_fused!(advance_tile_fused_scalar, true)
                         }
-                        #[cfg(not(target_arch = "x86_64"))]
-                        {
-                            serial_loop_fused!(advance_tile_fused_scalar);
+                        KernelBackend::Avx2 => {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                serial_loop_fused!(advance_tile_fused_avx2, true);
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                serial_loop_fused!(advance_tile_fused_scalar, true);
+                            }
+                        }
+                    }
+                } else {
+                    match backend {
+                        KernelBackend::Scalar => {
+                            serial_loop_fused!(advance_tile_fused_scalar, false)
+                        }
+                        KernelBackend::Avx2 => {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                serial_loop_fused!(advance_tile_fused_avx2, false);
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                serial_loop_fused!(advance_tile_fused_scalar, false);
+                            }
                         }
                     }
                 }
@@ -1045,7 +1096,7 @@ impl TurboLife {
             let worker_count = effective_threads.min(active_len);
             let use_static_schedule =
                 active_len >= PARALLEL_STATIC_SCHEDULE_THRESHOLD || worker_count < thread_count;
-            self.prepare_worker_scratch(worker_count, active_len);
+            self.prepare_worker_scratch(worker_count, active_len, track_neighbor_influence);
             let scratch_ptr = SendPtr::new(self.worker_scratch.as_mut_ptr());
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
 
@@ -1084,7 +1135,7 @@ impl TurboLife {
             }
 
             macro_rules! process_work_item {
-                ($advance:path, $scratch:expr, $i:expr, $end:expr) => {{
+                ($advance:path, $scratch:expr, $i:expr, $end:expr, $track:expr) => {{
                     prefetch_for_work_item!($i, $end);
                     let idx = unsafe { *active_ptr.get().add($i) };
                     let ii = idx.index();
@@ -1105,15 +1156,17 @@ impl TurboLife {
                             live_masks_read_ptr.get(),
                             next_live_masks_ptr.get(),
                             ii,
-                            track_neighbor_influence,
+                            $track,
                         )
                     };
 
                     if result.changed {
                         ($scratch).changed.push(idx);
-                        ($scratch)
-                            .changed_influence
-                            .push(result.neighbor_influence_mask);
+                        if $track {
+                            ($scratch)
+                                .changed_influence
+                                .push(result.neighbor_influence_mask);
+                        }
                     } else if !result.has_live {
                         ($scratch).prune.push(idx);
                     }
@@ -1131,7 +1184,7 @@ impl TurboLife {
             }
 
             macro_rules! parallel_kernel_static {
-                ($advance:path, $chunk_size:expr) => {{
+                ($advance:path, $chunk_size:expr, $track:expr) => {{
                     (0..worker_count).into_par_iter().for_each(|worker_id| {
                         let start = worker_id.saturating_mul($chunk_size);
                         if start >= active_len {
@@ -1140,7 +1193,7 @@ impl TurboLife {
                         let end = (start + $chunk_size).min(active_len);
                         let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
                         for i in start..end {
-                            process_work_item!($advance, scratch, i, end);
+                            process_work_item!($advance, scratch, i, end, $track);
                         }
                     });
                 }};
@@ -1149,18 +1202,40 @@ impl TurboLife {
             if use_static_schedule {
                 let chunk_size = active_len.div_ceil(worker_count);
 
-                match backend {
-                    KernelBackend::Scalar => {
-                        parallel_kernel_static!(advance_tile_fused_scalar, chunk_size)
-                    }
-                    KernelBackend::Avx2 => {
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            parallel_kernel_static!(advance_tile_fused_avx2, chunk_size)
+                if track_neighbor_influence {
+                    match backend {
+                        KernelBackend::Scalar => {
+                            parallel_kernel_static!(advance_tile_fused_scalar, chunk_size, true)
                         }
-                        #[cfg(not(target_arch = "x86_64"))]
-                        {
-                            parallel_kernel_static!(advance_tile_fused_scalar, chunk_size)
+                        KernelBackend::Avx2 => {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                parallel_kernel_static!(advance_tile_fused_avx2, chunk_size, true)
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                parallel_kernel_static!(advance_tile_fused_scalar, chunk_size, true)
+                            }
+                        }
+                    }
+                } else {
+                    match backend {
+                        KernelBackend::Scalar => {
+                            parallel_kernel_static!(advance_tile_fused_scalar, chunk_size, false)
+                        }
+                        KernelBackend::Avx2 => {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                parallel_kernel_static!(advance_tile_fused_avx2, chunk_size, false)
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                parallel_kernel_static!(
+                                    advance_tile_fused_scalar,
+                                    chunk_size,
+                                    false
+                                )
+                            }
                         }
                     }
                 }
@@ -1169,7 +1244,7 @@ impl TurboLife {
                 let cursor = AtomicUsize::new(0);
 
                 macro_rules! parallel_kernel_lockfree {
-                    ($advance:path) => {{
+                    ($advance:path, $track:expr) => {{
                         (0..worker_count).into_par_iter().for_each(|worker_id| {
                             let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
                             loop {
@@ -1179,23 +1254,43 @@ impl TurboLife {
                                 }
                                 let end = (start + chunk_size).min(active_len);
                                 for i in start..end {
-                                    process_work_item!($advance, scratch, i, end);
+                                    process_work_item!($advance, scratch, i, end, $track);
                                 }
                             }
                         });
                     }};
                 }
 
-                match backend {
-                    KernelBackend::Scalar => parallel_kernel_lockfree!(advance_tile_fused_scalar),
-                    KernelBackend::Avx2 => {
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            parallel_kernel_lockfree!(advance_tile_fused_avx2)
+                if track_neighbor_influence {
+                    match backend {
+                        KernelBackend::Scalar => {
+                            parallel_kernel_lockfree!(advance_tile_fused_scalar, true)
                         }
-                        #[cfg(not(target_arch = "x86_64"))]
-                        {
-                            parallel_kernel_lockfree!(advance_tile_fused_scalar)
+                        KernelBackend::Avx2 => {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                parallel_kernel_lockfree!(advance_tile_fused_avx2, true)
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                parallel_kernel_lockfree!(advance_tile_fused_scalar, true)
+                            }
+                        }
+                    }
+                } else {
+                    match backend {
+                        KernelBackend::Scalar => {
+                            parallel_kernel_lockfree!(advance_tile_fused_scalar, false)
+                        }
+                        KernelBackend::Avx2 => {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                parallel_kernel_lockfree!(advance_tile_fused_avx2, false)
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                parallel_kernel_lockfree!(advance_tile_fused_scalar, false)
+                            }
                         }
                     }
                 }
@@ -1208,29 +1303,40 @@ impl TurboLife {
                 reserve_expand = reserve_expand.saturating_add(scratch.expand.len());
                 reserve_prune = reserve_prune.saturating_add(scratch.prune.len());
                 reserve_changed = reserve_changed.saturating_add(scratch.changed.len());
-                debug_assert_eq!(scratch.changed.len(), scratch.changed_influence.len());
+                if track_neighbor_influence {
+                    debug_assert_eq!(scratch.changed.len(), scratch.changed_influence.len());
+                }
             }
             self.arena.expand_buf.reserve(reserve_expand);
             self.arena.prune_buf.reserve(reserve_prune);
             self.arena.changed_list.reserve(reserve_changed);
-            self.arena.changed_influence.reserve(reserve_changed);
+            if track_neighbor_influence {
+                self.arena.changed_influence.reserve(reserve_changed);
+            }
 
             for worker_id in 0..worker_count {
                 let scratch = &mut self.worker_scratch[worker_id];
                 self.arena.expand_buf.append(&mut scratch.expand);
                 self.arena.prune_buf.append(&mut scratch.prune);
                 self.arena.changed_list.append(&mut scratch.changed);
-                self.arena
-                    .changed_influence
-                    .append(&mut scratch.changed_influence);
+                if track_neighbor_influence {
+                    self.arena
+                        .changed_influence
+                        .append(&mut scratch.changed_influence);
+                }
             }
         }
         if !self.arena.changed_list.is_empty() {
-            debug_assert_eq!(
-                self.arena.changed_list.len(),
-                self.arena.changed_influence.len()
-            );
-            self.arena.mark_changed_bitmap_unsynced();
+            if track_neighbor_influence {
+                debug_assert_eq!(
+                    self.arena.changed_list.len(),
+                    self.arena.changed_influence.len()
+                );
+                self.arena.mark_changed_bitmap_unsynced();
+            } else {
+                debug_assert!(self.arena.changed_influence.is_empty());
+                self.arena.mark_changed_bitmap_unsynced_uniform_all();
+            }
         }
 
         self.arena.flip_borders();
@@ -1495,14 +1601,19 @@ mod tests {
     #[test]
     fn worker_scratch_reserve_for_chunk_reaches_requested_capacity() {
         let mut scratch = super::WorkerScratch::default();
-        scratch.reserve_for_chunk(8);
+        scratch.reserve_for_chunk(8, true);
 
         let chunk_target = scratch.changed.capacity() + 1;
-        scratch.reserve_for_chunk(chunk_target);
+        scratch.reserve_for_chunk(chunk_target, true);
         assert!(
             scratch.changed.capacity() >= chunk_target,
             "changed capacity {} < chunk target {chunk_target}",
             scratch.changed.capacity()
+        );
+        assert!(
+            scratch.changed_influence.capacity() >= chunk_target,
+            "changed_influence capacity {} < chunk target {chunk_target}",
+            scratch.changed_influence.capacity()
         );
         assert!(
             scratch.prune.capacity() >= chunk_target,
@@ -1512,7 +1623,7 @@ mod tests {
 
         let expand_chunk_target = scratch.expand.capacity().div_ceil(3) + 1;
         let expand_target = expand_chunk_target.saturating_mul(3);
-        scratch.reserve_for_chunk(expand_chunk_target);
+        scratch.reserve_for_chunk(expand_chunk_target, false);
         assert!(
             scratch.expand.capacity() >= expand_target,
             "expand capacity {} < expand target {expand_target}",

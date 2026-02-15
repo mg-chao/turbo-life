@@ -246,16 +246,20 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     arena.active_set.clear();
     arena.changed_scratch.clear();
     arena.changed_influence_scratch.clear();
+    let (had_synced_changed_bits, changed_influence_uniform_all) = arena.begin_changed_rebuild();
     // Swap instead of copy to avoid O(n) memcpy.
     std::mem::swap(&mut arena.changed_scratch, &mut arena.changed_list);
-    std::mem::swap(
-        &mut arena.changed_influence_scratch,
-        &mut arena.changed_influence,
-    );
-    let had_synced_changed_bits = arena.begin_changed_rebuild();
+    if !changed_influence_uniform_all {
+        std::mem::swap(
+            &mut arena.changed_influence_scratch,
+            &mut arena.changed_influence,
+        );
+    }
 
     let changed_count = arena.changed_scratch.len();
-    debug_assert_eq!(changed_count, arena.changed_influence_scratch.len());
+    if !changed_influence_uniform_all {
+        debug_assert_eq!(changed_count, arena.changed_influence_scratch.len());
+    }
     if changed_count == 0 {
         return;
     }
@@ -316,21 +320,15 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         let marks_ptr = arena.active_marks_words.as_mut_ptr();
         let neighbors_ptr = arena.neighbors.as_ptr();
         let changed_ptr = arena.changed_scratch.as_ptr();
-        let influence_ptr = arena.changed_influence_scratch.as_ptr();
-        for changed_i in 0..changed_count {
-            let idx = unsafe { *changed_ptr.add(changed_i) };
-            let influence_mask = unsafe { *influence_ptr.add(changed_i) };
-            let i = idx.index();
+        if changed_influence_uniform_all {
+            for changed_i in 0..changed_count {
+                let idx = unsafe { *changed_ptr.add(changed_i) };
+                let i = idx.index();
 
-            unsafe {
-                let word = i >> 6;
-                *marks_ptr.add(word) |= 1u64 << (i & 63);
-
-                if influence_mask == 0 {
-                    continue;
-                }
-                let nb = *neighbors_ptr.add(i);
-                if influence_mask == u8::MAX {
+                unsafe {
+                    let word = i >> 6;
+                    *marks_ptr.add(word) |= 1u64 << (i & 63);
+                    let nb = *neighbors_ptr.add(i);
                     for &ni_raw in nb.iter() {
                         if ni_raw == NO_NEIGHBOR {
                             continue;
@@ -339,17 +337,44 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                         let ni_word = ni >> 6;
                         *marks_ptr.add(ni_word) |= 1u64 << (ni & 63);
                     }
-                } else {
-                    let dirs = &EXPAND_MASK_TABLE.dirs[influence_mask as usize];
-                    let count = EXPAND_MASK_TABLE.len[influence_mask as usize] as usize;
-                    for &dir in dirs[..count].iter() {
-                        let ni_raw = nb[dir as usize];
-                        if ni_raw == NO_NEIGHBOR {
-                            continue;
+                }
+            }
+        } else {
+            let influence_ptr = arena.changed_influence_scratch.as_ptr();
+            for changed_i in 0..changed_count {
+                let idx = unsafe { *changed_ptr.add(changed_i) };
+                let influence_mask = unsafe { *influence_ptr.add(changed_i) };
+                let i = idx.index();
+
+                unsafe {
+                    let word = i >> 6;
+                    *marks_ptr.add(word) |= 1u64 << (i & 63);
+
+                    if influence_mask == 0 {
+                        continue;
+                    }
+                    let nb = *neighbors_ptr.add(i);
+                    if influence_mask == u8::MAX {
+                        for &ni_raw in nb.iter() {
+                            if ni_raw == NO_NEIGHBOR {
+                                continue;
+                            }
+                            let ni = ni_raw as usize;
+                            let ni_word = ni >> 6;
+                            *marks_ptr.add(ni_word) |= 1u64 << (ni & 63);
                         }
-                        let ni = ni_raw as usize;
-                        let ni_word = ni >> 6;
-                        *marks_ptr.add(ni_word) |= 1u64 << (ni & 63);
+                    } else {
+                        let dirs = &EXPAND_MASK_TABLE.dirs[influence_mask as usize];
+                        let count = EXPAND_MASK_TABLE.len[influence_mask as usize] as usize;
+                        for &dir in dirs[..count].iter() {
+                            let ni_raw = nb[dir as usize];
+                            if ni_raw == NO_NEIGHBOR {
+                                continue;
+                            }
+                            let ni = ni_raw as usize;
+                            let ni_word = ni >> 6;
+                            *marks_ptr.add(ni_word) |= 1u64 << (ni & 63);
+                        }
                     }
                 }
             }
@@ -388,25 +413,18 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     let neighbors_ptr = arena.neighbors.as_ptr();
     let meta_ptr = arena.meta.as_ptr();
     let changed_ptr = arena.changed_scratch.as_ptr();
-    let influence_ptr = arena.changed_influence_scratch.as_ptr();
-    for changed_i in 0..changed_count {
-        let idx = unsafe { *changed_ptr.add(changed_i) };
-        let influence_mask = unsafe { *influence_ptr.add(changed_i) };
-        let i = idx.index();
-        debug_assert!(i < meta_len);
-        debug_assert!(unsafe { (*meta_ptr.add(i)).occupied() });
-        if unsafe { !arena.active_test_and_set_unchecked(i) } {
-            arena.active_set.push(idx);
-        }
-        if influence_mask == 0 {
-            continue;
-        }
+    if changed_influence_uniform_all {
+        for changed_i in 0..changed_count {
+            let idx = unsafe { *changed_ptr.add(changed_i) };
+            let i = idx.index();
+            debug_assert!(i < meta_len);
+            debug_assert!(unsafe { (*meta_ptr.add(i)).occupied() });
+            if unsafe { !arena.active_test_and_set_unchecked(i) } {
+                arena.active_set.push(idx);
+            }
 
-        // SAFETY: i < meta_len guaranteed by arena invariants
-        // (idx came from changed_list).
-        unsafe {
-            let nb = *neighbors_ptr.add(i);
-            if influence_mask == u8::MAX {
+            unsafe {
+                let nb = *neighbors_ptr.add(i);
                 for &ni_raw in nb.iter() {
                     if ni_raw == NO_NEIGHBOR {
                         continue;
@@ -418,19 +436,53 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                         arena.active_set.push(TileIdx(ni_raw));
                     }
                 }
-            } else {
-                let dirs = &EXPAND_MASK_TABLE.dirs[influence_mask as usize];
-                let count = EXPAND_MASK_TABLE.len[influence_mask as usize] as usize;
-                for &dir in dirs[..count].iter() {
-                    let ni_raw = nb[dir as usize];
-                    if ni_raw == NO_NEIGHBOR {
-                        continue;
+            }
+        }
+    } else {
+        let influence_ptr = arena.changed_influence_scratch.as_ptr();
+        for changed_i in 0..changed_count {
+            let idx = unsafe { *changed_ptr.add(changed_i) };
+            let influence_mask = unsafe { *influence_ptr.add(changed_i) };
+            let i = idx.index();
+            debug_assert!(i < meta_len);
+            debug_assert!(unsafe { (*meta_ptr.add(i)).occupied() });
+            if unsafe { !arena.active_test_and_set_unchecked(i) } {
+                arena.active_set.push(idx);
+            }
+            if influence_mask == 0 {
+                continue;
+            }
+
+            // SAFETY: i < meta_len guaranteed by arena invariants
+            // (idx came from changed_list).
+            unsafe {
+                let nb = *neighbors_ptr.add(i);
+                if influence_mask == u8::MAX {
+                    for &ni_raw in nb.iter() {
+                        if ni_raw == NO_NEIGHBOR {
+                            continue;
+                        }
+                        let ni_i = ni_raw as usize;
+                        debug_assert!(ni_i < meta_len);
+                        debug_assert!((*meta_ptr.add(ni_i)).occupied());
+                        if !arena.active_test_and_set_unchecked(ni_i) {
+                            arena.active_set.push(TileIdx(ni_raw));
+                        }
                     }
-                    let ni_i = ni_raw as usize;
-                    debug_assert!(ni_i < meta_len);
-                    debug_assert!((*meta_ptr.add(ni_i)).occupied());
-                    if !arena.active_test_and_set_unchecked(ni_i) {
-                        arena.active_set.push(TileIdx(ni_raw));
+                } else {
+                    let dirs = &EXPAND_MASK_TABLE.dirs[influence_mask as usize];
+                    let count = EXPAND_MASK_TABLE.len[influence_mask as usize] as usize;
+                    for &dir in dirs[..count].iter() {
+                        let ni_raw = nb[dir as usize];
+                        if ni_raw == NO_NEIGHBOR {
+                            continue;
+                        }
+                        let ni_i = ni_raw as usize;
+                        debug_assert!(ni_i < meta_len);
+                        debug_assert!((*meta_ptr.add(ni_i)).occupied());
+                        if !arena.active_test_and_set_unchecked(ni_i) {
+                            arena.active_set.push(TileIdx(ni_raw));
+                        }
                     }
                 }
             }
