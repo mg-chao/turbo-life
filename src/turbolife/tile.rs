@@ -219,8 +219,10 @@ impl TileMeta {
     pub fn update_after_step(&mut self, changed: bool, has_live: bool) {
         self.set_has_live(has_live);
         if changed {
-            self.population = POPULATION_UNKNOWN;
-        } else if !has_live {
+            if self.population != POPULATION_UNKNOWN {
+                self.population = POPULATION_UNKNOWN;
+            }
+        } else if !has_live && self.population != 0 {
             self.population = 0;
         }
     }

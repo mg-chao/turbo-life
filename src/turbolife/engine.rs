@@ -89,6 +89,54 @@ const PRECISE_INFLUENCE_MAX_ACTIVE: usize = 256;
 const ASSUME_CHANGED_NEON_MIN_ACTIVE: usize = 2_048;
 const ASSUME_CHANGED_NEON_MIN_CHURN_PCT: usize = 85;
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn prefetch_l1_read<T>(ptr: *const T) {
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{addr}]",
+            addr = in(reg) ptr,
+            options(nostack, readonly)
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn prefetch_l2_read<T>(ptr: *const T) {
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl2keep, [{addr}]",
+            addr = in(reg) ptr,
+            options(nostack, readonly)
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn prefetch_l1_write<T>(ptr: *const T) {
+    unsafe {
+        std::arch::asm!(
+            "prfm pstl1keep, [{addr}]",
+            addr = in(reg) ptr,
+            options(nostack)
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn prefetch_l2_write<T>(ptr: *const T) {
+    unsafe {
+        std::arch::asm!(
+            "prfm pstl2keep, [{addr}]",
+            addr = in(reg) ptr,
+            options(nostack)
+        );
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn prefetch_neighbor_border_lines(
@@ -135,6 +183,29 @@ unsafe fn prefetch_neighbor_border_lines(
             borders_north_read_ptr.add(nb[Direction::SE.index()] as usize) as *const i8,
             _MM_HINT_T0,
         );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn prefetch_neighbor_border_lines(
+    neighbors_ptr: *const [u32; 8],
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    tile_index: usize,
+) {
+    let nb = unsafe { &*neighbors_ptr.add(tile_index) };
+    unsafe {
+        prefetch_l1_read(borders_south_read_ptr.add(nb[Direction::North.index()] as usize));
+        prefetch_l1_read(borders_north_read_ptr.add(nb[Direction::South.index()] as usize));
+        prefetch_l1_read(borders_east_read_ptr.add(nb[Direction::West.index()] as usize));
+        prefetch_l1_read(borders_west_read_ptr.add(nb[Direction::East.index()] as usize));
+        prefetch_l1_read(borders_south_read_ptr.add(nb[Direction::NW.index()] as usize));
+        prefetch_l1_read(borders_south_read_ptr.add(nb[Direction::NE.index()] as usize));
+        prefetch_l1_read(borders_north_read_ptr.add(nb[Direction::SW.index()] as usize));
+        prefetch_l1_read(borders_north_read_ptr.add(nb[Direction::SE.index()] as usize));
     }
 }
 
@@ -878,6 +949,8 @@ impl TurboLife {
             let cache_ptr = &mut self.tile_cache as *mut TileCache;
             #[cfg(target_arch = "x86_64")]
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
+            #[cfg(target_arch = "aarch64")]
+            let prefetch_neighbor_borders = false;
 
             macro_rules! serial_loop_cached {
                 ($advance:path, $track:expr) => {{
@@ -902,6 +975,33 @@ impl TurboLife {
                                 _mm_prefetch(current_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(next_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(neighbors_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
+                                if prefetch_neighbor_borders {
+                                    prefetch_neighbor_border_lines(
+                                        neighbors_ptr,
+                                        borders_north_read_ptr,
+                                        borders_south_read_ptr,
+                                        borders_west_read_ptr,
+                                        borders_east_read_ptr,
+                                        near_ii,
+                                    );
+                                }
+                            }
+                        }
+
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe {
+                            // Prefetch tile i+2 cell buffers into L2.
+                            if i + 2 < active_len {
+                                let far_ii = (*active_ptr.add(i + 2)).index();
+                                prefetch_l2_read(current_ptr.add(far_ii));
+                                prefetch_l2_write(next_ptr.add(far_ii));
+                            }
+                            // Prefetch tile i+1 into L1, plus neighbor metadata and borders.
+                            if i + 1 < active_len {
+                                let near_ii = (*active_ptr.add(i + 1)).index();
+                                prefetch_l1_read(current_ptr.add(near_ii));
+                                prefetch_l1_write(next_ptr.add(near_ii));
+                                prefetch_l1_read(neighbors_ptr.add(near_ii));
                                 if prefetch_neighbor_borders {
                                     prefetch_neighbor_border_lines(
                                         neighbors_ptr,
@@ -984,6 +1084,33 @@ impl TurboLife {
                                 _mm_prefetch(current_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(next_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(neighbors_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
+                                if prefetch_neighbor_borders {
+                                    prefetch_neighbor_border_lines(
+                                        neighbors_ptr,
+                                        borders_north_read_ptr,
+                                        borders_south_read_ptr,
+                                        borders_west_read_ptr,
+                                        borders_east_read_ptr,
+                                        near_ii,
+                                    );
+                                }
+                            }
+                        }
+
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe {
+                            // Prefetch tile i+2 cell buffers into L2.
+                            if i + 2 < active_len {
+                                let far_ii = (*active_ptr.add(i + 2)).index();
+                                prefetch_l2_read(current_ptr.add(far_ii));
+                                prefetch_l2_write(next_ptr.add(far_ii));
+                            }
+                            // Prefetch tile i+1 into L1, plus neighbor metadata and borders.
+                            if i + 1 < active_len {
+                                let near_ii = (*active_ptr.add(i + 1)).index();
+                                prefetch_l1_read(current_ptr.add(near_ii));
+                                prefetch_l1_write(next_ptr.add(near_ii));
+                                prefetch_l1_read(neighbors_ptr.add(near_ii));
                                 if prefetch_neighbor_borders {
                                     prefetch_neighbor_border_lines(
                                         neighbors_ptr,
@@ -1163,6 +1290,8 @@ impl TurboLife {
             let scratch_ptr = SendPtr::new(self.worker_scratch.as_mut_ptr());
             #[cfg(target_arch = "x86_64")]
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
+            #[cfg(target_arch = "aarch64")]
+            let prefetch_neighbor_borders = false;
 
             macro_rules! prefetch_for_work_item {
                 ($i:expr, $end:expr) => {
@@ -1183,6 +1312,31 @@ impl TurboLife {
                                 neighbors_ptr.get().add(near_ii) as *const i8,
                                 _MM_HINT_T0,
                             );
+                            if prefetch_neighbor_borders {
+                                prefetch_neighbor_border_lines(
+                                    neighbors_ptr.get(),
+                                    borders_north_read_ptr.get(),
+                                    borders_south_read_ptr.get(),
+                                    borders_west_read_ptr.get(),
+                                    borders_east_read_ptr.get(),
+                                    near_ii,
+                                );
+                            }
+                        }
+                    }
+
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        if $i + 2 < $end {
+                            let far_ii = (*active_ptr.get().add($i + 2)).index();
+                            prefetch_l2_read(current_ptr.get().add(far_ii));
+                            prefetch_l2_write(next_ptr.get().add(far_ii));
+                        }
+                        if $i + 1 < $end {
+                            let near_ii = (*active_ptr.get().add($i + 1)).index();
+                            prefetch_l1_read(current_ptr.get().add(near_ii));
+                            prefetch_l1_write(next_ptr.get().add(near_ii));
+                            prefetch_l1_read(neighbors_ptr.get().add(near_ii));
                             if prefetch_neighbor_borders {
                                 prefetch_neighbor_border_lines(
                                     neighbors_ptr.get(),
