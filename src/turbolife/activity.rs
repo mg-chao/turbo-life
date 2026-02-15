@@ -61,7 +61,6 @@ fn should_use_bitmap_active_rebuild(occupied_count: usize, changed_count: usize)
 }
 
 #[inline(always)]
-#[cfg(test)]
 fn active_set_is_sorted(active_set: &[TileIdx]) -> bool {
     active_set.windows(2).all(|pair| pair[0].0 <= pair[1].0)
 }
@@ -467,10 +466,14 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     let active_len = arena.active_set.len();
     let mut active_set_sorted = false;
     if active_len <= ACTIVE_SORT_STD_MAX {
-        arena.active_set.sort_unstable_by_key(|idx| idx.0);
+        if !active_set_is_sorted(&arena.active_set) {
+            arena.active_set.sort_unstable_by_key(|idx| idx.0);
+        }
         active_set_sorted = true;
     } else if active_len >= ACTIVE_SORT_RADIX_MIN {
-        radix_sort_active_set(arena);
+        if !active_set_is_sorted(&arena.active_set) {
+            radix_sort_active_set(arena);
+        }
         active_set_sorted = true;
     }
 
