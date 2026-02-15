@@ -358,9 +358,17 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     if dense_rebuild {
         arena.active_set.reserve(arena.occupied_count);
         if arena.free_list.is_empty() && arena.occupied_count + 1 == arena.meta.len() {
-            for i in 1..arena.meta.len() {
-                if arena.meta[i].occupied() {
-                    arena.active_set.push(TileIdx(i as u32));
+            let count = arena.occupied_count;
+            debug_assert_eq!(arena.active_set.len(), 0);
+            debug_assert!(
+                arena.meta[1..].iter().all(|meta| meta.occupied()),
+                "dense contiguous rebuild requires occupied metadata for all slots"
+            );
+            unsafe {
+                let ptr = arena.active_set.as_mut_ptr();
+                arena.active_set.set_len(count);
+                for i in 0..count {
+                    ptr.add(i).write(TileIdx((i + 1) as u32));
                 }
             }
         } else {
@@ -693,6 +701,24 @@ mod tests {
 
         arena.mark_changed(second);
         assert_eq!(arena.changed_list, vec![second]);
+    }
+
+    #[test]
+    fn dense_rebuild_contiguous_slots_stay_index_ordered() {
+        let mut arena = TileArena::new();
+        let tile_count = 4_096usize;
+
+        for x in 0..tile_count {
+            let idx = arena.allocate((x as i64, 0));
+            arena.mark_changed(idx);
+        }
+
+        rebuild_active_set(&mut arena);
+
+        assert_eq!(arena.active_set.len(), tile_count);
+        for (i, idx) in arena.active_set.iter().enumerate() {
+            assert_eq!(idx.0, (i + 1) as u32);
+        }
     }
 
     #[test]
