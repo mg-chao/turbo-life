@@ -64,8 +64,16 @@ const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
 const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
 const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 32_768;
-// Fewer, larger dynamic chunks reduce scheduler atomics and scratch merge churn.
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 2;
+// Dynamic scheduler chunking tiers:
+// - small frontiers: fewer chunks to minimize atomic overhead
+// - medium frontiers: more chunks to improve load balance
+// - very large frontiers: fewer chunks again to reduce scheduler pressure
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_BASE: usize = 2;
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_MID: usize = 4;
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_HIGH: usize = 2;
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_MID_ACTIVE: usize = 2_048;
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_HIGH_ACTIVE: usize = 16_384;
+const PARALLEL_DYNAMIC_MID_CHURN_PCT: usize = 35;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 16;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 512;
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
@@ -338,10 +346,31 @@ fn tuned_parallel_threads(active_len: usize, thread_count: usize) -> usize {
 }
 
 #[inline]
-fn dynamic_parallel_chunk_size(active_len: usize, worker_count: usize) -> usize {
+fn dynamic_target_chunks_per_worker(active_len: usize, changed_len: usize) -> usize {
+    if active_len < PARALLEL_DYNAMIC_TARGET_CHUNKS_MID_ACTIVE {
+        PARALLEL_DYNAMIC_TARGET_CHUNKS_BASE
+    } else if active_len < PARALLEL_DYNAMIC_TARGET_CHUNKS_HIGH_ACTIVE {
+        if changed_len.saturating_mul(100)
+            < active_len.saturating_mul(PARALLEL_DYNAMIC_MID_CHURN_PCT)
+        {
+            PARALLEL_DYNAMIC_TARGET_CHUNKS_BASE
+        } else {
+            PARALLEL_DYNAMIC_TARGET_CHUNKS_MID
+        }
+    } else {
+        PARALLEL_DYNAMIC_TARGET_CHUNKS_HIGH
+    }
+}
+
+#[inline]
+fn dynamic_parallel_chunk_size(
+    active_len: usize,
+    changed_len: usize,
+    worker_count: usize,
+) -> usize {
     let workers = worker_count.max(1);
     let target_chunks = workers
-        .saturating_mul(PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER)
+        .saturating_mul(dynamic_target_chunks_per_worker(active_len, changed_len))
         .max(workers);
     let size = active_len.div_ceil(target_chunks);
     size.clamp(PARALLEL_DYNAMIC_CHUNK_MIN, PARALLEL_DYNAMIC_CHUNK_MAX)
@@ -742,6 +771,7 @@ impl TurboLife {
         }
 
         let active_len = self.arena.active_set.len();
+        let changed_len = self.arena.changed_scratch.len();
         self.arena.expand_buf.clear();
         self.arena.prune_buf.clear();
         let use_serial_cache = active_len <= SERIAL_CACHE_MAX_ACTIVE;
@@ -1135,7 +1165,7 @@ impl TurboLife {
                     }
                 }
             } else {
-                let chunk_size = dynamic_parallel_chunk_size(active_len, worker_count);
+                let chunk_size = dynamic_parallel_chunk_size(active_len, changed_len, worker_count);
                 let cursor = AtomicUsize::new(0);
 
                 macro_rules! parallel_kernel_lockfree {
@@ -1336,7 +1366,8 @@ mod tests {
 
     use super::{
         KernelBackend, PARALLEL_KERNEL_MIN_ACTIVE, TILE_SIZE_I64, TurboLife, TurboLifeConfig,
-        auto_pool_thread_count_for_physical, memory_parallel_cap,
+        auto_pool_thread_count_for_physical, dynamic_parallel_chunk_size,
+        dynamic_target_chunks_per_worker, memory_parallel_cap,
     };
 
     const PARALLEL_TEST_TILE_GRID: i64 = 12;
@@ -1432,6 +1463,28 @@ mod tests {
         assert_eq!(auto_pool_thread_count_for_physical(12), 6);
         assert_eq!(auto_pool_thread_count_for_physical(16), 8);
         assert_eq!(auto_pool_thread_count_for_physical(24), 12);
+    }
+
+    #[test]
+    fn dynamic_chunk_targets_switch_at_expected_frontier_sizes() {
+        assert_eq!(dynamic_target_chunks_per_worker(1, 1), 2);
+        assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 2);
+        assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 2);
+        assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 4);
+        assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 4);
+        assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 2);
+    }
+
+    #[test]
+    fn dynamic_chunk_size_obeys_bounds_and_tiers() {
+        let small = dynamic_parallel_chunk_size(800, 600, 4);
+        let medium_balanced = dynamic_parallel_chunk_size(4_096, 1_200, 4);
+        let medium_high = dynamic_parallel_chunk_size(4_096, 3_000, 4);
+        let large = dynamic_parallel_chunk_size(65_536, 50_000, 4);
+        assert_eq!(small, 100);
+        assert_eq!(medium_balanced, 512);
+        assert_eq!(medium_high, 256);
+        assert_eq!(large, 512);
     }
 
     #[test]
