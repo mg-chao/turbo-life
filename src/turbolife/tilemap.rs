@@ -221,9 +221,7 @@ impl TileMap {
             let ins_dist = pos.wrapping_sub(ins_home) & mask;
 
             if ins_dist > existing_dist {
-                let displaced = *slot;
-                *slot = ins;
-                ins = displaced;
+                std::mem::swap(&mut *slot, &mut ins);
                 ins_home = existing_home;
             }
 
@@ -255,9 +253,7 @@ impl TileMap {
             let ins_dist = pos.wrapping_sub(ins_home) & mask;
 
             if ins_dist > existing_dist {
-                let displaced = *slot;
-                *slot = ins;
-                ins = displaced;
+                std::mem::swap(&mut *slot, &mut ins);
                 ins_home = existing_home;
             }
 

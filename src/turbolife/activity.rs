@@ -161,8 +161,11 @@ fn prune_candidate_invalid(meta: super::tile::TileMeta) -> bool {
     !meta.occupied() || meta.has_live()
 }
 
+/// # Safety
+/// Caller must ensure `expand` has enough spare capacity for all candidates in
+/// `missing_mask & live_mask` before calling.
 #[inline(always)]
-pub(crate) fn append_expand_candidates(
+pub(crate) unsafe fn append_expand_candidates_unchecked(
     expand: &mut Vec<u32>,
     idx: TileIdx,
     missing_mask: u8,
@@ -172,16 +175,18 @@ pub(crate) fn append_expand_candidates(
     if expand_mask == 0 {
         return;
     }
-    append_expand_candidates_slow(expand, idx, expand_mask);
-}
-
-#[cold]
-#[inline(never)]
-fn append_expand_candidates_slow(expand: &mut Vec<u32>, idx: TileIdx, expand_mask: usize) {
     let dirs = &EXPAND_MASK_TABLE.dirs[expand_mask];
     let count = EXPAND_MASK_TABLE.len[expand_mask] as usize;
-    for &dir in dirs[..count].iter() {
-        expand.push(pack_expand_candidate(idx, dir as usize));
+
+    let len = expand.len();
+    debug_assert!(len.saturating_add(count) <= expand.capacity());
+    unsafe {
+        let mut write_ptr = expand.as_mut_ptr().add(len);
+        for &dir in dirs[..count].iter() {
+            write_ptr.write(pack_expand_candidate(idx, dir as usize));
+            write_ptr = write_ptr.add(1);
+        }
+        expand.set_len(len + count);
     }
 }
 

@@ -21,6 +21,12 @@ pub struct QuickLife {
     minlow32: i32,
 }
 
+impl Default for QuickLife {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl QuickLife {
     pub fn new() -> Self {
         let arenas = Arenas::new();
@@ -126,8 +132,8 @@ impl QuickLife {
             lev -= 1;
         }
 
-        let x = (x & 31) as i32;
-        let y = (y & 31) as i32;
+        let x = x & 31;
+        let y = y & 31;
         let tile_id = TileId(node);
         let brick_index = ((y >> 3) & 0x3) as usize;
         let existing_brick = self.arenas.tiles[tile_id.0].b[brick_index];
@@ -210,8 +216,8 @@ impl QuickLife {
             lev -= 1;
         }
 
-        let x = (x & 31) as i32;
-        let y = (y & 31) as i32;
+        let x = x & 31;
+        let y = y & 31;
         let tile = &self.arenas.tiles[node];
         let brick_index = ((y >> 3) & 0x3) as usize;
         if tile.b[brick_index] == self.arenas.empty_brick {
@@ -438,6 +444,7 @@ impl QuickLife {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn visit_node<F>(
         &self,
         node: NodeId,
@@ -498,8 +505,8 @@ impl QuickLife {
                 for bit_pos in 0..32 {
                     let mask = 1u32 << (31 - bit_pos);
                     if data & mask != 0 {
-                        let row = (bit_pos / 4) as i32;
-                        let col = (bit_pos % 4) as i32;
+                        let row = bit_pos / 4;
+                        let col = bit_pos % 4;
                         let ix = tile_x + (slice as i32) * 4 + col;
                         let iy = base_y + row;
                         let (ux, uy) = if odd { (ix + 1, -(iy + 1)) } else { (ix, -iy) };

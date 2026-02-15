@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
-use super::activity::{append_expand_candidates, finalize_prune_and_expand, rebuild_active_set};
+use super::activity::{
+    append_expand_candidates_unchecked, finalize_prune_and_expand, rebuild_active_set,
+};
 use super::arena::TileArena;
 #[cfg(target_arch = "x86_64")]
 use super::kernel::advance_core;
@@ -239,9 +241,22 @@ struct WorkerScratch {
 
 impl WorkerScratch {
     #[inline]
-    fn reserve_capacity<T>(buf: &mut Vec<T>, target: usize) {
+    fn reserve_total_capacity<T>(buf: &mut Vec<T>, target: usize) {
         if buf.capacity() < target {
             buf.reserve(target.saturating_sub(buf.len()));
+        }
+    }
+
+    #[inline(always)]
+    fn reserve_additional_capacity<T>(buf: &mut Vec<T>, additional: usize) {
+        if additional == 0 {
+            return;
+        }
+        let spare = buf.capacity().saturating_sub(buf.len());
+        if spare < additional {
+            // `Vec::reserve` takes an amount *in addition to the current length*.
+            // Requesting `additional` ensures `capacity >= len + additional`.
+            buf.reserve(additional);
         }
     }
 
@@ -255,13 +270,24 @@ impl WorkerScratch {
 
     #[inline]
     fn reserve_for_chunk(&mut self, chunk_len: usize, track_neighbor_influence: bool) {
-        Self::reserve_capacity(&mut self.changed, chunk_len);
+        Self::reserve_total_capacity(&mut self.changed, chunk_len);
         if track_neighbor_influence {
-            Self::reserve_capacity(&mut self.changed_influence, chunk_len);
+            Self::reserve_total_capacity(&mut self.changed_influence, chunk_len);
         }
-        Self::reserve_capacity(&mut self.prune, chunk_len);
-        let expand_target = chunk_len.saturating_mul(3);
-        Self::reserve_capacity(&mut self.expand, expand_target);
+        Self::reserve_total_capacity(&mut self.prune, chunk_len);
+        let expand_target = chunk_len.saturating_mul(8);
+        Self::reserve_total_capacity(&mut self.expand, expand_target);
+    }
+
+    #[inline(always)]
+    fn reserve_for_additional_work(&mut self, work_items: usize, track_neighbor_influence: bool) {
+        Self::reserve_additional_capacity(&mut self.changed, work_items);
+        if track_neighbor_influence {
+            Self::reserve_additional_capacity(&mut self.changed_influence, work_items);
+        }
+        Self::reserve_additional_capacity(&mut self.prune, work_items);
+        let expand_additional = work_items.saturating_mul(8);
+        Self::reserve_additional_capacity(&mut self.expand, expand_additional);
     }
 }
 
@@ -489,6 +515,29 @@ fn dynamic_parallel_chunk_size(
         .max(workers);
     let size = active_len.div_ceil(target_chunks);
     size.clamp(PARALLEL_DYNAMIC_CHUNK_MIN, PARALLEL_DYNAMIC_CHUNK_MAX)
+}
+
+#[inline(always)]
+fn reserve_additional_capacity<T>(buf: &mut Vec<T>, additional: usize) {
+    if additional == 0 {
+        return;
+    }
+    let spare = buf.capacity().saturating_sub(buf.len());
+    if spare < additional {
+        // `Vec::reserve` takes an amount *in addition to the current length*.
+        // Requesting `additional` ensures `capacity >= len + additional`.
+        buf.reserve(additional);
+    }
+}
+
+#[inline(always)]
+unsafe fn vec_push_unchecked<T>(buf: &mut Vec<T>, value: T) {
+    debug_assert!(buf.len() < buf.capacity());
+    let len = buf.len();
+    unsafe {
+        std::ptr::write(buf.as_mut_ptr().add(len), value);
+        buf.set_len(len + 1);
+    }
 }
 
 /// Resolve the thread count from a config, falling back to auto-detect.
@@ -992,6 +1041,13 @@ impl TurboLife {
         debug_assert_eq!(self.arena.meta.len(), self.arena.neighbors.len());
 
         if !run_parallel {
+            reserve_additional_capacity(&mut self.arena.changed_list, active_len);
+            if track_neighbor_influence {
+                reserve_additional_capacity(&mut self.arena.changed_influence, active_len);
+            }
+            reserve_additional_capacity(&mut self.arena.prune_buf, active_len);
+            reserve_additional_capacity(&mut self.arena.expand_buf, active_len.saturating_mul(8));
+
             // Serial path: cached kernel with multi-level prefetching.
             let neighbors_ptr = self.arena.neighbors.as_ptr();
             let borders_north_read_ptr = borders_read.north_ptr();
@@ -1101,24 +1157,33 @@ impl TurboLife {
                         };
 
                         if result.changed {
-                            self.arena.changed_list.push(idx);
+                            unsafe {
+                                vec_push_unchecked(&mut self.arena.changed_list, idx);
+                            }
                             if $track {
-                                self.arena
-                                    .changed_influence
-                                    .push(result.neighbor_influence_mask);
+                                unsafe {
+                                    vec_push_unchecked(
+                                        &mut self.arena.changed_influence,
+                                        result.neighbor_influence_mask,
+                                    );
+                                }
                             }
                         } else if !result.has_live {
-                            self.arena.prune_buf.push(idx);
+                            unsafe {
+                                vec_push_unchecked(&mut self.arena.prune_buf, idx);
+                            }
                         }
 
                         let missing = result.missing_mask;
                         if missing != 0 {
-                            append_expand_candidates(
-                                &mut self.arena.expand_buf,
-                                idx,
-                                missing,
-                                result.live_mask,
-                            );
+                            unsafe {
+                                append_expand_candidates_unchecked(
+                                    &mut self.arena.expand_buf,
+                                    idx,
+                                    missing,
+                                    result.live_mask,
+                                );
+                            }
                         }
                     }
                 }};
@@ -1210,24 +1275,33 @@ impl TurboLife {
                         };
 
                         if result.changed {
-                            self.arena.changed_list.push(idx);
+                            unsafe {
+                                vec_push_unchecked(&mut self.arena.changed_list, idx);
+                            }
                             if $track {
-                                self.arena
-                                    .changed_influence
-                                    .push(result.neighbor_influence_mask);
+                                unsafe {
+                                    vec_push_unchecked(
+                                        &mut self.arena.changed_influence,
+                                        result.neighbor_influence_mask,
+                                    );
+                                }
                             }
                         } else if !result.has_live {
-                            self.arena.prune_buf.push(idx);
+                            unsafe {
+                                vec_push_unchecked(&mut self.arena.prune_buf, idx);
+                            }
                         }
 
                         let missing = result.missing_mask;
                         if missing != 0 {
-                            append_expand_candidates(
-                                &mut self.arena.expand_buf,
-                                idx,
-                                missing,
-                                result.live_mask,
-                            );
+                            unsafe {
+                                append_expand_candidates_unchecked(
+                                    &mut self.arena.expand_buf,
+                                    idx,
+                                    missing,
+                                    result.live_mask,
+                                );
+                            }
                         }
                     }
                 }};
@@ -1452,24 +1526,33 @@ impl TurboLife {
                     };
 
                     if result.changed {
-                        ($scratch).changed.push(idx);
+                        unsafe {
+                            vec_push_unchecked(&mut ($scratch).changed, idx);
+                        }
                         if $track {
-                            ($scratch)
-                                .changed_influence
-                                .push(result.neighbor_influence_mask);
+                            unsafe {
+                                vec_push_unchecked(
+                                    &mut ($scratch).changed_influence,
+                                    result.neighbor_influence_mask,
+                                );
+                            }
                         }
                     } else if !result.has_live {
-                        ($scratch).prune.push(idx);
+                        unsafe {
+                            vec_push_unchecked(&mut ($scratch).prune, idx);
+                        }
                     }
 
                     let missing = result.missing_mask;
                     if missing != 0 {
-                        append_expand_candidates(
-                            &mut ($scratch).expand,
-                            idx,
-                            missing,
-                            result.live_mask,
-                        );
+                        unsafe {
+                            append_expand_candidates_unchecked(
+                                &mut ($scratch).expand,
+                                idx,
+                                missing,
+                                result.live_mask,
+                            );
+                        }
                     }
                 }};
             }
@@ -1483,6 +1566,7 @@ impl TurboLife {
                         }
                         let end = (start + $chunk_size).min(active_len);
                         let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
+                        scratch.reserve_for_additional_work(end - start, $track);
                         for i in start..end {
                             process_work_item!($advance, scratch, i, end, $track);
                         }
@@ -1608,6 +1692,7 @@ impl TurboLife {
                                     break;
                                 }
                                 let end = (start + chunk_size).min(active_len);
+                                scratch.reserve_for_additional_work(end - start, $track);
                                 for i in start..end {
                                     process_work_item!($advance, scratch, i, end, $track);
                                 }
@@ -1681,34 +1766,68 @@ impl TurboLife {
                 }
             }
 
-            let mut reserve_expand = 0usize;
-            let mut reserve_prune = 0usize;
-            let mut reserve_changed = 0usize;
-            for scratch in self.worker_scratch.iter().take(worker_count) {
-                reserve_expand = reserve_expand.saturating_add(scratch.expand.len());
-                reserve_prune = reserve_prune.saturating_add(scratch.prune.len());
-                reserve_changed = reserve_changed.saturating_add(scratch.changed.len());
-                if track_neighbor_influence {
-                    debug_assert_eq!(scratch.changed.len(), scratch.changed_influence.len());
+            let mut total_expand = 0usize;
+            let mut total_prune = 0usize;
+            let mut total_changed = 0usize;
+            let mut max_expand = (0usize, 0usize);
+            let mut max_prune = (0usize, 0usize);
+            let mut max_changed = (0usize, 0usize);
+            for worker_id in 0..worker_count {
+                let scratch = &self.worker_scratch[worker_id];
+                let expand_len = scratch.expand.len();
+                let prune_len = scratch.prune.len();
+                let changed_len = scratch.changed.len();
+
+                total_expand = total_expand.saturating_add(expand_len);
+                total_prune = total_prune.saturating_add(prune_len);
+                total_changed = total_changed.saturating_add(changed_len);
+
+                if expand_len > max_expand.0 {
+                    max_expand = (expand_len, worker_id);
                 }
-            }
-            self.arena.expand_buf.reserve(reserve_expand);
-            self.arena.prune_buf.reserve(reserve_prune);
-            self.arena.changed_list.reserve(reserve_changed);
-            if track_neighbor_influence {
-                self.arena.changed_influence.reserve(reserve_changed);
+                if prune_len > max_prune.0 {
+                    max_prune = (prune_len, worker_id);
+                }
+                if changed_len > max_changed.0 {
+                    max_changed = (changed_len, worker_id);
+                }
+
+                if track_neighbor_influence {
+                    debug_assert_eq!(changed_len, scratch.changed_influence.len());
+                }
             }
 
-            for worker_id in 0..worker_count {
-                let scratch = &mut self.worker_scratch[worker_id];
-                self.arena.expand_buf.append(&mut scratch.expand);
-                self.arena.prune_buf.append(&mut scratch.prune);
-                self.arena.changed_list.append(&mut scratch.changed);
-                if track_neighbor_influence {
-                    self.arena
-                        .changed_influence
-                        .append(&mut scratch.changed_influence);
-                }
+            macro_rules! merge_worker_vectors {
+                ($dst:expr, $field:ident, $total:expr, $max_pair:expr) => {{
+                    if $total == 0 {
+                        $dst.clear();
+                    } else {
+                        let base_worker = $max_pair.1;
+                        std::mem::swap(&mut $dst, &mut self.worker_scratch[base_worker].$field);
+                        let additional = $total.saturating_sub($dst.len());
+                        reserve_additional_capacity(&mut $dst, additional);
+                        for worker_id in 0..worker_count {
+                            if worker_id == base_worker {
+                                continue;
+                            }
+                            $dst.append(&mut self.worker_scratch[worker_id].$field);
+                        }
+                    }
+                }};
+            }
+
+            merge_worker_vectors!(self.arena.expand_buf, expand, total_expand, max_expand);
+            merge_worker_vectors!(self.arena.prune_buf, prune, total_prune, max_prune);
+            merge_worker_vectors!(self.arena.changed_list, changed, total_changed, max_changed);
+            if track_neighbor_influence {
+                merge_worker_vectors!(
+                    self.arena.changed_influence,
+                    changed_influence,
+                    total_changed,
+                    max_changed
+                );
+            } else {
+                self.arena.changed_influence.clear();
             }
         }
         if !self.arena.changed_list.is_empty() {
