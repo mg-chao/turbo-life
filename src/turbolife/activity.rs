@@ -502,9 +502,11 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
 /// Apply expansion and pruning from candidates collected during kernel execution.
 pub fn finalize_prune_and_expand(arena: &mut TileArena) {
     if !arena.expand_buf.is_empty() {
-        arena.reserve_additional_tiles(arena.expand_buf.len());
-        for i in 0..arena.expand_buf.len() {
-            let candidate = arena.expand_buf[i];
+        let expand_len = arena.expand_buf.len();
+        arena.reserve_additional_tiles(expand_len);
+        let expand_ptr = arena.expand_buf.as_ptr();
+        for i in 0..expand_len {
+            let candidate = unsafe { *expand_ptr.add(i) };
             let src_i = (candidate >> 3) as usize;
             let dir = (candidate & 0b111) as usize;
             debug_assert!(arena.meta[src_i].occupied());
@@ -568,7 +570,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                             // SAFETY: pointers are valid for the entire prune phase.
                             let should_prune = unsafe {
                                 let meta = *mp.add(ii);
-                                if prune_candidate_invalid(meta) {
+                                if cfg!(debug_assertions) && prune_candidate_invalid(meta) {
                                     false
                                 } else {
                                     let missing_mask = meta.missing_mask;
@@ -597,7 +599,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                         // SAFETY: pointers are valid for the entire prune phase.
                         let should_prune = unsafe {
                             let meta = *mp.add(ii);
-                            if prune_candidate_invalid(meta) {
+                            if cfg!(debug_assertions) && prune_candidate_invalid(meta) {
                                 false
                             } else {
                                 let missing_mask = meta.missing_mask;
@@ -610,16 +612,21 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                 });
         }
     } else {
+        let prune_ptr = arena.prune_buf.as_ptr();
+        let meta_ptr = arena.meta.as_ptr();
+        let neighbors_ptr = arena.neighbors.as_ptr();
+
         for i in 0..prune_len {
-            let idx = arena.prune_buf[i];
+            let idx = unsafe { *prune_ptr.add(i) };
             let ii = idx.index();
-            let meta = arena.meta[ii];
-            if prune_candidate_invalid(meta) {
+            let meta = unsafe { *meta_ptr.add(ii) };
+            if cfg!(debug_assertions) && prune_candidate_invalid(meta) {
                 continue;
             }
-            let should_prune = meta.missing_mask == MISSING_ALL_NEIGHBORS
+            let missing_mask = meta.missing_mask;
+            let should_prune = missing_mask == MISSING_ALL_NEIGHBORS
                 || unsafe {
-                    ghost_is_empty_from_live_masks_ptr(live_masks_ptr, &arena.neighbors[ii])
+                    ghost_is_empty_from_live_masks_ptr(live_masks_ptr, &*neighbors_ptr.add(ii))
                 };
             if should_prune {
                 arena.release(idx);
