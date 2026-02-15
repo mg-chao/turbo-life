@@ -251,10 +251,18 @@ pub fn advance_core_scalar(
     process_row!(0, current[1], current[0], ghost.south);
     west_window >>= 1;
     east_window >>= 1;
-    for row in 1..(TILE_SIZE - 1) {
+
+    let mut row = 1usize;
+    while row < TILE_SIZE - 2 {
         process_row!(row, current[row + 1], current[row], current[row - 1]);
         west_window >>= 1;
         east_window >>= 1;
+
+        let row2 = row + 1;
+        process_row!(row2, current[row2 + 1], current[row2], current[row2 - 1]);
+        west_window >>= 1;
+        east_window >>= 1;
+        row += 2;
     }
     process_row!(
         TILE_SIZE - 1,
