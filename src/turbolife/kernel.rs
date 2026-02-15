@@ -706,9 +706,6 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool>(
     let mut west_below_bits = (ghost.west << 1) | (ghost.sw as u64);
     let mut east_below_bits = (ghost.east << 1) | (ghost.se as u64);
 
-    let mut border_north = 0u64;
-    let mut border_south = 0u64;
-
     macro_rules! process_pair {
         ($row_base:expr, $row_above:expr, $row_self:expr, $row_below:expr) => {{
             let ghost_w_self = west_self_bits & 0b11;
@@ -765,20 +762,14 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool>(
             border_west |= (row1 & 1) << ($row_base + 1);
             border_east |= ((row0 >> 63) & 1) << $row_base;
             border_east |= ((row1 >> 63) & 1) << ($row_base + 1);
-
-            if $row_base == 0 {
-                border_south = row0;
-            }
-            if $row_base == TILE_SIZE - 2 {
-                border_north = row1;
-            }
+            (row0, row1)
         }};
     }
 
     let row_self_0 = unsafe { vld1q_u64(current_ptr) };
     let row_above_0 = unsafe { vld1q_u64(current_ptr.add(1)) };
     let row_below_0 = unsafe { neon_set_u64x2_lane_order(ghost.south, current[0]) };
-    process_pair!(0, row_above_0, row_self_0, row_below_0);
+    let (border_south, _) = process_pair!(0, row_above_0, row_self_0, row_below_0);
     west_self_bits >>= 2;
     east_self_bits >>= 2;
     west_above_bits >>= 2;
@@ -786,12 +777,14 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool>(
     west_below_bits >>= 2;
     east_below_bits >>= 2;
 
+    let mut prev_above = row_above_0;
     let mut row_base = 2usize;
     while row_base < TILE_SIZE - 2 {
+        let row_below = prev_above;
         let row_self = unsafe { vld1q_u64(current_ptr.add(row_base)) };
         let row_above = unsafe { vld1q_u64(current_ptr.add(row_base + 1)) };
-        let row_below = unsafe { vld1q_u64(current_ptr.add(row_base - 1)) };
-        process_pair!(row_base, row_above, row_self, row_below);
+        let _ = process_pair!(row_base, row_above, row_self, row_below);
+        prev_above = row_above;
         west_self_bits >>= 2;
         east_self_bits >>= 2;
         west_above_bits >>= 2;
@@ -804,8 +797,8 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool>(
     let last_base = TILE_SIZE - 2;
     let row_self_last = unsafe { vld1q_u64(current_ptr.add(last_base)) };
     let row_above_last = unsafe { neon_set_u64x2_lane_order(current[63], ghost.north) };
-    let row_below_last = unsafe { vld1q_u64(current_ptr.add(last_base - 1)) };
-    process_pair!(last_base, row_above_last, row_self_last, row_below_last);
+    let row_below_last = prev_above;
+    let (_, border_north) = process_pair!(last_base, row_above_last, row_self_last, row_below_last);
 
     let border = BorderData::from_edges(border_north, border_south, border_west, border_east);
     let changed = if TRACK_DIFF {
