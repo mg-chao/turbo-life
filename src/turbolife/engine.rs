@@ -96,11 +96,14 @@ const PREFETCH_TILE_DATA_AARCH64: bool = false;
 const PRECISE_INFLUENCE_MAX_ACTIVE: usize = 256;
 #[cfg(target_arch = "aarch64")]
 const ASSUME_CHANGED_NEON_MIN_ACTIVE: usize = 2_048;
-// `assume_changed` reports every tile as changed; once enabled it self-inflates
-// churn metrics. Keep this gate conservative so we only enter it when churn is
-// already very high.
+// `assume_changed` reports every live tile as changed; once enabled it can
+// self-inflate churn metrics. Keep this gate conservative so we only enter it
+// when churn is already very high.
 #[cfg(target_arch = "aarch64")]
 const ASSUME_CHANGED_NEON_MIN_CHURN_PCT: usize = 85;
+#[cfg(target_arch = "aarch64")]
+const _: [(); 1] = [(); ((ASSUME_CHANGED_NEON_MIN_CHURN_PCT > 0
+    && ASSUME_CHANGED_NEON_MIN_CHURN_PCT <= 100) as usize)];
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -1332,8 +1335,8 @@ impl TurboLife {
             }
         } else {
             // Parallel kernel compute with a hybrid scheduler:
-            // - static contiguous slices for very large or reduced-worker runs
-            // - lock-free dynamic chunking for medium activity levels
+            // - static contiguous slices for very large frontiers
+            // - lock-free dynamic chunking otherwise for better load balance
             // Both reuse per-worker scratch buffers to avoid collect/reduce churn.
             let active_set = &self.arena.active_set;
             let active_ptr = SendConstPtr::new(active_set.as_ptr());
@@ -1352,8 +1355,9 @@ impl TurboLife {
             let live_masks_read_ptr = SendConstPtr::new(live_masks_read.as_ptr());
             let next_live_masks_ptr = SendPtr::new(next_live_masks_vec.as_mut_ptr());
             let worker_count = effective_threads.min(active_len);
-            let use_static_schedule =
-                active_len >= PARALLEL_STATIC_SCHEDULE_THRESHOLD || worker_count < thread_count;
+            // Keep dynamic scheduling whenever the frontier is not huge; it handles
+            // heterogeneous cores much better than fixed contiguous slices.
+            let use_static_schedule = active_len >= PARALLEL_STATIC_SCHEDULE_THRESHOLD;
             self.prepare_worker_scratch(worker_count, active_len, track_neighbor_influence);
             let scratch_ptr = SendPtr::new(self.worker_scratch.as_mut_ptr());
             #[cfg(target_arch = "x86_64")]
