@@ -775,6 +775,7 @@ impl TurboLife {
             let meta = self.arena.meta_mut(idx);
             meta.population = POPULATION_UNKNOWN;
             meta.set_has_live(true);
+            meta.set_alt_phase_dirty(false);
         }
         self.population_cache = None;
         self.arena.mark_changed(idx);
@@ -819,8 +820,10 @@ impl TurboLife {
 
         {
             let meta = self.arena.meta_mut(idx);
+            let was_live = meta.has_live();
             meta.population = POPULATION_UNKNOWN;
             meta.set_has_live(has_live_after_clear);
+            meta.set_alt_phase_dirty(!has_live_after_clear && was_live);
         }
         self.population_cache = None;
         self.arena.mark_changed(idx);
@@ -889,8 +892,10 @@ impl TurboLife {
             self.arena.set_current_border(*idx, border);
             {
                 let meta = self.arena.meta_mut(*idx);
+                let was_live = meta.has_live();
                 meta.population = POPULATION_UNKNOWN;
                 meta.set_has_live(has_live);
+                meta.set_alt_phase_dirty(!has_live && was_live);
             }
         }
 
@@ -2129,6 +2134,20 @@ mod tests {
 
         engine.set_cells([(0, 0, false), (127, 127, true), (190, -5, true)]);
         assert_border_live_mask_cache_sync(&engine);
+    }
+
+    #[test]
+    fn set_cells_dead_to_dead_batch_keeps_alt_phase_clean() {
+        let mut engine = TurboLife::new();
+        engine.set_cells([(0, 0, true), (0, 0, false)]);
+
+        let idx = engine
+            .arena
+            .idx_at((0, 0))
+            .expect("set_cells should allocate the tile");
+        let meta = engine.arena.meta(idx);
+        assert!(!meta.has_live());
+        assert!(!meta.alt_phase_dirty());
     }
 
     #[test]

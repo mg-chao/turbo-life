@@ -1,6 +1,6 @@
 use super::kernel::TileAdvanceResult;
 use super::kernel::{
-    advance_core_empty, clear_tile_if_needed, ghost_is_empty_from_live_masks_ptr, tile_is_empty,
+    advance_core_empty_with_clear, ghost_is_empty_from_live_masks_ptr, tile_is_empty,
 };
 use super::tile::{BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, TILE_SIZE};
 
@@ -10,6 +10,10 @@ const ADAPT_WINDOW: u32 = 512;
 const MIN_HIT_RATE_PCT: u32 = 20;
 const DISABLE_THRESHOLD: u32 = 3;
 const REPROBE_INTERVAL: u32 = 8;
+const LIVE_NW: u8 = 1 << 4;
+const LIVE_NE: u8 = 1 << 5;
+const LIVE_SW: u8 = 1 << 6;
+const LIVE_SE: u8 = 1 << 7;
 
 #[repr(C, align(64))]
 #[derive(Clone)]
@@ -267,7 +271,11 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_IN
         if missing_mask == MISSING_ALL_NEIGHBORS {
             debug_assert!(tile_is_empty(current));
             unsafe {
-                clear_tile_if_needed(next);
+                if meta.alt_phase_dirty() {
+                    std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                } else {
+                    debug_assert!(tile_is_empty(next));
+                }
                 *next_borders_north_ptr.add(idx) = 0;
                 *next_borders_south_ptr.add(idx) = 0;
                 *next_borders_west_ptr.add(idx) = 0;
@@ -285,7 +293,11 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_IN
         if ghost_empty {
             debug_assert!(tile_is_empty(current));
             unsafe {
-                clear_tile_if_needed(next);
+                if meta.alt_phase_dirty() {
+                    std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                } else {
+                    debug_assert!(tile_is_empty(next));
+                }
                 *next_borders_north_ptr.add(idx) = 0;
                 *next_borders_south_ptr.add(idx) = 0;
                 *next_borders_west_ptr.add(idx) = 0;
@@ -297,20 +309,30 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_IN
         }
     }
 
+    let north_i = nb[0] as usize;
+    let south_i = nb[1] as usize;
+    let west_i = nb[2] as usize;
+    let east_i = nb[3] as usize;
+    let nw_i = nb[4] as usize;
+    let ne_i = nb[5] as usize;
+    let sw_i = nb[6] as usize;
+    let se_i = nb[7] as usize;
+
     let ghost = GhostZone {
-        north: unsafe { *borders_south_read_ptr.add(nb[0] as usize) },
-        south: unsafe { *borders_north_read_ptr.add(nb[1] as usize) },
-        west: unsafe { *borders_east_read_ptr.add(nb[2] as usize) },
-        east: unsafe { *borders_west_read_ptr.add(nb[3] as usize) },
-        nw: unsafe { ((*borders_south_read_ptr.add(nb[4] as usize) >> 63) & 1) != 0 },
-        ne: unsafe { (*borders_south_read_ptr.add(nb[5] as usize) & 1) != 0 },
-        sw: unsafe { ((*borders_north_read_ptr.add(nb[6] as usize) >> 63) & 1) != 0 },
-        se: unsafe { (*borders_north_read_ptr.add(nb[7] as usize) & 1) != 0 },
+        north: unsafe { *borders_south_read_ptr.add(north_i) },
+        south: unsafe { *borders_north_read_ptr.add(south_i) },
+        west: unsafe { *borders_east_read_ptr.add(west_i) },
+        east: unsafe { *borders_west_read_ptr.add(east_i) },
+        nw: unsafe { (*live_masks_read_ptr.add(nw_i) & LIVE_SE) != 0 },
+        ne: unsafe { (*live_masks_read_ptr.add(ne_i) & LIVE_SW) != 0 },
+        sw: unsafe { (*live_masks_read_ptr.add(sw_i) & LIVE_NE) != 0 },
+        se: unsafe { (*live_masks_read_ptr.add(se_i) & LIVE_NW) != 0 },
     };
 
     if !tile_has_live {
         debug_assert!(tile_is_empty(current));
-        let (changed, border, has_live) = advance_core_empty(next, &ghost);
+        let (changed, border, has_live) =
+            advance_core_empty_with_clear(next, &ghost, meta.alt_phase_dirty());
         let live_mask = border.live_mask();
         unsafe {
             *next_borders_north_ptr.add(idx) = border.north;

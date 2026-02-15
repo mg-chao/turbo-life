@@ -855,6 +855,7 @@ impl TileArena {
         let m = &mut self.meta[idx.index()];
         m.population = 0;
         m.set_has_live(false);
+        m.set_alt_phase_dirty(false);
         self.mark_changed(idx);
     }
 }

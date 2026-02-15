@@ -310,9 +310,19 @@ fn birth_from_count5(bits: u64) -> u64 {
 /// Only boundary cells can be born from halo activity, so this bypasses
 /// the full 64-row adder pipeline and writes a sparse edge-only result.
 #[inline(always)]
+#[allow(dead_code)]
 pub(crate) fn advance_core_empty(
     next: &mut [u64; TILE_SIZE],
     ghost: &GhostZone,
+) -> (bool, BorderData, bool) {
+    advance_core_empty_with_clear(next, ghost, true)
+}
+
+#[inline(always)]
+pub(crate) fn advance_core_empty_with_clear(
+    next: &mut [u64; TILE_SIZE],
+    ghost: &GhostZone,
+    clear_next: bool,
 ) -> (bool, BorderData, bool) {
     let south_trip = (ghost.south << 1) & ghost.south & (ghost.south >> 1);
     let north_trip = (ghost.north << 1) & ghost.north & (ghost.north >> 1);
@@ -350,7 +360,11 @@ pub(crate) fn advance_core_empty(
     let border_west = west_trip | sw_birth | (nw_birth << 63);
     let border_east = east_trip | se_birth | (ne_birth << 63);
 
-    clear_tile_if_needed(next);
+    if clear_next {
+        clear_tile_if_needed(next);
+    } else {
+        debug_assert!(tile_is_empty(next));
+    }
     next[0] = south_row;
     next[TILE_SIZE - 1] = north_row;
 
@@ -944,7 +958,11 @@ unsafe fn advance_tile_fused_impl<
         if missing_mask == MISSING_ALL_NEIGHBORS {
             debug_assert!(tile_is_empty(current));
             unsafe {
-                clear_tile_if_needed(next);
+                if meta.alt_phase_dirty() {
+                    std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                } else {
+                    debug_assert!(tile_is_empty(next));
+                }
                 *next_borders_north_ptr.add(idx) = 0;
                 *next_borders_south_ptr.add(idx) = 0;
                 *next_borders_west_ptr.add(idx) = 0;
@@ -962,7 +980,11 @@ unsafe fn advance_tile_fused_impl<
         if ghost_empty {
             debug_assert!(tile_is_empty(current));
             unsafe {
-                clear_tile_if_needed(next);
+                if meta.alt_phase_dirty() {
+                    std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                } else {
+                    debug_assert!(tile_is_empty(next));
+                }
                 *next_borders_north_ptr.add(idx) = 0;
                 *next_borders_south_ptr.add(idx) = 0;
                 *next_borders_west_ptr.add(idx) = 0;
@@ -975,22 +997,31 @@ unsafe fn advance_tile_fused_impl<
     }
 
     // Inline ghost-zone gather (avoids function call + struct construction).
+    let north_i = nb[0] as usize;
+    let south_i = nb[1] as usize;
+    let west_i = nb[2] as usize;
+    let east_i = nb[3] as usize;
+    let nw_i = nb[4] as usize;
+    let ne_i = nb[5] as usize;
+    let sw_i = nb[6] as usize;
+    let se_i = nb[7] as usize;
+
     let ghost = GhostZone {
-        north: unsafe { *borders_south_read_ptr.add(nb[0] as usize) },
-        south: unsafe { *borders_north_read_ptr.add(nb[1] as usize) },
-        west: unsafe { *borders_east_read_ptr.add(nb[2] as usize) },
-        east: unsafe { *borders_west_read_ptr.add(nb[3] as usize) },
-        nw: unsafe { ((*borders_south_read_ptr.add(nb[4] as usize) >> 63) & 1) != 0 },
-        ne: unsafe { (*borders_south_read_ptr.add(nb[5] as usize) & 1) != 0 },
-        sw: unsafe { ((*borders_north_read_ptr.add(nb[6] as usize) >> 63) & 1) != 0 },
-        se: unsafe { (*borders_north_read_ptr.add(nb[7] as usize) & 1) != 0 },
+        north: unsafe { *borders_south_read_ptr.add(north_i) },
+        south: unsafe { *borders_north_read_ptr.add(south_i) },
+        west: unsafe { *borders_east_read_ptr.add(west_i) },
+        east: unsafe { *borders_west_read_ptr.add(east_i) },
+        nw: unsafe { (*live_masks_read_ptr.add(nw_i) & LIVE_SE) != 0 },
+        ne: unsafe { (*live_masks_read_ptr.add(ne_i) & LIVE_SW) != 0 },
+        sw: unsafe { (*live_masks_read_ptr.add(sw_i) & LIVE_NE) != 0 },
+        se: unsafe { (*live_masks_read_ptr.add(se_i) & LIVE_NW) != 0 },
     };
 
     let (changed, border, has_live) = if tile_has_live {
         unsafe { advance_core_const::<CORE_BACKEND, ASSUME_CHANGED>(current, next, &ghost) }
     } else {
         debug_assert!(tile_is_empty(current));
-        advance_core_empty(next, &ghost)
+        advance_core_empty_with_clear(next, &ghost, meta.alt_phase_dirty())
     };
     let live_mask = border.live_mask();
 

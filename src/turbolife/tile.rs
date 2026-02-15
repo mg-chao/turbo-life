@@ -178,6 +178,7 @@ pub struct GhostZone {
 
 const FLAG_OCCUPIED: u8 = 1 << 0;
 const FLAG_HAS_LIVE: u8 = 1 << 1;
+const FLAG_ALT_PHASE_DIRTY: u8 = 1 << 2;
 pub const MISSING_ALL_NEIGHBORS: u8 = 0xFF;
 
 /// Per-tile metadata with flags packed into a single byte.
@@ -207,6 +208,10 @@ impl TileMeta {
         self.flags & FLAG_HAS_LIVE != 0
     }
     #[inline(always)]
+    pub fn alt_phase_dirty(self) -> bool {
+        self.flags & FLAG_ALT_PHASE_DIRTY != 0
+    }
+    #[inline(always)]
     #[allow(dead_code)]
     pub fn set_occupied(&mut self, v: bool) {
         self.set_flag(FLAG_OCCUPIED, v);
@@ -216,8 +221,14 @@ impl TileMeta {
         self.set_flag(FLAG_HAS_LIVE, v);
     }
     #[inline(always)]
+    pub fn set_alt_phase_dirty(&mut self, v: bool) {
+        self.set_flag(FLAG_ALT_PHASE_DIRTY, v);
+    }
+    #[inline(always)]
     pub fn update_after_step(&mut self, changed: bool, has_live: bool) {
+        let was_live = self.has_live();
         self.set_has_live(has_live);
+        self.set_alt_phase_dirty(!has_live && was_live);
         if changed {
             if self.population != POPULATION_UNKNOWN {
                 self.population = POPULATION_UNKNOWN;
@@ -343,5 +354,20 @@ mod tests {
     fn border_data_live_mask_includes_edges_and_corners() {
         let border = BorderData::from_edges(1, 1u64 << 63, 1, 1);
         assert_eq!(border.live_mask(), 0b1001_1111);
+    }
+
+    #[test]
+    fn tile_meta_tracks_alt_phase_dirty_only_on_live_to_dead_transition() {
+        let mut meta = TileMeta::empty();
+        assert!(!meta.alt_phase_dirty());
+
+        meta.set_has_live(true);
+        meta.update_after_step(true, false);
+        assert!(!meta.has_live());
+        assert!(meta.alt_phase_dirty());
+
+        meta.update_after_step(false, false);
+        assert!(!meta.has_live());
+        assert!(!meta.alt_phase_dirty());
     }
 }
