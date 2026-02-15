@@ -113,35 +113,22 @@ pub(crate) unsafe fn ghost_is_empty_from_live_masks_ptr(
     // indexed by every value in `neighbors` (including sentinel slot 0).
     unsafe {
         let north = *live_masks_ptr.add(neighbors[0] as usize);
-        if (north & LIVE_S) != 0 {
-            return false;
-        }
         let south = *live_masks_ptr.add(neighbors[1] as usize);
-        if (south & LIVE_N) != 0 {
-            return false;
-        }
         let west = *live_masks_ptr.add(neighbors[2] as usize);
-        if (west & LIVE_E) != 0 {
-            return false;
-        }
         let east = *live_masks_ptr.add(neighbors[3] as usize);
-        if (east & LIVE_W) != 0 {
-            return false;
-        }
         let nw = *live_masks_ptr.add(neighbors[4] as usize);
-        if (nw & LIVE_SE) != 0 {
-            return false;
-        }
         let ne = *live_masks_ptr.add(neighbors[5] as usize);
-        if (ne & LIVE_SW) != 0 {
-            return false;
-        }
         let sw = *live_masks_ptr.add(neighbors[6] as usize);
-        if (sw & LIVE_NE) != 0 {
-            return false;
-        }
         let se = *live_masks_ptr.add(neighbors[7] as usize);
-        (se & LIVE_NW) == 0
+        ((north & LIVE_S)
+            | (south & LIVE_N)
+            | (west & LIVE_E)
+            | (east & LIVE_W)
+            | (nw & LIVE_SE)
+            | (ne & LIVE_SW)
+            | (sw & LIVE_NE)
+            | (se & LIVE_NW))
+            == 0
     }
 }
 
@@ -925,7 +912,11 @@ unsafe fn advance_core_const<const CORE_BACKEND: u8, const ASSUME_CHANGED: bool>
 /// `meta_ptr[idx]`, `next_borders_ptr[idx]`, and `next_live_masks_ptr[idx]`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn advance_tile_fused_impl<const CORE_BACKEND: u8, const ASSUME_CHANGED: bool>(
+unsafe fn advance_tile_fused_impl<
+    const CORE_BACKEND: u8,
+    const ASSUME_CHANGED: bool,
+    const TRACK_NEIGHBOR_INFLUENCE: bool,
+>(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut TileMeta,
@@ -941,7 +932,6 @@ unsafe fn advance_tile_fused_impl<const CORE_BACKEND: u8, const ASSUME_CHANGED: 
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
-    track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     let nb = unsafe { &*neighbors_ptr.add(idx) };
     let current = unsafe { &(*current_ptr.add(idx)).0 };
@@ -1012,7 +1002,7 @@ unsafe fn advance_tile_fused_impl<const CORE_BACKEND: u8, const ASSUME_CHANGED: 
         *next_live_masks_ptr.add(idx) = live_mask;
     }
 
-    let neighbor_influence_mask = if track_neighbor_influence {
+    let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
         if changed {
             let prev_north = unsafe { *borders_north_read_ptr.add(idx) };
             let prev_south = unsafe { *borders_south_read_ptr.add(idx) };
@@ -1041,7 +1031,7 @@ unsafe fn advance_tile_fused_impl<const CORE_BACKEND: u8, const ASSUME_CHANGED: 
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn advance_tile_fused_scalar(
+pub unsafe fn advance_tile_fused_scalar_track(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut TileMeta,
@@ -1057,10 +1047,9 @@ pub unsafe fn advance_tile_fused_scalar(
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
-    track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_SCALAR }, false>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_SCALAR }, false, true>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1076,7 +1065,46 @@ pub unsafe fn advance_tile_fused_scalar(
             live_masks_read_ptr,
             next_live_masks_ptr,
             idx,
-            track_neighbor_influence,
+        )
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn advance_tile_fused_scalar_no_track(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
+    meta_ptr: *mut TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+) -> TileAdvanceResult {
+    unsafe {
+        advance_tile_fused_impl::<{ CORE_BACKEND_SCALAR }, false, false>(
+            current_ptr,
+            next_ptr,
+            meta_ptr,
+            next_borders_north_ptr,
+            next_borders_south_ptr,
+            next_borders_west_ptr,
+            next_borders_east_ptr,
+            borders_north_read_ptr,
+            borders_south_read_ptr,
+            borders_west_read_ptr,
+            borders_east_read_ptr,
+            neighbors_ptr,
+            live_masks_read_ptr,
+            next_live_masks_ptr,
+            idx,
         )
     }
 }
@@ -1084,7 +1112,7 @@ pub unsafe fn advance_tile_fused_scalar(
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn advance_tile_fused_avx2(
+pub unsafe fn advance_tile_fused_avx2_track(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut TileMeta,
@@ -1100,10 +1128,9 @@ pub unsafe fn advance_tile_fused_avx2(
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
-    track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_AVX2 }, false>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_AVX2 }, false, true>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1119,7 +1146,47 @@ pub unsafe fn advance_tile_fused_avx2(
             live_masks_read_ptr,
             next_live_masks_ptr,
             idx,
-            track_neighbor_influence,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn advance_tile_fused_avx2_no_track(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
+    meta_ptr: *mut TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+) -> TileAdvanceResult {
+    unsafe {
+        advance_tile_fused_impl::<{ CORE_BACKEND_AVX2 }, false, false>(
+            current_ptr,
+            next_ptr,
+            meta_ptr,
+            next_borders_north_ptr,
+            next_borders_south_ptr,
+            next_borders_west_ptr,
+            next_borders_east_ptr,
+            borders_north_read_ptr,
+            borders_south_read_ptr,
+            borders_west_read_ptr,
+            borders_east_read_ptr,
+            neighbors_ptr,
+            live_masks_read_ptr,
+            next_live_masks_ptr,
+            idx,
         )
     }
 }
@@ -1127,7 +1194,7 @@ pub unsafe fn advance_tile_fused_avx2(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn advance_tile_fused_neon(
+pub unsafe fn advance_tile_fused_neon_track(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut TileMeta,
@@ -1143,10 +1210,9 @@ pub unsafe fn advance_tile_fused_neon(
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
-    track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, false>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, false, true>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1162,7 +1228,6 @@ pub unsafe fn advance_tile_fused_neon(
             live_masks_read_ptr,
             next_live_masks_ptr,
             idx,
-            track_neighbor_influence,
         )
     }
 }
@@ -1170,7 +1235,7 @@ pub unsafe fn advance_tile_fused_neon(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn advance_tile_fused_neon_assume_changed(
+pub unsafe fn advance_tile_fused_neon_no_track(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut TileMeta,
@@ -1186,10 +1251,9 @@ pub unsafe fn advance_tile_fused_neon_assume_changed(
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
-    track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, true>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, false, false>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1205,7 +1269,47 @@ pub unsafe fn advance_tile_fused_neon_assume_changed(
             live_masks_read_ptr,
             next_live_masks_ptr,
             idx,
-            track_neighbor_influence,
+        )
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn advance_tile_fused_neon_assume_changed_no_track(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
+    meta_ptr: *mut TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+) -> TileAdvanceResult {
+    unsafe {
+        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, true, false>(
+            current_ptr,
+            next_ptr,
+            meta_ptr,
+            next_borders_north_ptr,
+            next_borders_south_ptr,
+            next_borders_west_ptr,
+            next_borders_east_ptr,
+            borders_north_read_ptr,
+            borders_south_read_ptr,
+            borders_west_read_ptr,
+            borders_east_read_ptr,
+            neighbors_ptr,
+            live_masks_read_ptr,
+            next_live_masks_ptr,
+            idx,
         )
     }
 }

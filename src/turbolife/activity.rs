@@ -249,6 +249,12 @@ pub(crate) fn append_expand_candidates(
     if expand_mask == 0 {
         return;
     }
+    append_expand_candidates_slow(expand, idx, expand_mask);
+}
+
+#[cold]
+#[inline(never)]
+fn append_expand_candidates_slow(expand: &mut Vec<u32>, idx: TileIdx, expand_mask: usize) {
     let dirs = &EXPAND_MASK_TABLE.dirs[expand_mask];
     let count = EXPAND_MASK_TABLE.len[expand_mask] as usize;
     for &dir in dirs[..count].iter() {

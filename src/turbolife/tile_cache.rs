@@ -238,7 +238,7 @@ unsafe fn advance_core_const<const USE_AVX2: bool>(
 /// All pointers must be valid. `idx` must be within bounds of all arrays.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
+unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_INFLUENCE: bool>(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut super::tile::TileMeta,
@@ -255,7 +255,6 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
     next_live_masks_ptr: *mut u8,
     idx: usize,
     cache: *mut TileCache,
-    track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     let nb = unsafe { &*neighbors_ptr.add(idx) };
     let current = unsafe { &(*current_ptr.add(idx)).0 };
@@ -320,7 +319,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
             *next_borders_east_ptr.add(idx) = border.east;
             *next_live_masks_ptr.add(idx) = live_mask;
         }
-        let neighbor_influence_mask = if track_neighbor_influence {
+        let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
             if changed {
                 unsafe {
                     neighbor_influence_mask_for_result(
@@ -374,7 +373,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
             let changed = entry.changed;
             let has_live = entry.has_live;
             let live_mask = entry.live_mask;
-            let neighbor_influence_mask = if track_neighbor_influence {
+            let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
                 if changed {
                     entry.neighbor_influence_mask
                 } else {
@@ -403,7 +402,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
             *next_borders_east_ptr.add(idx) = border.east;
             *next_live_masks_ptr.add(idx) = live_mask;
         }
-        let neighbor_influence_mask = if track_neighbor_influence {
+        let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
             if changed {
                 unsafe {
                     neighbor_influence_mask_for_result(
@@ -458,7 +457,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
         *next_borders_east_ptr.add(idx) = border.east;
         *next_live_masks_ptr.add(idx) = live_mask;
     }
-    let neighbor_influence_mask = if track_neighbor_influence {
+    let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
         if changed {
             unsafe {
                 neighbor_influence_mask_for_result(
@@ -490,7 +489,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
 /// All pointers must be valid. `idx` must be within bounds of all arrays.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn advance_tile_cached_scalar(
+pub unsafe fn advance_tile_cached_scalar_track(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut super::tile::TileMeta,
@@ -507,10 +506,9 @@ pub unsafe fn advance_tile_cached_scalar(
     next_live_masks_ptr: *mut u8,
     idx: usize,
     cache: *mut TileCache,
-    track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_cached_impl::<false>(
+        advance_tile_cached_impl::<false, true>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -527,7 +525,50 @@ pub unsafe fn advance_tile_cached_scalar(
             next_live_masks_ptr,
             idx,
             cache,
-            track_neighbor_influence,
+        )
+    }
+}
+
+/// # Safety
+/// All pointers must be valid. `idx` must be within bounds of all arrays.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn advance_tile_cached_scalar_no_track(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
+    meta_ptr: *mut super::tile::TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+    cache: *mut TileCache,
+) -> TileAdvanceResult {
+    unsafe {
+        advance_tile_cached_impl::<false, false>(
+            current_ptr,
+            next_ptr,
+            meta_ptr,
+            next_borders_north_ptr,
+            next_borders_south_ptr,
+            next_borders_west_ptr,
+            next_borders_east_ptr,
+            borders_north_read_ptr,
+            borders_south_read_ptr,
+            borders_west_read_ptr,
+            borders_east_read_ptr,
+            neighbors_ptr,
+            live_masks_read_ptr,
+            next_live_masks_ptr,
+            idx,
+            cache,
         )
     }
 }
@@ -537,7 +578,7 @@ pub unsafe fn advance_tile_cached_scalar(
 /// All pointers must be valid. `idx` must be within bounds of all arrays.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn advance_tile_cached_avx2(
+pub unsafe fn advance_tile_cached_avx2_track(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut super::tile::TileMeta,
@@ -554,10 +595,9 @@ pub unsafe fn advance_tile_cached_avx2(
     next_live_masks_ptr: *mut u8,
     idx: usize,
     cache: *mut TileCache,
-    track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_cached_impl::<true>(
+        advance_tile_cached_impl::<true, true>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -574,7 +614,51 @@ pub unsafe fn advance_tile_cached_avx2(
             next_live_masks_ptr,
             idx,
             cache,
-            track_neighbor_influence,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+/// # Safety
+/// All pointers must be valid. `idx` must be within bounds of all arrays.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn advance_tile_cached_avx2_no_track(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
+    meta_ptr: *mut super::tile::TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+    cache: *mut TileCache,
+) -> TileAdvanceResult {
+    unsafe {
+        advance_tile_cached_impl::<true, false>(
+            current_ptr,
+            next_ptr,
+            meta_ptr,
+            next_borders_north_ptr,
+            next_borders_south_ptr,
+            next_borders_west_ptr,
+            next_borders_east_ptr,
+            borders_north_read_ptr,
+            borders_south_read_ptr,
+            borders_west_read_ptr,
+            borders_east_read_ptr,
+            neighbors_ptr,
+            live_masks_read_ptr,
+            next_live_masks_ptr,
+            idx,
+            cache,
         )
     }
 }
