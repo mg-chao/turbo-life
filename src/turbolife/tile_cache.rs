@@ -131,11 +131,7 @@ unsafe fn neighbor_influence_mask_for_result(
     borders_east_read_ptr: *const u64,
     idx: usize,
     border: &BorderData,
-    changed: bool,
 ) -> u8 {
-    if !changed {
-        return 0;
-    }
     let prev_north = unsafe { *borders_north_read_ptr.add(idx) };
     let prev_south = unsafe { *borders_south_read_ptr.add(idx) };
     let prev_west = unsafe { *borders_west_read_ptr.add(idx) };
@@ -324,22 +320,23 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
             *next_borders_east_ptr.add(idx) = border.east;
             *next_live_masks_ptr.add(idx) = live_mask;
         }
-        let neighbor_influence_mask = if changed && track_neighbor_influence {
-            unsafe {
-                neighbor_influence_mask_for_result(
-                    borders_north_read_ptr,
-                    borders_south_read_ptr,
-                    borders_west_read_ptr,
-                    borders_east_read_ptr,
-                    idx,
-                    &border,
-                    changed,
-                )
+        let neighbor_influence_mask = if track_neighbor_influence {
+            if changed {
+                unsafe {
+                    neighbor_influence_mask_for_result(
+                        borders_north_read_ptr,
+                        borders_south_read_ptr,
+                        borders_west_read_ptr,
+                        borders_east_read_ptr,
+                        idx,
+                        &border,
+                    )
+                }
+            } else {
+                0
             }
-        } else if changed {
-            u8::MAX
         } else {
-            0
+            (changed as u8).wrapping_neg()
         };
         meta.update_after_step(changed, has_live);
         return TileAdvanceResult::new(
@@ -377,12 +374,14 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
             let changed = entry.changed;
             let has_live = entry.has_live;
             let live_mask = entry.live_mask;
-            let neighbor_influence_mask = if changed && track_neighbor_influence {
-                entry.neighbor_influence_mask
-            } else if changed {
-                u8::MAX
+            let neighbor_influence_mask = if track_neighbor_influence {
+                if changed {
+                    entry.neighbor_influence_mask
+                } else {
+                    0
+                }
             } else {
-                0
+                (changed as u8).wrapping_neg()
             };
             meta.update_after_step(changed, has_live);
             cr.record_hit();
@@ -404,22 +403,23 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
             *next_borders_east_ptr.add(idx) = border.east;
             *next_live_masks_ptr.add(idx) = live_mask;
         }
-        let neighbor_influence_mask = if changed && track_neighbor_influence {
-            unsafe {
-                neighbor_influence_mask_for_result(
-                    borders_north_read_ptr,
-                    borders_south_read_ptr,
-                    borders_west_read_ptr,
-                    borders_east_read_ptr,
-                    idx,
-                    &border,
-                    changed,
-                )
+        let neighbor_influence_mask = if track_neighbor_influence {
+            if changed {
+                unsafe {
+                    neighbor_influence_mask_for_result(
+                        borders_north_read_ptr,
+                        borders_south_read_ptr,
+                        borders_west_read_ptr,
+                        borders_east_read_ptr,
+                        idx,
+                        &border,
+                    )
+                }
+            } else {
+                0
             }
-        } else if changed {
-            u8::MAX
         } else {
-            0
+            (changed as u8).wrapping_neg()
         };
         meta.update_after_step(changed, has_live);
         let em = unsafe { cr.entries.get_unchecked_mut(slot) };
@@ -458,22 +458,23 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool>(
         *next_borders_east_ptr.add(idx) = border.east;
         *next_live_masks_ptr.add(idx) = live_mask;
     }
-    let neighbor_influence_mask = if changed && track_neighbor_influence {
-        unsafe {
-            neighbor_influence_mask_for_result(
-                borders_north_read_ptr,
-                borders_south_read_ptr,
-                borders_west_read_ptr,
-                borders_east_read_ptr,
-                idx,
-                &border,
-                changed,
-            )
+    let neighbor_influence_mask = if track_neighbor_influence {
+        if changed {
+            unsafe {
+                neighbor_influence_mask_for_result(
+                    borders_north_read_ptr,
+                    borders_south_read_ptr,
+                    borders_west_read_ptr,
+                    borders_east_read_ptr,
+                    idx,
+                    &border,
+                )
+            }
+        } else {
+            0
         }
-    } else if changed {
-        u8::MAX
     } else {
-        0
+        (changed as u8).wrapping_neg()
     };
     meta.update_after_step(changed, has_live);
     TileAdvanceResult::new(

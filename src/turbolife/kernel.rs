@@ -996,16 +996,20 @@ unsafe fn advance_tile_fused_impl<const CORE_BACKEND: u8, const ASSUME_CHANGED: 
         *next_live_masks_ptr.add(idx) = live_mask;
     }
 
-    let neighbor_influence_mask = if changed && track_neighbor_influence {
-        let prev_north = unsafe { *borders_north_read_ptr.add(idx) };
-        let prev_south = unsafe { *borders_south_read_ptr.add(idx) };
-        let prev_west = unsafe { *borders_west_read_ptr.add(idx) };
-        let prev_east = unsafe { *borders_east_read_ptr.add(idx) };
-        neighbor_influence_mask_from_borders(prev_north, prev_south, prev_west, prev_east, &border)
-    } else if changed {
-        u8::MAX
+    let neighbor_influence_mask = if track_neighbor_influence {
+        if changed {
+            let prev_north = unsafe { *borders_north_read_ptr.add(idx) };
+            let prev_south = unsafe { *borders_south_read_ptr.add(idx) };
+            let prev_west = unsafe { *borders_west_read_ptr.add(idx) };
+            let prev_east = unsafe { *borders_east_read_ptr.add(idx) };
+            neighbor_influence_mask_from_borders(
+                prev_north, prev_south, prev_west, prev_east, &border,
+            )
+        } else {
+            0
+        }
     } else {
-        0
+        (changed as u8).wrapping_neg()
     };
 
     meta.update_after_step(changed, has_live);

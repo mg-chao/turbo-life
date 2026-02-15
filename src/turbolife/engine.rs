@@ -87,6 +87,9 @@ const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 512;
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 const PRECISE_INFLUENCE_MAX_ACTIVE: usize = 256;
 const ASSUME_CHANGED_NEON_MIN_ACTIVE: usize = 2_048;
+// `assume_changed` reports every tile as changed; once enabled it self-inflates
+// churn metrics. Keep this gate conservative so we only enter it when churn is
+// already very high.
 const ASSUME_CHANGED_NEON_MIN_CHURN_PCT: usize = 85;
 
 #[cfg(target_arch = "aarch64")]
