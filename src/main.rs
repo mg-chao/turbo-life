@@ -7,34 +7,42 @@ use turbo_life::turbolife::{KernelBackend, TurboLife, TurboLifeConfig};
 fn parse_args() -> TurboLifeConfig {
     let args: Vec<String> = std::env::args().collect();
     let mut config = TurboLifeConfig::default();
+    let next_arg = |i: usize, flag: &str| -> &str {
+        args.get(i)
+            .map(String::as_str)
+            .unwrap_or_else(|| panic!("{flag} requires a value"))
+    };
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--threads" => {
                 i += 1;
-                let n: usize = args[i]
+                let n: usize = next_arg(i, "--threads")
                     .parse()
                     .expect("--threads requires a positive integer");
                 config = config.thread_count(n);
             }
             "--max-threads" => {
                 i += 1;
-                let n: usize = args[i]
+                let n: usize = next_arg(i, "--max-threads")
                     .parse()
                     .expect("--max-threads requires a positive integer");
                 config = config.max_threads(n);
             }
             "--kernel" => {
                 i += 1;
-                let backend = match args[i].to_ascii_lowercase().as_str() {
+                let backend = match next_arg(i, "--kernel").to_ascii_lowercase().as_str() {
                     "scalar" => KernelBackend::Scalar,
                     "avx2" => KernelBackend::Avx2,
-                    other => panic!("unknown kernel backend: {other} (expected scalar or avx2)"),
+                    "neon" => KernelBackend::Neon,
+                    other => {
+                        panic!("unknown kernel backend: {other} (expected scalar, avx2, or neon)")
+                    }
                 };
                 config = config.kernel(backend);
             }
             other => panic!(
-                "unknown argument: {other}\nusage: turbo-life [--threads N] [--max-threads N] [--kernel scalar|avx2]"
+                "unknown argument: {other}\nusage: turbo-life [--threads N] [--max-threads N] [--kernel scalar|avx2|neon]"
             ),
         }
         i += 1;

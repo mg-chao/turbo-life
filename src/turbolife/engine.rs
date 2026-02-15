@@ -1,13 +1,18 @@
 use rayon::prelude::*;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
 use super::activity::{append_expand_candidates, finalize_prune_and_expand, rebuild_active_set};
 use super::arena::TileArena;
 #[cfg(target_arch = "x86_64")]
+use super::kernel::advance_core;
+#[cfg(target_arch = "x86_64")]
 use super::kernel::advance_tile_fused_avx2;
-use super::kernel::{KernelBackend, advance_core, advance_tile_fused_scalar};
+#[cfg(target_arch = "aarch64")]
+use super::kernel::advance_tile_fused_neon;
+use super::kernel::{KernelBackend, advance_tile_fused_scalar};
 use super::tile::{self, Direction, NO_NEIGHBOR, POPULATION_UNKNOWN, TileIdx};
 #[cfg(target_arch = "x86_64")]
 use super::tile_cache::advance_tile_cached_avx2;
@@ -76,6 +81,7 @@ const PARALLEL_DYNAMIC_TARGET_CHUNKS_HIGH_ACTIVE: usize = 16_384;
 const PARALLEL_DYNAMIC_MID_CHURN_PCT: usize = 35;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 16;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 512;
+#[cfg(target_arch = "x86_64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 const PRECISE_INFLUENCE_MAX_ACTIVE: usize = 256;
 
@@ -193,6 +199,18 @@ fn detect_kernel_backend() -> KernelBackend {
     }
 }
 
+#[inline]
+fn neon_available() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("neon")
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn next_seed(seed: &mut u64) -> u64 {
@@ -275,7 +293,11 @@ fn calibrate_auto_backend() -> KernelBackend {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn calibrate_auto_backend() -> KernelBackend {
-    KernelBackend::Scalar
+    if neon_available() {
+        KernelBackend::Neon
+    } else {
+        KernelBackend::Scalar
+    }
 }
 
 #[inline]
@@ -400,6 +422,12 @@ fn resolve_kernel_backend(config: &TurboLifeConfig) -> KernelBackend {
             }
             return KernelBackend::Scalar;
         }
+        if backend == KernelBackend::Neon {
+            if neon_available() {
+                return KernelBackend::Neon;
+            }
+            return KernelBackend::Scalar;
+        }
         return backend;
     }
     detect_kernel_backend()
@@ -418,7 +446,8 @@ pub struct TurboLifeConfig {
     /// `None` means no additional cap beyond `thread_count`.
     pub max_threads: Option<usize>,
     /// Kernel backend selection.
-    /// `None` means auto-detect (calibrated AVX2-vs-scalar on x86_64).
+    /// `None` means auto-detect (calibrated AVX2-vs-scalar on x86_64,
+    /// NEON on aarch64 when the CPU reports support).
     /// Set `TURBOLIFE_AUTO_KERNEL=0` to force scalar default policy.
     pub kernel: Option<KernelBackend>,
 }
@@ -838,6 +867,7 @@ impl TurboLife {
             let meta_ptr = self.arena.meta.as_mut_ptr();
             let active_ptr = self.arena.active_set.as_ptr();
             let cache_ptr = &mut self.tile_cache as *mut TileCache;
+            #[cfg(target_arch = "x86_64")]
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
 
             macro_rules! serial_loop_cached {
@@ -1019,6 +1049,9 @@ impl TurboLife {
                                 serial_loop_cached!(advance_tile_cached_scalar, true);
                             }
                         }
+                        KernelBackend::Neon => {
+                            serial_loop_cached!(advance_tile_cached_scalar, true);
+                        }
                     }
                 } else {
                     match backend {
@@ -1035,39 +1068,56 @@ impl TurboLife {
                                 serial_loop_cached!(advance_tile_cached_scalar, false);
                             }
                         }
+                        KernelBackend::Neon => {
+                            serial_loop_cached!(advance_tile_cached_scalar, false);
+                        }
+                    }
+                }
+            } else if track_neighbor_influence {
+                match backend {
+                    KernelBackend::Scalar => serial_loop_fused!(advance_tile_fused_scalar, true),
+                    KernelBackend::Avx2 => {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            serial_loop_fused!(advance_tile_fused_avx2, true);
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            serial_loop_fused!(advance_tile_fused_scalar, true);
+                        }
+                    }
+                    KernelBackend::Neon => {
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            serial_loop_fused!(advance_tile_fused_neon, true);
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        {
+                            serial_loop_fused!(advance_tile_fused_scalar, true);
+                        }
                     }
                 }
             } else {
-                if track_neighbor_influence {
-                    match backend {
-                        KernelBackend::Scalar => {
-                            serial_loop_fused!(advance_tile_fused_scalar, true)
+                match backend {
+                    KernelBackend::Scalar => serial_loop_fused!(advance_tile_fused_scalar, false),
+                    KernelBackend::Avx2 => {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            serial_loop_fused!(advance_tile_fused_avx2, false);
                         }
-                        KernelBackend::Avx2 => {
-                            #[cfg(target_arch = "x86_64")]
-                            {
-                                serial_loop_fused!(advance_tile_fused_avx2, true);
-                            }
-                            #[cfg(not(target_arch = "x86_64"))]
-                            {
-                                serial_loop_fused!(advance_tile_fused_scalar, true);
-                            }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            serial_loop_fused!(advance_tile_fused_scalar, false);
                         }
                     }
-                } else {
-                    match backend {
-                        KernelBackend::Scalar => {
-                            serial_loop_fused!(advance_tile_fused_scalar, false)
+                    KernelBackend::Neon => {
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            serial_loop_fused!(advance_tile_fused_neon, false);
                         }
-                        KernelBackend::Avx2 => {
-                            #[cfg(target_arch = "x86_64")]
-                            {
-                                serial_loop_fused!(advance_tile_fused_avx2, false);
-                            }
-                            #[cfg(not(target_arch = "x86_64"))]
-                            {
-                                serial_loop_fused!(advance_tile_fused_scalar, false);
-                            }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        {
+                            serial_loop_fused!(advance_tile_fused_scalar, false);
                         }
                     }
                 }
@@ -1098,6 +1148,7 @@ impl TurboLife {
                 active_len >= PARALLEL_STATIC_SCHEDULE_THRESHOLD || worker_count < thread_count;
             self.prepare_worker_scratch(worker_count, active_len, track_neighbor_influence);
             let scratch_ptr = SendPtr::new(self.worker_scratch.as_mut_ptr());
+            #[cfg(target_arch = "x86_64")]
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
 
             macro_rules! prefetch_for_work_item {
@@ -1217,6 +1268,16 @@ impl TurboLife {
                                 parallel_kernel_static!(advance_tile_fused_scalar, chunk_size, true)
                             }
                         }
+                        KernelBackend::Neon => {
+                            #[cfg(target_arch = "aarch64")]
+                            {
+                                parallel_kernel_static!(advance_tile_fused_neon, chunk_size, true)
+                            }
+                            #[cfg(not(target_arch = "aarch64"))]
+                            {
+                                parallel_kernel_static!(advance_tile_fused_scalar, chunk_size, true)
+                            }
+                        }
                     }
                 } else {
                     match backend {
@@ -1229,6 +1290,20 @@ impl TurboLife {
                                 parallel_kernel_static!(advance_tile_fused_avx2, chunk_size, false)
                             }
                             #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                parallel_kernel_static!(
+                                    advance_tile_fused_scalar,
+                                    chunk_size,
+                                    false
+                                )
+                            }
+                        }
+                        KernelBackend::Neon => {
+                            #[cfg(target_arch = "aarch64")]
+                            {
+                                parallel_kernel_static!(advance_tile_fused_neon, chunk_size, false)
+                            }
+                            #[cfg(not(target_arch = "aarch64"))]
                             {
                                 parallel_kernel_static!(
                                     advance_tile_fused_scalar,
@@ -1276,6 +1351,16 @@ impl TurboLife {
                                 parallel_kernel_lockfree!(advance_tile_fused_scalar, true)
                             }
                         }
+                        KernelBackend::Neon => {
+                            #[cfg(target_arch = "aarch64")]
+                            {
+                                parallel_kernel_lockfree!(advance_tile_fused_neon, true)
+                            }
+                            #[cfg(not(target_arch = "aarch64"))]
+                            {
+                                parallel_kernel_lockfree!(advance_tile_fused_scalar, true)
+                            }
+                        }
                     }
                 } else {
                     match backend {
@@ -1288,6 +1373,16 @@ impl TurboLife {
                                 parallel_kernel_lockfree!(advance_tile_fused_avx2, false)
                             }
                             #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                parallel_kernel_lockfree!(advance_tile_fused_scalar, false)
+                            }
+                        }
+                        KernelBackend::Neon => {
+                            #[cfg(target_arch = "aarch64")]
+                            {
+                                parallel_kernel_lockfree!(advance_tile_fused_neon, false)
+                            }
+                            #[cfg(not(target_arch = "aarch64"))]
                             {
                                 parallel_kernel_lockfree!(advance_tile_fused_scalar, false)
                             }

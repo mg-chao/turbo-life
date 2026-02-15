@@ -11,6 +11,7 @@ const _: [(); 1] = [(); (TILE_SIZE == 64) as usize];
 pub enum KernelBackend {
     Scalar,
     Avx2,
+    Neon,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,6 +405,12 @@ unsafe fn avx2_set_u64x4_lane_order(
     unsafe { _mm256_set_epi64x(a3 as i64, a2 as i64, a1 as i64, a0 as i64) }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn neon_set_u64x2_lane_order(a0: u64, a1: u64) -> std::arch::aarch64::uint64x2_t {
+    unsafe { std::mem::transmute([a0, a1]) }
+}
+
 /// Build carry masks for 4 lanes from 4 ghost bits, placing each bit at `shift`.
 #[cfg(target_arch = "x86_64")]
 const fn avx2_build_carry_table(shift: u32) -> [[u64; 4]; 16] {
@@ -442,6 +449,40 @@ unsafe fn avx2_carry_mask_hi(bits4: u64) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::{__m256i, _mm256_loadu_si256};
     let row = unsafe { AVX2_CARRY_HI_TABLE.get_unchecked(bits4 as usize) };
     unsafe { _mm256_loadu_si256(row.as_ptr() as *const __m256i) }
+}
+
+#[cfg(target_arch = "aarch64")]
+const fn neon_build_carry_table(shift: u32) -> [[u64; 2]; 4] {
+    let mut table = [[0u64; 2]; 4];
+    let mut bits = 0usize;
+    while bits < 4 {
+        let b = bits as u64;
+        table[bits] = [(b & 1) << shift, ((b >> 1) & 1) << shift];
+        bits += 1;
+    }
+    table
+}
+
+#[cfg(target_arch = "aarch64")]
+const NEON_CARRY_LO_TABLE: [[u64; 2]; 4] = neon_build_carry_table(0);
+
+#[cfg(target_arch = "aarch64")]
+const NEON_CARRY_HI_TABLE: [[u64; 2]; 4] = neon_build_carry_table(63);
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn neon_carry_mask_lo(bits2: u64) -> std::arch::aarch64::uint64x2_t {
+    use std::arch::aarch64::vld1q_u64;
+    let row = unsafe { NEON_CARRY_LO_TABLE.get_unchecked(bits2 as usize) };
+    unsafe { vld1q_u64(row.as_ptr()) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn neon_carry_mask_hi(bits2: u64) -> std::arch::aarch64::uint64x2_t {
+    use std::arch::aarch64::vld1q_u64;
+    let row = unsafe { NEON_CARRY_HI_TABLE.get_unchecked(bits2 as usize) };
+    unsafe { vld1q_u64(row.as_ptr()) }
 }
 
 /// AVX2 kernel: processes 4 rows at a time using 256-bit SIMD.
@@ -583,6 +624,168 @@ pub unsafe fn advance_core_avx2(
     (changed, border, has_live)
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn neon_full_add(
+    a: std::arch::aarch64::uint64x2_t,
+    b: std::arch::aarch64::uint64x2_t,
+    c: std::arch::aarch64::uint64x2_t,
+) -> (
+    std::arch::aarch64::uint64x2_t,
+    std::arch::aarch64::uint64x2_t,
+) {
+    use std::arch::aarch64::{vandq_u64, veorq_u64, vorrq_u64};
+    unsafe {
+        let sum = veorq_u64(veorq_u64(a, b), c);
+        let carry = vorrq_u64(vorrq_u64(vandq_u64(a, b), vandq_u64(b, c)), vandq_u64(a, c));
+        (sum, carry)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn neon_half_add(
+    a: std::arch::aarch64::uint64x2_t,
+    b: std::arch::aarch64::uint64x2_t,
+) -> (
+    std::arch::aarch64::uint64x2_t,
+    std::arch::aarch64::uint64x2_t,
+) {
+    use std::arch::aarch64::{vandq_u64, veorq_u64};
+    unsafe { (veorq_u64(a, b), vandq_u64(a, b)) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn advance_core_neon(
+    current: &[u64; TILE_SIZE],
+    next: &mut [u64; TILE_SIZE],
+    ghost: &GhostZone,
+) -> (bool, BorderData, bool) {
+    use std::arch::aarch64::{
+        vandq_u64, vdupq_n_u64, veorq_u64, vgetq_lane_u64, vld1q_u64, vorrq_u64, vshlq_n_u64,
+        vshrq_n_u64, vst1q_u64,
+    };
+
+    let mut diff_acc = vdupq_n_u64(0);
+    let mut live_acc = vdupq_n_u64(0);
+    let mut border_west = 0u64;
+    let mut border_east = 0u64;
+    let current_ptr = current.as_ptr();
+    let next_ptr = next.as_mut_ptr();
+
+    let mut west_self_bits = ghost.west;
+    let mut east_self_bits = ghost.east;
+    let mut west_above_bits = (ghost.west >> 1) | ((ghost.nw as u64) << 63);
+    let mut east_above_bits = (ghost.east >> 1) | ((ghost.ne as u64) << 63);
+    let mut west_below_bits = (ghost.west << 1) | (ghost.sw as u64);
+    let mut east_below_bits = (ghost.east << 1) | (ghost.se as u64);
+
+    let mut border_north = 0u64;
+    let mut border_south = 0u64;
+
+    macro_rules! process_pair {
+        ($row_base:expr, $row_above:expr, $row_self:expr, $row_below:expr) => {{
+            let ghost_w_self = west_self_bits & 0b11;
+            let ghost_e_self = east_self_bits & 0b11;
+            let ghost_w_above = west_above_bits & 0b11;
+            let ghost_e_above = east_above_bits & 0b11;
+            let ghost_w_below = west_below_bits & 0b11;
+            let ghost_e_below = east_below_bits & 0b11;
+
+            let nw = vorrq_u64(vshlq_n_u64($row_above, 1), unsafe {
+                neon_carry_mask_lo(ghost_w_above)
+            });
+            let n = $row_above;
+            let ne = vorrq_u64(vshrq_n_u64($row_above, 1), unsafe {
+                neon_carry_mask_hi(ghost_e_above)
+            });
+            let w = vorrq_u64(vshlq_n_u64($row_self, 1), unsafe {
+                neon_carry_mask_lo(ghost_w_self)
+            });
+            let e = vorrq_u64(vshrq_n_u64($row_self, 1), unsafe {
+                neon_carry_mask_hi(ghost_e_self)
+            });
+            let sw = vorrq_u64(vshlq_n_u64($row_below, 1), unsafe {
+                neon_carry_mask_lo(ghost_w_below)
+            });
+            let s = $row_below;
+            let se = vorrq_u64(vshrq_n_u64($row_below, 1), unsafe {
+                neon_carry_mask_hi(ghost_e_below)
+            });
+
+            let (a0, a1) = unsafe { neon_full_add(nw, n, ne) };
+            let (s0, s1) = unsafe { neon_half_add(w, e) };
+            let (b0, b1) = unsafe { neon_full_add(sw, s, se) };
+            let (t0, t0c) = unsafe { neon_full_add(a0, s0, b0) };
+            let (u0, u0c) = unsafe { neon_full_add(a1, s1, b1) };
+            let (t1, t1c) = unsafe { neon_half_add(u0, t0c) };
+            let (t2, _) = unsafe { neon_half_add(u0c, t1c) };
+
+            let alive_mask = vandq_u64(veorq_u64(t2, vdupq_n_u64(u64::MAX)), t1);
+            let next_rows = vandq_u64(alive_mask, vorrq_u64(t0, $row_self));
+
+            let diff = veorq_u64(next_rows, $row_self);
+            diff_acc = vorrq_u64(diff_acc, diff);
+            live_acc = vorrq_u64(live_acc, next_rows);
+
+            unsafe {
+                vst1q_u64(next_ptr.add($row_base), next_rows);
+            }
+            let row0 = vgetq_lane_u64(next_rows, 0);
+            let row1 = vgetq_lane_u64(next_rows, 1);
+            border_west |= (row0 & 1) << $row_base;
+            border_west |= (row1 & 1) << ($row_base + 1);
+            border_east |= ((row0 >> 63) & 1) << $row_base;
+            border_east |= ((row1 >> 63) & 1) << ($row_base + 1);
+
+            if $row_base == 0 {
+                border_south = row0;
+            }
+            if $row_base == TILE_SIZE - 2 {
+                border_north = row1;
+            }
+        }};
+    }
+
+    let row_self_0 = unsafe { vld1q_u64(current_ptr) };
+    let row_above_0 = unsafe { vld1q_u64(current_ptr.add(1)) };
+    let row_below_0 = unsafe { neon_set_u64x2_lane_order(ghost.south, current[0]) };
+    process_pair!(0, row_above_0, row_self_0, row_below_0);
+    west_self_bits >>= 2;
+    east_self_bits >>= 2;
+    west_above_bits >>= 2;
+    east_above_bits >>= 2;
+    west_below_bits >>= 2;
+    east_below_bits >>= 2;
+
+    let mut row_base = 2usize;
+    while row_base < TILE_SIZE - 2 {
+        let row_self = unsafe { vld1q_u64(current_ptr.add(row_base)) };
+        let row_above = unsafe { vld1q_u64(current_ptr.add(row_base + 1)) };
+        let row_below = unsafe { vld1q_u64(current_ptr.add(row_base - 1)) };
+        process_pair!(row_base, row_above, row_self, row_below);
+        west_self_bits >>= 2;
+        east_self_bits >>= 2;
+        west_above_bits >>= 2;
+        east_above_bits >>= 2;
+        west_below_bits >>= 2;
+        east_below_bits >>= 2;
+        row_base += 2;
+    }
+
+    let last_base = TILE_SIZE - 2;
+    let row_self_last = unsafe { vld1q_u64(current_ptr.add(last_base)) };
+    let row_above_last = unsafe { neon_set_u64x2_lane_order(current[63], ghost.north) };
+    let row_below_last = unsafe { vld1q_u64(current_ptr.add(last_base - 1)) };
+    process_pair!(last_base, row_above_last, row_self_last, row_below_last);
+
+    let border = BorderData::from_edges(border_north, border_south, border_west, border_east);
+    let changed = (vgetq_lane_u64(diff_acc, 0) | vgetq_lane_u64(diff_acc, 1)) != 0;
+    let has_live = (vgetq_lane_u64(live_acc, 0) | vgetq_lane_u64(live_acc, 1)) != 0;
+    (changed, border, has_live)
+}
+
 #[inline(always)]
 pub fn advance_core(
     current: &[u64; TILE_SIZE],
@@ -602,16 +805,34 @@ pub fn advance_core(
                 advance_core_scalar(current, next, ghost)
             }
         }
+        KernelBackend::Neon => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if std::arch::is_aarch64_feature_detected!("neon") {
+                    unsafe { advance_core_neon(current, next, ghost) }
+                } else {
+                    advance_core_scalar(current, next, ghost)
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                advance_core_scalar(current, next, ghost)
+            }
+        }
     }
 }
 
+const CORE_BACKEND_SCALAR: u8 = 0;
+const CORE_BACKEND_AVX2: u8 = 1;
+const CORE_BACKEND_NEON: u8 = 2;
+
 #[inline(always)]
-unsafe fn advance_core_const<const USE_AVX2: bool>(
+unsafe fn advance_core_const<const CORE_BACKEND: u8>(
     current: &[u64; TILE_SIZE],
     next: &mut [u64; TILE_SIZE],
     ghost: &GhostZone,
 ) -> (bool, BorderData, bool) {
-    if USE_AVX2 {
+    if CORE_BACKEND == CORE_BACKEND_AVX2 {
         #[cfg(target_arch = "x86_64")]
         {
             return unsafe { advance_core_avx2(current, next, ghost) };
@@ -619,6 +840,16 @@ unsafe fn advance_core_const<const USE_AVX2: bool>(
         #[cfg(not(target_arch = "x86_64"))]
         {
             unreachable!("AVX2 backend selected on non-x86 target");
+        }
+    }
+    if CORE_BACKEND == CORE_BACKEND_NEON {
+        #[cfg(target_arch = "aarch64")]
+        {
+            return unsafe { advance_core_neon(current, next, ghost) };
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            unreachable!("NEON backend selected on non-aarch64 target");
         }
     }
     advance_core_scalar(current, next, ghost)
@@ -636,7 +867,7 @@ unsafe fn advance_core_const<const USE_AVX2: bool>(
 /// `meta_ptr[idx]`, `next_borders_ptr[idx]`, and `next_live_masks_ptr[idx]`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
+unsafe fn advance_tile_fused_impl<const CORE_BACKEND: u8>(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
     meta_ptr: *mut TileMeta,
@@ -708,7 +939,7 @@ unsafe fn advance_tile_fused_impl<const USE_AVX2: bool>(
     };
 
     let (changed, border, has_live) = if tile_has_live {
-        unsafe { advance_core_const::<USE_AVX2>(current, next, &ghost) }
+        unsafe { advance_core_const::<CORE_BACKEND>(current, next, &ghost) }
     } else {
         debug_assert!(tile_is_empty(current));
         advance_core_empty(next, &ghost)
@@ -767,7 +998,7 @@ pub unsafe fn advance_tile_fused_scalar(
     track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<false>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_SCALAR }>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -810,7 +1041,50 @@ pub unsafe fn advance_tile_fused_avx2(
     track_neighbor_influence: bool,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<true>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_AVX2 }>(
+            current_ptr,
+            next_ptr,
+            meta_ptr,
+            next_borders_north_ptr,
+            next_borders_south_ptr,
+            next_borders_west_ptr,
+            next_borders_east_ptr,
+            borders_north_read_ptr,
+            borders_south_read_ptr,
+            borders_west_read_ptr,
+            borders_east_read_ptr,
+            neighbors_ptr,
+            live_masks_read_ptr,
+            next_live_masks_ptr,
+            idx,
+            track_neighbor_influence,
+        )
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn advance_tile_fused_neon(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
+    meta_ptr: *mut TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+    track_neighbor_influence: bool,
+) -> TileAdvanceResult {
+    unsafe {
+        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -878,6 +1152,8 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     use super::advance_core_avx2;
+    #[cfg(target_arch = "aarch64")]
+    use super::advance_core_neon;
 
     use rand::RngCore;
     use rand::SeedableRng;
@@ -1062,6 +1338,34 @@ mod tests {
 
         tile[37] = 1 << 11;
         assert!(!tile_is_empty(&tile));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_matches_scalar_randomized() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xD00D_F00D_A11C_0DE5);
+        for _ in 0..2048 {
+            let current = random_tile(&mut rng);
+            let ghost = random_ghost(&mut rng);
+            let mut next_scalar = [0u64; TILE_SIZE];
+            let mut next_neon = [0u64; TILE_SIZE];
+
+            let scalar = advance_core_scalar(&current, &mut next_scalar, &ghost);
+            let neon = unsafe { advance_core_neon(&current, &mut next_neon, &ghost) };
+
+            assert_eq!(next_scalar, next_neon);
+            assert_eq!(scalar.0, neon.0);
+            assert_eq!(scalar.2, neon.2);
+            assert_eq!(scalar.1.north, neon.1.north);
+            assert_eq!(scalar.1.south, neon.1.south);
+            assert_eq!(scalar.1.west, neon.1.west);
+            assert_eq!(scalar.1.east, neon.1.east);
+            assert_eq!(scalar.1.live_mask(), neon.1.live_mask());
+        }
     }
 
     #[test]
