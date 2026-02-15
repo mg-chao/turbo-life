@@ -6,16 +6,6 @@ use super::arena::TileArena;
 use super::kernel::ghost_is_empty_from_live_masks_ptr;
 use super::tile::{MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
 
-const EXPAND_OFFSETS: [(i64, i64); 8] = [
-    (0, 1),   // N
-    (0, -1),  // S
-    (-1, 0),  // W
-    (1, 0),   // E
-    (-1, 1),  // NW
-    (1, 1),   // NE
-    (-1, -1), // SW
-    (1, -1),  // SE
-];
 const PARALLEL_PRUNE_CANDIDATES_MIN: usize = 512;
 const PRUNE_FILTER_CHUNK_MIN: usize = 64;
 const PRUNE_FILTER_CHUNK_MAX: usize = 512;
@@ -496,12 +486,11 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
             let src_i = (candidate >> 3) as usize;
             let dir = (candidate & 0b111) as usize;
             debug_assert!(arena.meta[src_i].occupied());
-            if arena.neighbors[src_i][dir] != NO_NEIGHBOR {
+            let src_idx = TileIdx(src_i as u32);
+            let (idx, was_allocated) = arena.allocate_absent_neighbor_from(src_idx, dir);
+            if !was_allocated {
                 continue;
             }
-            let (tx, ty) = arena.coords[src_i];
-            let (dx, dy) = EXPAND_OFFSETS[dir];
-            let idx = arena.allocate_absent((tx + dx, ty + dy));
             arena.meta[idx.index()].population = 0;
             arena.mark_changed_new_unique(idx);
         }

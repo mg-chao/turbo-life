@@ -14,6 +14,50 @@ const INITIAL_TILE_CAPACITY: usize = 256;
 const MIN_GROW_TILES: usize = 256;
 const ACTIVE_SORT_RADIX_BUCKETS: usize = 1 << 16;
 pub(crate) const CHANGED_INFLUENCE_ALL: u8 = 0xFF;
+const DIR_OFFSETS: [(i64, i64); 8] = [
+    (0, 1),
+    (0, -1),
+    (-1, 0),
+    (1, 0),
+    (-1, 1),
+    (1, 1),
+    (-1, -1),
+    (1, -1),
+];
+const DIR_REVERSE: [usize; 8] = [1, 0, 3, 2, 7, 6, 5, 4];
+const UNKNOWN_HINT: i8 = -1;
+
+const fn direction_index_from_offset(dx: i64, dy: i64) -> i8 {
+    let mut dir = 0usize;
+    while dir < DIR_OFFSETS.len() {
+        let (odx, ody) = DIR_OFFSETS[dir];
+        if odx == dx && ody == dy {
+            return dir as i8;
+        }
+        dir += 1;
+    }
+    UNKNOWN_HINT
+}
+
+const fn build_expand_neighbor_hints() -> [[i8; 8]; 8] {
+    let mut table = [[UNKNOWN_HINT; 8]; 8];
+    let mut expand_dir = 0usize;
+    while expand_dir < 8 {
+        let (ex, ey) = DIR_OFFSETS[expand_dir];
+        let mut target_neighbor_dir = 0usize;
+        while target_neighbor_dir < 8 {
+            let (nx, ny) = DIR_OFFSETS[target_neighbor_dir];
+            let sx = ex + nx;
+            let sy = ey + ny;
+            table[expand_dir][target_neighbor_dir] = direction_index_from_offset(sx, sy);
+            target_neighbor_dir += 1;
+        }
+        expand_dir += 1;
+    }
+    table
+}
+
+const EXPAND_NEIGHBOR_HINTS: [[i8; 8]; 8] = build_expand_neighbor_hints();
 
 #[derive(Clone)]
 pub struct BorderPlanes {
@@ -611,34 +655,35 @@ impl TileArena {
     }
 
     #[inline]
+    unsafe fn link_neighbor_pair_raw(
+        neighbors_ptr: *mut Neighbors,
+        meta_ptr: *mut TileMeta,
+        tile_i: usize,
+        dir_idx: usize,
+        neighbor_i: usize,
+    ) {
+        let reverse_dir = DIR_REVERSE[dir_idx];
+        unsafe {
+            (*neighbors_ptr.add(tile_i))[dir_idx] = neighbor_i as u32;
+            (*neighbors_ptr.add(neighbor_i))[reverse_dir] = tile_i as u32;
+            (*meta_ptr.add(tile_i)).missing_mask &= !(1u8 << dir_idx);
+            (*meta_ptr.add(neighbor_i)).missing_mask &= !(1u8 << reverse_dir);
+        }
+    }
+
+    #[inline]
     fn link_neighbors(&mut self, idx: TileIdx, coord: (i64, i64)) {
         let (cx, cy) = coord;
-        let idx_val = idx.0;
         let i = idx.index();
         let neighbors_ptr = self.neighbors.as_mut_ptr();
         let meta_ptr = self.meta.as_mut_ptr();
 
-        // Unrolled direction offsets: (dx, dy, dir_index, reverse_dir_index)
-        const DIRS: [(i64, i64, usize, usize); 8] = [
-            (0, 1, 0, 1),   // North -> reverse South
-            (0, -1, 1, 0),  // South -> reverse North
-            (-1, 0, 2, 3),  // West -> reverse East
-            (1, 0, 3, 2),   // East -> reverse West
-            (-1, 1, 4, 7),  // NW -> reverse SE
-            (1, 1, 5, 6),   // NE -> reverse SW
-            (-1, -1, 6, 5), // SW -> reverse NE
-            (1, -1, 7, 4),  // SE -> reverse NW
-        ];
-
-        for &(dx, dy, dir_idx, rev_idx) in &DIRS {
+        for (dir_idx, (dx, dy)) in DIR_OFFSETS.iter().copied().enumerate() {
             if let Some(neighbor_idx) = self.coord_to_idx.get(cx + dx, cy + dy) {
                 let ni = neighbor_idx.index();
                 // SAFETY: idx and neighbor_idx are valid arena indices.
                 unsafe {
-                    (*neighbors_ptr.add(i))[dir_idx] = neighbor_idx.0;
-                    (*neighbors_ptr.add(ni))[rev_idx] = idx_val;
-                    (*meta_ptr.add(i)).missing_mask &= !(1u8 << dir_idx);
-                    (*meta_ptr.add(ni)).missing_mask &= !(1u8 << rev_idx);
+                    Self::link_neighbor_pair_raw(neighbors_ptr, meta_ptr, i, dir_idx, ni);
                 }
             }
         }
@@ -653,6 +698,104 @@ impl TileArena {
 
         self.link_neighbors(idx, coord);
         idx
+    }
+
+    #[inline]
+    pub(crate) fn allocate_absent_neighbor_from(
+        &mut self,
+        src: TileIdx,
+        dir_idx: usize,
+    ) -> (TileIdx, bool) {
+        debug_assert!(dir_idx < 8);
+        let src_i = src.index();
+        let existing_neighbor = self.neighbors[src_i][dir_idx];
+        if existing_neighbor != NO_NEIGHBOR {
+            return (TileIdx(existing_neighbor), false);
+        }
+
+        let (sx, sy) = self.coords[src_i];
+        let (dx, dy) = DIR_OFFSETS[dir_idx];
+        let coord = (sx + dx, sy + dy);
+        if let Some(existing_idx) = self.coord_to_idx.get(coord.0, coord.1) {
+            unsafe {
+                Self::link_neighbor_pair_raw(
+                    self.neighbors.as_mut_ptr(),
+                    self.meta.as_mut_ptr(),
+                    src_i,
+                    dir_idx,
+                    existing_idx.index(),
+                );
+            }
+            return (existing_idx, false);
+        }
+
+        let idx = self.allocate_slot(coord);
+        self.coord_to_idx.insert(coord.0, coord.1, idx);
+        self.occupied_count += 1;
+
+        let idx_i = idx.index();
+        let src_neighbors = self.neighbors[src_i];
+        let neighbors_ptr = self.neighbors.as_mut_ptr();
+        let meta_ptr = self.meta.as_mut_ptr();
+
+        // Direct source-to-target link.
+        unsafe {
+            Self::link_neighbor_pair_raw(
+                neighbors_ptr,
+                meta_ptr,
+                idx_i,
+                DIR_REVERSE[dir_idx],
+                src_i,
+            );
+        }
+
+        // Resolve and stitch remaining target-neighbor links.
+        for target_neighbor_dir in 0..8usize {
+            if target_neighbor_dir == DIR_REVERSE[dir_idx] {
+                continue;
+            }
+
+            let (ndx, ndy) = DIR_OFFSETS[target_neighbor_dir];
+            let neighbor_coord = (coord.0 + ndx, coord.1 + ndy);
+            let hint = EXPAND_NEIGHBOR_HINTS[dir_idx][target_neighbor_dir];
+            let neighbor_raw = if hint >= 0 {
+                let hinted_raw = src_neighbors[hint as usize];
+                if hinted_raw != NO_NEIGHBOR {
+                    let hinted_i = hinted_raw as usize;
+                    if self.meta[hinted_i].occupied() && self.coords[hinted_i] == neighbor_coord {
+                        hinted_raw
+                    } else {
+                        self.coord_to_idx
+                            .get(neighbor_coord.0, neighbor_coord.1)
+                            .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
+                    }
+                } else {
+                    self.coord_to_idx
+                        .get(neighbor_coord.0, neighbor_coord.1)
+                        .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
+                }
+            } else {
+                self.coord_to_idx
+                    .get(neighbor_coord.0, neighbor_coord.1)
+                    .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
+            };
+
+            if neighbor_raw == NO_NEIGHBOR {
+                continue;
+            }
+
+            unsafe {
+                Self::link_neighbor_pair_raw(
+                    neighbors_ptr,
+                    meta_ptr,
+                    idx_i,
+                    target_neighbor_dir,
+                    neighbor_raw as usize,
+                );
+            }
+        }
+
+        (idx, true)
     }
 
     #[allow(dead_code)]
@@ -682,9 +825,7 @@ impl TileArena {
             for dir_idx in 0..8u8 {
                 let neighbor_raw = nb[dir_idx as usize];
                 if neighbor_raw != NO_NEIGHBOR {
-                    // Reverse direction index lookup table.
-                    const REV: [usize; 8] = [1, 0, 3, 2, 7, 6, 5, 4];
-                    let rev = REV[dir_idx as usize];
+                    let rev = DIR_REVERSE[dir_idx as usize];
                     let ni = neighbor_raw as usize;
                     (*neighbors_ptr.add(ni))[rev] = NO_NEIGHBOR;
                     (*meta_ptr.add(ni)).missing_mask |= 1u8 << rev;
@@ -717,7 +858,7 @@ impl TileArena {
 #[cfg(test)]
 mod tests {
     use super::{CHANGED_INFLUENCE_ALL, TileArena};
-    use crate::turbolife::tile::BorderData;
+    use crate::turbolife::tile::{BorderData, NO_NEIGHBOR};
 
     #[test]
     fn mark_changed_dedupes_after_kernel_queue_becomes_unsynced() {
@@ -856,5 +997,43 @@ mod tests {
         assert_eq!(border1.east, 0);
         assert_eq!(arena.border_live_masks[0][ri], 0);
         assert_eq!(arena.border_live_masks[1][ri], 0);
+    }
+
+    #[test]
+    fn allocate_absent_neighbor_from_falls_back_when_hint_is_missing() {
+        let mut arena = TileArena::new();
+        let src = arena.allocate((0, 0));
+        let west = arena.allocate((-1, 0));
+
+        let src_i = src.index();
+        let west_i = west.index();
+        arena.neighbors[src_i][2] = NO_NEIGHBOR;
+        arena.meta[src_i].missing_mask |= 1u8 << 2;
+        assert_eq!(arena.neighbors[west_i][3], src.0);
+
+        let (north, allocated) = arena.allocate_absent_neighbor_from(src, 0);
+        assert!(allocated);
+        assert_eq!(arena.coords[north.index()], (0, 1));
+        assert_eq!(arena.neighbors[north.index()][6], west.0);
+        assert_eq!(arena.neighbors[west_i][5], north.0);
+    }
+
+    #[test]
+    fn allocate_absent_neighbor_from_ignores_stale_hint_coordinates() {
+        let mut arena = TileArena::new();
+        let src = arena.allocate((0, 0));
+        let west = arena.allocate((-1, 0));
+        let wrong = arena.allocate((42, 42));
+
+        let src_i = src.index();
+        arena.neighbors[src_i][2] = wrong.0;
+        arena.meta[src_i].missing_mask &= !(1u8 << 2);
+
+        let (north, allocated) = arena.allocate_absent_neighbor_from(src, 0);
+        assert!(allocated);
+        assert_eq!(arena.coords[north.index()], (0, 1));
+        assert_eq!(arena.neighbors[north.index()][6], west.0);
+        assert_eq!(arena.neighbors[west.index()][5], north.0);
+        assert_eq!(arena.neighbors[wrong.index()][5], NO_NEIGHBOR);
     }
 }
