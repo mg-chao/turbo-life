@@ -66,24 +66,6 @@ fn active_set_is_sorted(active_set: &[TileIdx]) -> bool {
     active_set.windows(2).all(|pair| pair[0].0 <= pair[1].0)
 }
 
-#[inline(always)]
-fn active_set_is_dense_contiguous(active_set: &[TileIdx], occupied_count: usize) -> bool {
-    if occupied_count > u32::MAX as usize || active_set.len() != occupied_count {
-        return false;
-    }
-    if active_set.first().map(|idx| idx.0) != Some(1)
-        || active_set.last().map(|idx| idx.0) != Some(occupied_count as u32)
-    {
-        return false;
-    }
-    for (i, &idx) in active_set.iter().enumerate() {
-        if idx.0 != (i + 1) as u32 {
-            return false;
-        }
-    }
-    true
-}
-
 #[inline]
 fn radix_sort_active_set(arena: &mut TileArena) {
     let len = arena.active_set.len();
@@ -227,6 +209,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     }
     if changed_count == 0 {
         arena.active_set.clear();
+        arena.active_set_dense_contiguous = false;
         return;
     }
     if had_synced_changed_bits {
@@ -243,7 +226,8 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     if dense_rebuild {
         let can_reuse_full_contiguous_active = arena.free_list.is_empty()
             && arena.occupied_count + 1 == arena.meta.len()
-            && active_set_is_dense_contiguous(&arena.active_set, arena.occupied_count);
+            && arena.active_set.len() == arena.occupied_count
+            && arena.active_set_dense_contiguous;
         if can_reuse_full_contiguous_active {
             return;
         }
@@ -264,6 +248,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                     ptr.add(i).write(TileIdx((i + 1) as u32));
                 }
             }
+            arena.active_set_dense_contiguous = true;
         } else {
             for (word_idx, &word) in arena.occupied_bits.iter().enumerate() {
                 let mut bits = word;
@@ -278,11 +263,13 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                     bits &= bits - 1;
                 }
             }
+            arena.active_set_dense_contiguous = false;
         }
         return;
     }
 
     arena.active_set.clear();
+    arena.active_set_dense_contiguous = false;
 
     let bitmap_rebuild = should_use_bitmap_active_rebuild(arena.occupied_count, changed_count);
     if bitmap_rebuild {
@@ -380,6 +367,14 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                 bits &= bits - 1;
             }
         }
+        if arena.free_list.is_empty()
+            && arena.occupied_count + 1 == meta_len
+            && arena.active_set.len() == arena.occupied_count
+            && arena.active_set.first().map(|idx| idx.0) == Some(1)
+            && arena.active_set.last().map(|idx| idx.0) == Some(arena.occupied_count as u32)
+        {
+            arena.active_set_dense_contiguous = true;
+        }
         return;
     }
 
@@ -470,10 +465,23 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     // use a stable two-pass radix sort. The 8k-32k band still skips sorting
     // to keep rebuild costs bounded.
     let active_len = arena.active_set.len();
+    let mut active_set_sorted = false;
     if active_len <= ACTIVE_SORT_STD_MAX {
         arena.active_set.sort_unstable_by_key(|idx| idx.0);
+        active_set_sorted = true;
     } else if active_len >= ACTIVE_SORT_RADIX_MIN {
         radix_sort_active_set(arena);
+        active_set_sorted = true;
+    }
+
+    if active_set_sorted
+        && arena.free_list.is_empty()
+        && arena.occupied_count + 1 == arena.meta.len()
+        && arena.active_set.len() == arena.occupied_count
+        && arena.active_set.first().map(|idx| idx.0) == Some(1)
+        && arena.active_set.last().map(|idx| idx.0) == Some(arena.occupied_count as u32)
+    {
+        arena.active_set_dense_contiguous = true;
     }
 }
 
@@ -697,6 +705,35 @@ mod tests {
         for (i, idx) in arena.active_set.iter().enumerate() {
             assert_eq!(idx.0, (i + 1) as u32);
         }
+    }
+
+    #[test]
+    fn dense_rebuild_skips_stale_contiguous_cache_after_growth() {
+        let mut arena = TileArena::new();
+        let tile_count = 4_096usize;
+
+        for x in 0..tile_count {
+            let idx = arena.allocate((x as i64, 0));
+            arena.mark_changed(idx);
+        }
+        rebuild_active_set(&mut arena);
+        assert_eq!(arena.active_set.len(), tile_count);
+        assert!(arena.active_set_dense_contiguous);
+
+        let new_idx = arena.allocate((tile_count as i64, 0));
+        for i in 1..=tile_count {
+            arena.mark_changed(TileIdx(i as u32));
+        }
+        arena.mark_changed(new_idx);
+
+        rebuild_active_set(&mut arena);
+
+        assert_eq!(arena.active_set.len(), arena.occupied_count);
+        assert_eq!(arena.active_set.first().map(|idx| idx.0), Some(1));
+        assert_eq!(
+            arena.active_set.last().map(|idx| idx.0),
+            Some(arena.occupied_count as u32)
+        );
     }
 
     #[test]

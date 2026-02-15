@@ -193,6 +193,7 @@ pub struct TileArena {
     pub occupied_bits: Vec<u64>,
 
     pub active_set: Vec<TileIdx>,
+    pub active_set_dense_contiguous: bool,
     active_epoch: u16,
     active_tags: Vec<u16>,
     pub active_marks_words: Vec<u64>,
@@ -255,6 +256,7 @@ impl TileArena {
             occupied_count: 0,
             occupied_bits: vec![0],
             active_set: Vec::new(),
+            active_set_dense_contiguous: false,
             active_epoch: 1,
             active_tags: vec![0],
             active_marks_words: vec![0],
@@ -618,6 +620,7 @@ impl TileArena {
 
     #[inline]
     fn allocate_slot(&mut self, coord: (i64, i64)) -> TileIdx {
+        self.active_set_dense_contiguous = false;
         if let Some(recycled) = self.free_list.pop() {
             let i = recycled.index();
             // Use ptr::write_bytes for fast zeroing of cell buffers (512 bytes each).
@@ -812,6 +815,7 @@ impl TileArena {
         if !self.meta[i].occupied() {
             return;
         }
+        self.active_set_dense_contiguous = false;
         self.clear_occupied_bit(i);
         self.clear_changed_mark(i);
         self.ensure_active_tag_capacity(i);
@@ -963,6 +967,20 @@ mod tests {
 
         assert_eq!(recycled, idx);
         assert_eq!(arena.active_tags[recycled.index()], 0);
+    }
+
+    #[test]
+    fn structural_slot_changes_invalidate_dense_active_cache_flag() {
+        let mut arena = TileArena::new();
+        let idx = arena.allocate((0, 0));
+
+        arena.active_set_dense_contiguous = true;
+        let _ = arena.allocate((1, 0));
+        assert!(!arena.active_set_dense_contiguous);
+
+        arena.active_set_dense_contiguous = true;
+        arena.release(idx);
+        assert!(!arena.active_set_dense_contiguous);
     }
 
     #[test]
