@@ -104,7 +104,7 @@ const ASSUME_CHANGED_NEON_MIN_ACTIVE: usize = 2_048;
 #[cfg(target_arch = "aarch64")]
 const ASSUME_CHANGED_NEON_MIN_CHURN_PCT: usize = 85;
 #[cfg(target_arch = "aarch64")]
-const _: [(); 1] = [(); ((ASSUME_CHANGED_NEON_MIN_CHURN_PCT > 0
+const _: [(); 1] = [(); ((ASSUME_CHANGED_NEON_MIN_CHURN_PCT >= 80
     && ASSUME_CHANGED_NEON_MIN_CHURN_PCT <= 100) as usize)];
 
 #[cfg(target_arch = "aarch64")]
