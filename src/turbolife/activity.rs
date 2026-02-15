@@ -16,7 +16,7 @@ const EXPAND_OFFSETS: [(i64, i64); 8] = [
     (-1, -1), // SW
     (1, -1),  // SE
 ];
-const PARALLEL_PRUNE_CANDIDATES_MIN: usize = 256;
+const PARALLEL_PRUNE_CANDIDATES_MIN: usize = 512;
 const PRUNE_FILTER_CHUNK_MIN: usize = 64;
 const PRUNE_FILTER_CHUNK_MAX: usize = 512;
 const PARALLEL_PRUNE_BITMAP_MIN: usize = 65_536;
