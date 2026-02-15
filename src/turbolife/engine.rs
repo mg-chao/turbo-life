@@ -89,6 +89,10 @@ const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 16;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 512;
 #[cfg(target_arch = "x86_64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
+#[cfg(target_arch = "aarch64")]
+// Keep software tile-data prefetch opt-in on ARM64; hardware prefetchers tend
+// to do as well or better for this workload in current benchmarks.
+const PREFETCH_TILE_DATA_AARCH64: bool = false;
 const PRECISE_INFLUENCE_MAX_ACTIVE: usize = 256;
 #[cfg(target_arch = "aarch64")]
 const ASSUME_CHANGED_NEON_MIN_ACTIVE: usize = 2_048;
@@ -1040,27 +1044,29 @@ impl TurboLife {
 
                         #[cfg(target_arch = "aarch64")]
                         unsafe {
-                            // Prefetch tile i+2 cell buffers into L2.
-                            if i + 2 < active_len {
-                                let far_ii = (*active_ptr.add(i + 2)).index();
-                                prefetch_l2_read(current_ptr.add(far_ii));
-                                prefetch_l2_write(next_ptr.add(far_ii));
-                            }
-                            // Prefetch tile i+1 into L1, plus neighbor metadata and borders.
-                            if i + 1 < active_len {
-                                let near_ii = (*active_ptr.add(i + 1)).index();
-                                prefetch_l1_read(current_ptr.add(near_ii));
-                                prefetch_l1_write(next_ptr.add(near_ii));
-                                prefetch_l1_read(neighbors_ptr.add(near_ii));
-                                if prefetch_neighbor_borders {
-                                    prefetch_neighbor_border_lines(
-                                        neighbors_ptr,
-                                        borders_north_read_ptr,
-                                        borders_south_read_ptr,
-                                        borders_west_read_ptr,
-                                        borders_east_read_ptr,
-                                        near_ii,
-                                    );
+                            if PREFETCH_TILE_DATA_AARCH64 {
+                                // Prefetch tile i+2 cell buffers into L2.
+                                if i + 2 < active_len {
+                                    let far_ii = (*active_ptr.add(i + 2)).index();
+                                    prefetch_l2_read(current_ptr.add(far_ii));
+                                    prefetch_l2_write(next_ptr.add(far_ii));
+                                }
+                                // Prefetch tile i+1 into L1, plus neighbor metadata and borders.
+                                if i + 1 < active_len {
+                                    let near_ii = (*active_ptr.add(i + 1)).index();
+                                    prefetch_l1_read(current_ptr.add(near_ii));
+                                    prefetch_l1_write(next_ptr.add(near_ii));
+                                    prefetch_l1_read(neighbors_ptr.add(near_ii));
+                                    if prefetch_neighbor_borders {
+                                        prefetch_neighbor_border_lines(
+                                            neighbors_ptr,
+                                            borders_north_read_ptr,
+                                            borders_south_read_ptr,
+                                            borders_west_read_ptr,
+                                            borders_east_read_ptr,
+                                            near_ii,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1148,27 +1154,29 @@ impl TurboLife {
 
                         #[cfg(target_arch = "aarch64")]
                         unsafe {
-                            // Prefetch tile i+2 cell buffers into L2.
-                            if i + 2 < active_len {
-                                let far_ii = (*active_ptr.add(i + 2)).index();
-                                prefetch_l2_read(current_ptr.add(far_ii));
-                                prefetch_l2_write(next_ptr.add(far_ii));
-                            }
-                            // Prefetch tile i+1 into L1, plus neighbor metadata and borders.
-                            if i + 1 < active_len {
-                                let near_ii = (*active_ptr.add(i + 1)).index();
-                                prefetch_l1_read(current_ptr.add(near_ii));
-                                prefetch_l1_write(next_ptr.add(near_ii));
-                                prefetch_l1_read(neighbors_ptr.add(near_ii));
-                                if prefetch_neighbor_borders {
-                                    prefetch_neighbor_border_lines(
-                                        neighbors_ptr,
-                                        borders_north_read_ptr,
-                                        borders_south_read_ptr,
-                                        borders_west_read_ptr,
-                                        borders_east_read_ptr,
-                                        near_ii,
-                                    );
+                            if PREFETCH_TILE_DATA_AARCH64 {
+                                // Prefetch tile i+2 cell buffers into L2.
+                                if i + 2 < active_len {
+                                    let far_ii = (*active_ptr.add(i + 2)).index();
+                                    prefetch_l2_read(current_ptr.add(far_ii));
+                                    prefetch_l2_write(next_ptr.add(far_ii));
+                                }
+                                // Prefetch tile i+1 into L1, plus neighbor metadata and borders.
+                                if i + 1 < active_len {
+                                    let near_ii = (*active_ptr.add(i + 1)).index();
+                                    prefetch_l1_read(current_ptr.add(near_ii));
+                                    prefetch_l1_write(next_ptr.add(near_ii));
+                                    prefetch_l1_read(neighbors_ptr.add(near_ii));
+                                    if prefetch_neighbor_borders {
+                                        prefetch_neighbor_border_lines(
+                                            neighbors_ptr,
+                                            borders_north_read_ptr,
+                                            borders_south_read_ptr,
+                                            borders_west_read_ptr,
+                                            borders_east_read_ptr,
+                                            near_ii,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1382,25 +1390,27 @@ impl TurboLife {
 
                     #[cfg(target_arch = "aarch64")]
                     unsafe {
-                        if $i + 2 < $end {
-                            let far_ii = (*active_ptr.get().add($i + 2)).index();
-                            prefetch_l2_read(current_ptr.get().add(far_ii));
-                            prefetch_l2_write(next_ptr.get().add(far_ii));
-                        }
-                        if $i + 1 < $end {
-                            let near_ii = (*active_ptr.get().add($i + 1)).index();
-                            prefetch_l1_read(current_ptr.get().add(near_ii));
-                            prefetch_l1_write(next_ptr.get().add(near_ii));
-                            prefetch_l1_read(neighbors_ptr.get().add(near_ii));
-                            if prefetch_neighbor_borders {
-                                prefetch_neighbor_border_lines(
-                                    neighbors_ptr.get(),
-                                    borders_north_read_ptr.get(),
-                                    borders_south_read_ptr.get(),
-                                    borders_west_read_ptr.get(),
-                                    borders_east_read_ptr.get(),
-                                    near_ii,
-                                );
+                        if PREFETCH_TILE_DATA_AARCH64 {
+                            if $i + 2 < $end {
+                                let far_ii = (*active_ptr.get().add($i + 2)).index();
+                                prefetch_l2_read(current_ptr.get().add(far_ii));
+                                prefetch_l2_write(next_ptr.get().add(far_ii));
+                            }
+                            if $i + 1 < $end {
+                                let near_ii = (*active_ptr.get().add($i + 1)).index();
+                                prefetch_l1_read(current_ptr.get().add(near_ii));
+                                prefetch_l1_write(next_ptr.get().add(near_ii));
+                                prefetch_l1_read(neighbors_ptr.get().add(near_ii));
+                                if prefetch_neighbor_borders {
+                                    prefetch_neighbor_border_lines(
+                                        neighbors_ptr.get(),
+                                        borders_north_read_ptr.get(),
+                                        borders_south_read_ptr.get(),
+                                        borders_west_read_ptr.get(),
+                                        borders_east_read_ptr.get(),
+                                        near_ii,
+                                    );
+                                }
                             }
                         }
                     }
