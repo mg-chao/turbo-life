@@ -30,9 +30,9 @@ if [ ! -x "$PROFDATA_BIN" ]; then
     fi
 fi
 
-PGO_DIR="target/pgo-data"
-GEN_TARGET_DIR="target/pgo-gen"
-USE_TARGET_DIR="target/pgo-use"
+PGO_DIR="$ROOT_DIR/target/pgo-data"
+GEN_TARGET_DIR="$ROOT_DIR/target/pgo-gen"
+USE_TARGET_DIR="$ROOT_DIR/target/pgo-use"
 PROFDATA_FILE="$PGO_DIR/turbo-life.profdata"
 
 rm -rf -- "$PGO_DIR" "$GEN_TARGET_DIR" "$USE_TARGET_DIR"
