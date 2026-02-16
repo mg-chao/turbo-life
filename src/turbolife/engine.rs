@@ -83,13 +83,13 @@ const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 #[cfg(target_arch = "x86_64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 #[cfg(target_arch = "aarch64")]
-const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 2_048;
+const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 32_768;
 #[cfg(target_arch = "aarch64")]
 const PREFETCH_TILE_DATA_AARCH64: bool = true;
-// Tuned for Apple perf cores: i+3 gives L2 enough lookahead without pushing
+// Tuned for Apple perf cores: i+2 gives L2 enough lookahead without pushing
 // the soon-to-be-used tile out of L1 under heavy frontier churn.
 #[cfg(target_arch = "aarch64")]
-const PREFETCH_TILE_FAR_AHEAD_AARCH64: usize = 3;
+const PREFETCH_TILE_FAR_AHEAD_AARCH64: usize = 2;
 #[cfg(target_arch = "aarch64")]
 const PREFETCH_TILE_NEAR_AHEAD_AARCH64: usize = 1;
 #[cfg(target_arch = "aarch64")]

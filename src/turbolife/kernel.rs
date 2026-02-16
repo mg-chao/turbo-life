@@ -682,11 +682,10 @@ unsafe fn neon_half_add(
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool>(
+unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool, const FORCE_STORE: bool>(
     current: &[u64; TILE_SIZE],
     next: &mut [u64; TILE_SIZE],
     ghost: &GhostZone,
-    force_store: bool,
 ) -> (bool, BorderData, bool) {
     use std::arch::aarch64::{
         vandq_u64, vbicq_u64, veorq_u64, vgetq_lane_u64, vld1q_u64, vorrq_u64, vshlq_n_u64,
@@ -752,7 +751,7 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool>(
                 let diff = veorq_u64(next_rows, $row_self);
                 let pair_changed = (vgetq_lane_u64(diff, 0) | vgetq_lane_u64(diff, 1)) != 0;
                 changed |= pair_changed;
-                if force_store || pair_changed {
+                if FORCE_STORE || pair_changed {
                     unsafe {
                         vst1q_u64(next_ptr.add($row_base), next_rows);
                     }
@@ -844,7 +843,11 @@ pub unsafe fn advance_core_neon(
     ghost: &GhostZone,
     force_store: bool,
 ) -> (bool, BorderData, bool) {
-    unsafe { advance_core_neon_impl::<true>(current, next, ghost, force_store) }
+    if force_store {
+        unsafe { advance_core_neon_impl::<true, true>(current, next, ghost) }
+    } else {
+        unsafe { advance_core_neon_impl::<true, false>(current, next, ghost) }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -854,7 +857,7 @@ unsafe fn advance_core_neon_assume_changed(
     next: &mut [u64; TILE_SIZE],
     ghost: &GhostZone,
 ) -> (bool, BorderData, bool) {
-    unsafe { advance_core_neon_impl::<false>(current, next, ghost, true) }
+    unsafe { advance_core_neon_impl::<false, true>(current, next, ghost) }
 }
 
 #[inline(always)]
