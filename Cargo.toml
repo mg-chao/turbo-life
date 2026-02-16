@@ -34,7 +34,7 @@ opt-level = 2
 # ── Release profile: maximum runtime performance ────────────────────────
 [profile.release]
 opt-level = 3
-lto = "fat"                  # whole-program LTO across all crates
+lto = "off"                  # benchmarked on main.rs harness: lower wall-clock median on Apple M4
 codegen-units = 1            # single CGU for best optimization
 panic = "abort"              # smaller binary, no unwind overhead
 strip = "symbols"            # strip symbols for smaller binary
