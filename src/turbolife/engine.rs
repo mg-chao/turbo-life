@@ -84,9 +84,13 @@ const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 #[cfg(target_arch = "aarch64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 32_768;
-#[cfg(target_arch = "aarch64")]
 // AArch64 PRFM hints regressed end-to-end throughput on the main harness;
 // keep them compiled but disabled by default for this target.
+#[cfg(target_arch = "aarch64")]
+#[cfg(feature = "aggressive-prefetch-aarch64")]
+const PREFETCH_TILE_DATA_AARCH64: bool = true;
+#[cfg(target_arch = "aarch64")]
+#[cfg(not(feature = "aggressive-prefetch-aarch64"))]
 const PREFETCH_TILE_DATA_AARCH64: bool = false;
 // Tuned for Apple perf cores: i+3 gives L2 enough lookahead while i+1 keeps
 // the immediate tile in L1 under heavy frontier churn.
@@ -109,6 +113,10 @@ const ASSUME_CHANGED_NEON_MIN_ACTIVE: usize = 2_048;
 // self-inflate churn metrics. Keep this gate conservative so we only enter it
 // when churn is already very high.
 #[cfg(target_arch = "aarch64")]
+#[cfg(feature = "aggressive-neon-assume-changed")]
+const ASSUME_CHANGED_NEON_MIN_CHURN_PCT: usize = 84;
+#[cfg(target_arch = "aarch64")]
+#[cfg(not(feature = "aggressive-neon-assume-changed"))]
 const ASSUME_CHANGED_NEON_MIN_CHURN_PCT: usize = 88;
 #[cfg(target_arch = "aarch64")]
 const _: [(); 1] = [(); ((ASSUME_CHANGED_NEON_MIN_CHURN_PCT >= 80

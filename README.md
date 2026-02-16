@@ -57,6 +57,31 @@ To pass CLI args through to both training and benchmarking harness runs, append 
 ./scripts/build_pgo.sh 3 9 --threads 6 --kernel neon
 ```
 
+Max-performance auto-tuner (builds multiple compiler/feature variants, benchmarks each with `src/main.rs`, rejects regressions, then optionally tests PGO on top of the best non-PGO candidate):
+
+```
+./scripts/build_maxperf.sh 7 3
+```
+
+Arguments:
+
+- First positional: benchmark runs per candidate (default `7`).
+- Second positional: PGO training runs (default `3`).
+- Remaining args are passed through to `src/main.rs` for both candidate benchmarking and PGO training.
+
+Output binary:
+
+```
+target/maxperf/best/turbo-life
+```
+
+Auto-tuned feature flags used by `build_maxperf.sh`:
+
+- `aggressive-prefetch-aarch64` — enables AArch64 PRFM prefetch hints.
+- `aggressive-neon-assume-changed` — lowers the NEON assume-changed churn gate.
+
+Both are opt-in only and are rejected automatically when they regress.
+
 ## Threading behavior
 
 - TurboLife defaults to a memory-bandwidth-aware cap derived from physical CPU cores for its internal rayon thread pool.

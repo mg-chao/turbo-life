@@ -5,6 +5,17 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 description = "A high-performance Conway's Game of Life (B3/S23) engine in Rust."
 
+[features]
+default = []
+# AArch64-only: enables extra PRFM prefetch hints in the fused kernel loops.
+# Useful for machine-specific auto-tuning; disabled by default because it can
+# regress on some CPUs/workloads.
+aggressive-prefetch-aarch64 = []
+# AArch64-only: lowers the churn gate for NEON assume-changed mode.
+# This can improve high-churn workloads on some systems, but is not universally
+# faster, so it is opt-in for auto-tuning.
+aggressive-neon-assume-changed = []
+
 [dependencies]
 rand = "0.9.2"
 rayon = "1.10"
