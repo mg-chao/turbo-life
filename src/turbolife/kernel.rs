@@ -786,7 +786,33 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool>(
 
     let mut prev_above = row_above_0;
     let mut row_base = 2usize;
-    while row_base < TILE_SIZE - 2 {
+    while row_base < TILE_SIZE - 4 {
+        let row_below_0 = prev_above;
+        let row_self_0 = unsafe { vld1q_u64(current_ptr.add(row_base)) };
+        let row_above_0 = unsafe { vld1q_u64(current_ptr.add(row_base + 1)) };
+        let _ = process_pair!(row_base, row_above_0, row_self_0, row_below_0);
+        west_self_bits >>= 2;
+        east_self_bits >>= 2;
+        west_above_bits >>= 2;
+        east_above_bits >>= 2;
+        west_below_bits >>= 2;
+        east_below_bits >>= 2;
+
+        let row_below_1 = row_above_0;
+        let row_self_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 2)) };
+        let row_above_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 3)) };
+        let _ = process_pair!(row_base + 2, row_above_1, row_self_1, row_below_1);
+        prev_above = row_above_1;
+        west_self_bits >>= 2;
+        east_self_bits >>= 2;
+        west_above_bits >>= 2;
+        east_above_bits >>= 2;
+        west_below_bits >>= 2;
+        east_below_bits >>= 2;
+        row_base += 4;
+    }
+
+    if row_base < TILE_SIZE - 2 {
         let row_below = prev_above;
         let row_self = unsafe { vld1q_u64(current_ptr.add(row_base)) };
         let row_above = unsafe { vld1q_u64(current_ptr.add(row_base + 1)) };
@@ -798,7 +824,6 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool>(
         east_above_bits >>= 2;
         west_below_bits >>= 2;
         east_below_bits >>= 2;
-        row_base += 2;
     }
 
     let last_base = TILE_SIZE - 2;
