@@ -597,6 +597,11 @@ fn dynamic_parallel_chunk_size(
 }
 
 #[inline(always)]
+fn active_broadcast_workers(worker_count: usize, broadcast_threads: usize) -> usize {
+    worker_count.min(broadcast_threads)
+}
+
+#[inline(always)]
 fn should_queue_prune(has_live: bool, changed: bool, emit_changed: bool) -> bool {
     !has_live && (!changed || !emit_changed)
 }
@@ -1734,104 +1739,69 @@ impl TurboLife {
             }
 
             macro_rules! parallel_kernel_static {
-                ($advance:path, $chunk_size:expr, $track:expr) => {{
-                    rayon::scope(|scope| {
-                        for worker_id in 0..worker_count {
-                            scope.spawn(move |_| {
-                                let start = worker_id.saturating_mul($chunk_size);
-                                if start >= active_len {
-                                    return;
-                                }
-                                let end = start.saturating_add($chunk_size).min(active_len);
-                                let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
-                                scratch.reserve_for_additional_work(
-                                    end - start,
-                                    emit_changed,
-                                    $track,
-                                );
-                                for i in start..end {
-                                    process_work_item!($advance, scratch, i, end, $track);
-                                }
-                            });
+                ($advance:path, $track:expr) => {{
+                    let _ = rayon::broadcast(|ctx| {
+                        let active_workers =
+                            active_broadcast_workers(worker_count, ctx.num_threads());
+                        let worker_id = ctx.index();
+                        if worker_id >= active_workers {
+                            return;
+                        }
+                        let chunk_size = active_len.div_ceil(active_workers);
+                        let start = worker_id.saturating_mul(chunk_size);
+                        if start >= active_len {
+                            return;
+                        }
+                        let end = start.saturating_add(chunk_size).min(active_len);
+                        let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
+                        scratch.reserve_for_additional_work(end - start, emit_changed, $track);
+                        for i in start..end {
+                            process_work_item!($advance, scratch, i, end, $track);
                         }
                     });
                 }};
             }
 
             if use_static_schedule {
-                let chunk_size = active_len.div_ceil(worker_count);
-
                 if track_neighbor_influence {
                     match backend {
                         KernelBackend::Scalar => {
-                            parallel_kernel_static!(
-                                advance_tile_fused_scalar_track,
-                                chunk_size,
-                                true
-                            )
+                            parallel_kernel_static!(advance_tile_fused_scalar_track, true)
                         }
                         KernelBackend::Avx2 => {
                             #[cfg(target_arch = "x86_64")]
                             {
-                                parallel_kernel_static!(
-                                    advance_tile_fused_avx2_track,
-                                    chunk_size,
-                                    true
-                                )
+                                parallel_kernel_static!(advance_tile_fused_avx2_track, true)
                             }
                             #[cfg(not(target_arch = "x86_64"))]
                             {
-                                parallel_kernel_static!(
-                                    advance_tile_fused_scalar_track,
-                                    chunk_size,
-                                    true
-                                )
+                                parallel_kernel_static!(advance_tile_fused_scalar_track, true)
                             }
                         }
                         KernelBackend::Neon => {
                             #[cfg(target_arch = "aarch64")]
                             {
-                                parallel_kernel_static!(
-                                    advance_tile_fused_neon_track,
-                                    chunk_size,
-                                    true
-                                )
+                                parallel_kernel_static!(advance_tile_fused_neon_track, true)
                             }
                             #[cfg(not(target_arch = "aarch64"))]
                             {
-                                parallel_kernel_static!(
-                                    advance_tile_fused_scalar_track,
-                                    chunk_size,
-                                    true
-                                )
+                                parallel_kernel_static!(advance_tile_fused_scalar_track, true)
                             }
                         }
                     }
                 } else {
                     match backend {
                         KernelBackend::Scalar => {
-                            parallel_kernel_static!(
-                                advance_tile_fused_scalar_no_track,
-                                chunk_size,
-                                false
-                            )
+                            parallel_kernel_static!(advance_tile_fused_scalar_no_track, false)
                         }
                         KernelBackend::Avx2 => {
                             #[cfg(target_arch = "x86_64")]
                             {
-                                parallel_kernel_static!(
-                                    advance_tile_fused_avx2_no_track,
-                                    chunk_size,
-                                    false
-                                )
+                                parallel_kernel_static!(advance_tile_fused_avx2_no_track, false)
                             }
                             #[cfg(not(target_arch = "x86_64"))]
                             {
-                                parallel_kernel_static!(
-                                    advance_tile_fused_scalar_no_track,
-                                    chunk_size,
-                                    false
-                                )
+                                parallel_kernel_static!(advance_tile_fused_scalar_no_track, false)
                             }
                         }
                         KernelBackend::Neon => {
@@ -1840,24 +1810,15 @@ impl TurboLife {
                                 if assume_changed_neon {
                                     parallel_kernel_static!(
                                         advance_tile_fused_neon_assume_changed_no_track,
-                                        chunk_size,
                                         false
                                     )
                                 } else {
-                                    parallel_kernel_static!(
-                                        advance_tile_fused_neon_no_track,
-                                        chunk_size,
-                                        false
-                                    )
+                                    parallel_kernel_static!(advance_tile_fused_neon_no_track, false)
                                 }
                             }
                             #[cfg(not(target_arch = "aarch64"))]
                             {
-                                parallel_kernel_static!(
-                                    advance_tile_fused_scalar_no_track,
-                                    chunk_size,
-                                    false
-                                )
+                                parallel_kernel_static!(advance_tile_fused_scalar_no_track, false)
                             }
                         }
                     }
@@ -1869,27 +1830,28 @@ impl TurboLife {
                 macro_rules! parallel_kernel_lockfree {
                     ($advance:path, $track:expr) => {{
                         let cursor_ref = &cursor;
-                        rayon::scope(|scope| {
-                            for worker_id in 0..worker_count {
-                                scope.spawn(move |_| {
-                                    let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
-                                    loop {
-                                        let start =
-                                            cursor_ref.fetch_add(chunk_size, Ordering::Relaxed);
-                                        if start >= active_len {
-                                            break;
-                                        }
-                                        let end = start.saturating_add(chunk_size).min(active_len);
-                                        scratch.reserve_for_additional_work(
-                                            end - start,
-                                            emit_changed,
-                                            $track,
-                                        );
-                                        for i in start..end {
-                                            process_work_item!($advance, scratch, i, end, $track);
-                                        }
-                                    }
-                                });
+                        let _ = rayon::broadcast(|ctx| {
+                            let active_workers =
+                                active_broadcast_workers(worker_count, ctx.num_threads());
+                            let worker_id = ctx.index();
+                            if worker_id >= active_workers {
+                                return;
+                            }
+                            let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
+                            loop {
+                                let start = cursor_ref.fetch_add(chunk_size, Ordering::Relaxed);
+                                if start >= active_len {
+                                    break;
+                                }
+                                let end = start.saturating_add(chunk_size).min(active_len);
+                                scratch.reserve_for_additional_work(
+                                    end - start,
+                                    emit_changed,
+                                    $track,
+                                );
+                                for i in start..end {
+                                    process_work_item!($advance, scratch, i, end, $track);
+                                }
                             }
                         });
                     }};
@@ -2194,9 +2156,9 @@ mod tests {
 
     use super::{
         KernelBackend, PARALLEL_KERNEL_MIN_ACTIVE, TILE_SIZE_I64, TurboLife, TurboLifeConfig,
-        auto_pool_thread_count_for_physical, churn_at_most_percent, churn_below_percent,
-        dynamic_parallel_chunk_size, dynamic_target_chunks_per_worker, memory_parallel_cap,
-        physical_core_count,
+        active_broadcast_workers, auto_pool_thread_count_for_physical, churn_at_most_percent,
+        churn_below_percent, dynamic_parallel_chunk_size, dynamic_target_chunks_per_worker,
+        memory_parallel_cap, physical_core_count,
     };
 
     const PARALLEL_TEST_TILE_GRID: i64 = 12;
@@ -2280,6 +2242,14 @@ mod tests {
         assert_eq!(memory_parallel_cap(11), 8);
         assert_eq!(memory_parallel_cap(12), 8);
         assert_eq!(memory_parallel_cap(16), 8);
+    }
+
+    #[test]
+    fn active_broadcast_workers_caps_to_available_threads() {
+        assert_eq!(active_broadcast_workers(1, 1), 1);
+        assert_eq!(active_broadcast_workers(2, 8), 2);
+        assert_eq!(active_broadcast_workers(8, 2), 2);
+        assert_eq!(active_broadcast_workers(0, 4), 0);
     }
 
     #[test]
