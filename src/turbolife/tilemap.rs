@@ -21,12 +21,11 @@ const MY: u64 = 0x6c62_272e_07bb_0142;
 #[inline(always)]
 pub(crate) fn tile_hash(x: i64, y: i64) -> u64 {
     let mut h = (x as u64).wrapping_mul(MX) ^ (y as u64).wrapping_mul(MY).rotate_right(32);
-    // SplitMix64 finalizer to avalanche coordinate patterns across all bits.
-    h ^= h >> 30;
-    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    h ^= h >> 27;
-    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
-    h ^ (h >> 31)
+    // One-multiply avalanche (faster than full SplitMix finalizer on the
+    // coordinate-lookup hot path while preserving strong diffusion).
+    h ^= h >> 32;
+    h = h.wrapping_mul(0xd6e8_feb8_6659_fd93);
+    h ^ (h >> 32)
 }
 
 // ── Slot layout ─────────────────────────────────────────────────────────

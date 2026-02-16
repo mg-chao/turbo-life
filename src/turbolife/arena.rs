@@ -375,7 +375,12 @@ impl TileArena {
 
     #[inline(always)]
     pub fn idx_at(&self, coord: (i64, i64)) -> Option<TileIdx> {
-        self.coord_to_idx.get(coord.0, coord.1)
+        let idx = self.coord_to_idx.get(coord.0, coord.1)?;
+        if self.idx_matches_live_coord(idx, coord) {
+            Some(idx)
+        } else {
+            None
+        }
     }
 
     #[inline(always)]
@@ -387,11 +392,27 @@ impl TileArena {
     #[inline(always)]
     fn idx_at_cached_hashed(&mut self, coord: (i64, i64), hash: u64) -> Option<TileIdx> {
         if let Some(idx) = self.coord_lookup_cache_get(coord, hash) {
-            return Some(idx);
+            if self.idx_matches_live_coord(idx, coord) {
+                return Some(idx);
+            }
+            self.coord_lookup_cache_clear(coord, idx, hash);
         }
         let idx = self.coord_to_idx.get_hashed(coord.0, coord.1, hash)?;
-        self.coord_lookup_cache_set(coord, idx, hash);
-        Some(idx)
+        if self.idx_matches_live_coord(idx, coord) {
+            self.coord_lookup_cache_set(coord, idx, hash);
+            Some(idx)
+        } else {
+            // Defensive cleanup in case a stale coordinate mapping survives.
+            self.coord_to_idx.remove_hashed(coord.0, coord.1, hash);
+            self.coord_lookup_cache_clear(coord, idx, hash);
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn idx_matches_live_coord(&self, idx: TileIdx, coord: (i64, i64)) -> bool {
+        let i = idx.index();
+        self.meta[i].occupied() && self.coords[i] == coord
     }
 
     #[inline(always)]
@@ -776,8 +797,8 @@ impl TileArena {
 
     #[inline]
     pub(crate) fn allocate_absent(&mut self, coord: (i64, i64)) -> TileIdx {
-        debug_assert!(self.coord_to_idx.get(coord.0, coord.1).is_none());
         let hash = tile_hash(coord.0, coord.1);
+        debug_assert!(self.idx_at(coord).is_none());
         let idx = self.allocate_slot(coord);
         self.coord_to_idx.insert_hashed(coord.0, coord.1, idx, hash);
         self.coord_lookup_cache_set(coord, idx, hash);
@@ -1065,6 +1086,18 @@ mod tests {
 
         assert_eq!(recycled, idx);
         assert_eq!(arena.active_tags[recycled.index()], 0);
+    }
+
+    #[test]
+    fn release_removes_coord_map_entry() {
+        let mut arena = TileArena::new();
+        let idx = arena.allocate((0, 0));
+        assert_eq!(arena.coord_to_idx.len(), 1);
+
+        arena.release(idx);
+
+        assert_eq!(arena.coord_to_idx.len(), 0);
+        assert!(arena.idx_at((0, 0)).is_none());
     }
 
     #[test]
