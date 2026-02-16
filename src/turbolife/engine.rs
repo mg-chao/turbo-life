@@ -1134,7 +1134,8 @@ impl TurboLife {
         let changed_len = self.arena.changed_scratch.len();
         self.arena.expand_buf.clear();
         self.arena.prune_buf.clear();
-        let use_serial_cache = active_len <= SERIAL_CACHE_MAX_ACTIVE;
+        let use_serial_cache =
+            active_len <= SERIAL_CACHE_MAX_ACTIVE && self.backend != KernelBackend::Neon;
         if use_serial_cache {
             self.tile_cache.begin_step();
         }

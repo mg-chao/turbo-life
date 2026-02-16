@@ -12,6 +12,7 @@ const PRUNE_FILTER_CHUNK_MAX: usize = 512;
 const PARALLEL_PRUNE_BITMAP_MIN: usize = 4_096;
 const ACTIVE_SORT_STD_MAX: usize = 8_192;
 const ACTIVE_SORT_RADIX_MIN: usize = 32_768;
+const ACTIVE_SORT_RADIX_BUCKETS: usize = 1 << 16;
 const ACTIVE_BITMAP_REBUILD_MIN_OCCUPIED: usize = 2_048;
 const ACTIVE_BITMAP_REBUILD_MAX_OCCUPIED: usize = 8_192;
 const ACTIVE_BITMAP_REBUILD_MIN_CHANGED: usize = 1_024;
@@ -64,7 +65,26 @@ fn should_use_bitmap_active_rebuild(occupied_count: usize, changed_count: usize)
 
 #[inline(always)]
 fn active_set_is_sorted(active_set: &[TileIdx]) -> bool {
-    active_set.windows(2).all(|pair| pair[0].0 <= pair[1].0)
+    let len = active_set.len();
+    if len < 2 {
+        return true;
+    }
+    // SAFETY: len >= 2 and `ptr` comes from `active_set`, so `ptr.add(i)` is
+    // valid for every i in 0..len.
+    unsafe {
+        let ptr = active_set.as_ptr();
+        let mut prev = (*ptr).0;
+        let mut i = 1usize;
+        while i < len {
+            let curr = (*ptr.add(i)).0;
+            if prev > curr {
+                return false;
+            }
+            prev = curr;
+            i += 1;
+        }
+    }
+    true
 }
 
 #[inline]
@@ -74,53 +94,93 @@ fn radix_sort_active_set(arena: &mut TileArena) {
         return;
     }
 
-    debug_assert!(len <= u32::MAX as usize);
-    debug_assert_eq!(arena.active_sort_counts.len(), 1 << 16);
+    if len > u32::MAX as usize || arena.active_sort_counts.len() != ACTIVE_SORT_RADIX_BUCKETS {
+        arena.active_set.sort_unstable_by_key(|idx| idx.0);
+        return;
+    }
+
+    debug_assert_eq!(arena.active_sort_counts.len(), ACTIVE_SORT_RADIX_BUCKETS);
 
     arena.active_sort_scratch.clear();
     arena.active_sort_scratch.resize(len, TileIdx(0));
     let counts = &mut arena.active_sort_counts;
     counts.fill(0);
 
-    for &idx in arena.active_set.iter() {
-        counts[(idx.0 & 0xFFFF) as usize] += 1;
+    // SAFETY: `src_ptr` comes from `active_set` and we only read 0..len.
+    // Bucket indices are masked to 16 bits and fit in `counts`.
+    unsafe {
+        let src_ptr = arena.active_set.as_ptr();
+        let mut i = 0usize;
+        while i < len {
+            let idx = (*src_ptr.add(i)).0;
+            *counts.get_unchecked_mut((idx & 0xFFFF) as usize) += 1;
+            i += 1;
+        }
     }
 
     let mut prefix = 0u32;
-    for count in counts.iter_mut() {
+    let mut bucket = 0usize;
+    while bucket < counts.len() {
+        let count = unsafe { counts.get_unchecked_mut(bucket) };
         let next = prefix + *count;
         *count = prefix;
         prefix = next;
+        bucket += 1;
     }
 
-    for &idx in arena.active_set.iter() {
-        let bucket = (idx.0 & 0xFFFF) as usize;
-        let dst = counts[bucket] as usize;
-        unsafe {
-            *arena.active_sort_scratch.get_unchecked_mut(dst) = idx;
+    // SAFETY: `src_ptr` and `dst_ptr` come from vectors sized to `len`.
+    // Prefix counts produce destinations in 0..len.
+    unsafe {
+        let src_ptr = arena.active_set.as_ptr();
+        let dst_ptr = arena.active_sort_scratch.as_mut_ptr();
+        let mut i = 0usize;
+        while i < len {
+            let idx = *src_ptr.add(i);
+            let bucket = (idx.0 & 0xFFFF) as usize;
+            let dst = *counts.get_unchecked(bucket) as usize;
+            dst_ptr.add(dst).write(idx);
+            *counts.get_unchecked_mut(bucket) = (dst + 1) as u32;
+            i += 1;
         }
-        counts[bucket] += 1;
     }
 
     counts.fill(0);
-    for &idx in arena.active_sort_scratch.iter() {
-        counts[(idx.0 >> 16) as usize] += 1;
+    // SAFETY: `src_ptr` comes from `active_sort_scratch` and we only read 0..len.
+    // High 16-bit buckets are always in range for `counts`.
+    unsafe {
+        let src_ptr = arena.active_sort_scratch.as_ptr();
+        let mut i = 0usize;
+        while i < len {
+            let idx = (*src_ptr.add(i)).0;
+            *counts.get_unchecked_mut((idx >> 16) as usize) += 1;
+            i += 1;
+        }
     }
 
     prefix = 0;
-    for count in counts.iter_mut() {
+    bucket = 0;
+    while bucket < counts.len() {
+        let count = unsafe { counts.get_unchecked_mut(bucket) };
         let next = prefix + *count;
         *count = prefix;
         prefix = next;
+        bucket += 1;
     }
 
-    for &idx in arena.active_sort_scratch.iter() {
-        let bucket = (idx.0 >> 16) as usize;
-        let dst = counts[bucket] as usize;
-        unsafe {
-            *arena.active_set.get_unchecked_mut(dst) = idx;
+    // SAFETY: `src_ptr` and `dst_ptr` come from vectors sized to `len`.
+    // Prefix counts produce destinations in 0..len.
+    unsafe {
+        let src_ptr = arena.active_sort_scratch.as_ptr();
+        let dst_ptr = arena.active_set.as_mut_ptr();
+        let mut i = 0usize;
+        while i < len {
+            let idx = *src_ptr.add(i);
+            let bucket = (idx.0 >> 16) as usize;
+            let dst = *counts.get_unchecked(bucket) as usize;
+            dst_ptr.add(dst).write(idx);
+            *counts.get_unchecked_mut(bucket) = (dst + 1) as u32;
+            i += 1;
         }
-        counts[bucket] += 1;
     }
 }
 
