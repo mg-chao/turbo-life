@@ -228,6 +228,44 @@ unsafe fn prefetch_neighbor_border_lines(
 static PHYSICAL_CORES: OnceLock<usize> = OnceLock::new();
 static AUTO_KERNEL_BACKEND: OnceLock<KernelBackend> = OnceLock::new();
 
+#[cfg(target_os = "macos")]
+#[inline]
+fn apple_perf_core_count() -> Option<usize> {
+    use core::ffi::{c_char, c_int, c_void};
+
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const c_char,
+            oldp: *mut c_void,
+            oldlenp: *mut usize,
+            newp: *const c_void,
+            newlen: usize,
+        ) -> c_int;
+    }
+
+    const PERF_CORE_SYSCTL: &[u8] = b"hw.perflevel0.physicalcpu\0";
+    let mut value = 0u32;
+    let mut len = std::mem::size_of_val(&value);
+    let rc = unsafe {
+        // SAFETY:
+        // - `PERF_CORE_SYSCTL` is NUL-terminated and lives for the call.
+        // - `value` and `len` are valid mutable out-pointers.
+        // - `newp` is null with `newlen = 0`, so no write-input buffer is used.
+        sysctlbyname(
+            PERF_CORE_SYSCTL.as_ptr().cast(),
+            (&mut value as *mut u32).cast(),
+            &mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if rc == 0 && len == std::mem::size_of_val(&value) && value > 0 {
+        Some(value as usize)
+    } else {
+        None
+    }
+}
+
 #[derive(Default)]
 #[repr(align(64))]
 struct WorkerScratch {
@@ -417,7 +455,16 @@ fn calibrate_auto_backend() -> KernelBackend {
 
 #[inline]
 fn physical_core_count() -> usize {
-    *PHYSICAL_CORES.get_or_init(|| num_cpus::get_physical().max(1))
+    *PHYSICAL_CORES.get_or_init(|| {
+        let physical = num_cpus::get_physical().max(1);
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(perf) = apple_perf_core_count() {
+                return perf.min(physical).max(1);
+            }
+        }
+        physical
+    })
 }
 
 #[inline]
@@ -2020,6 +2067,7 @@ mod tests {
         KernelBackend, PARALLEL_KERNEL_MIN_ACTIVE, TILE_SIZE_I64, TurboLife, TurboLifeConfig,
         auto_pool_thread_count_for_physical, churn_at_most_percent, churn_below_percent,
         dynamic_parallel_chunk_size, dynamic_target_chunks_per_worker, memory_parallel_cap,
+        physical_core_count,
     };
 
     const PARALLEL_TEST_TILE_GRID: i64 = 12;
@@ -2191,7 +2239,7 @@ mod tests {
     #[test]
     fn default_pool_uses_auto_thread_count() {
         let engine = TurboLife::new();
-        let expected = auto_pool_thread_count_for_physical(num_cpus::get_physical().max(1));
+        let expected = auto_pool_thread_count_for_physical(physical_core_count());
         assert_eq!(engine.pool.current_num_threads(), expected);
     }
 
