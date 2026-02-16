@@ -381,6 +381,11 @@ impl TileArena {
     #[inline(always)]
     pub fn idx_at_cached(&mut self, coord: (i64, i64)) -> Option<TileIdx> {
         let hash = tile_hash(coord.0, coord.1);
+        self.idx_at_cached_hashed(coord, hash)
+    }
+
+    #[inline(always)]
+    fn idx_at_cached_hashed(&mut self, coord: (i64, i64), hash: u64) -> Option<TileIdx> {
         if let Some(idx) = self.coord_lookup_cache_get(coord, hash) {
             return Some(idx);
         }
@@ -757,7 +762,9 @@ impl TileArena {
         let meta_ptr = self.meta.as_mut_ptr();
 
         for (dir_idx, (dx, dy)) in DIR_OFFSETS.iter().copied().enumerate() {
-            if let Some(neighbor_idx) = self.idx_at_cached((cx + dx, cy + dy)) {
+            let neighbor_coord = (cx + dx, cy + dy);
+            let hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
+            if let Some(neighbor_idx) = self.idx_at_cached_hashed(neighbor_coord, hash) {
                 let ni = neighbor_idx.index();
                 // SAFETY: idx and neighbor_idx are valid arena indices.
                 unsafe {
@@ -797,7 +804,7 @@ impl TileArena {
         let (dx, dy) = DIR_OFFSETS[dir_idx];
         let coord = (sx + dx, sy + dy);
         let hash = tile_hash(coord.0, coord.1);
-        if let Some(existing_idx) = self.idx_at_cached(coord) {
+        if let Some(existing_idx) = self.idx_at_cached_hashed(coord, hash) {
             unsafe {
                 Self::link_neighbor_pair_raw(
                     self.neighbors.as_mut_ptr(),
@@ -847,15 +854,18 @@ impl TileArena {
                     if self.meta[hinted_i].occupied() && self.coords[hinted_i] == neighbor_coord {
                         hinted_raw
                     } else {
-                        self.idx_at_cached(neighbor_coord)
+                        let neighbor_hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
+                        self.idx_at_cached_hashed(neighbor_coord, neighbor_hash)
                             .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
                     }
                 } else {
-                    self.idx_at_cached(neighbor_coord)
+                    let neighbor_hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
+                    self.idx_at_cached_hashed(neighbor_coord, neighbor_hash)
                         .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
                 }
             } else {
-                self.idx_at_cached(neighbor_coord)
+                let neighbor_hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
+                self.idx_at_cached_hashed(neighbor_coord, neighbor_hash)
                     .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
             };
 

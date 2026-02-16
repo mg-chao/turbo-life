@@ -1,4 +1,3 @@
-use rayon::prelude::*;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(target_arch = "x86_64")]
@@ -89,7 +88,7 @@ const PARALLEL_DYNAMIC_TARGET_CHUNKS_HIGH_ACTIVE: usize = 16_384;
 const PARALLEL_DYNAMIC_MID_CHURN_PCT: usize = 35;
 const _: [(); 1] = [(); (PARALLEL_DYNAMIC_MID_CHURN_PCT <= 100) as usize];
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 16;
-const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 512;
+const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 #[cfg(target_arch = "x86_64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 #[cfg(target_arch = "aarch64")]
@@ -1581,16 +1580,20 @@ impl TurboLife {
 
             macro_rules! parallel_kernel_static {
                 ($advance:path, $chunk_size:expr, $track:expr) => {{
-                    (0..worker_count).into_par_iter().for_each(|worker_id| {
-                        let start = worker_id.saturating_mul($chunk_size);
-                        if start >= active_len {
-                            return;
-                        }
-                        let end = (start + $chunk_size).min(active_len);
-                        let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
-                        scratch.reserve_for_additional_work(end - start, $track);
-                        for i in start..end {
-                            process_work_item!($advance, scratch, i, end, $track);
+                    rayon::scope(|scope| {
+                        for worker_id in 0..worker_count {
+                            scope.spawn(move |_| {
+                                let start = worker_id.saturating_mul($chunk_size);
+                                if start >= active_len {
+                                    return;
+                                }
+                                let end = start.saturating_add($chunk_size).min(active_len);
+                                let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
+                                scratch.reserve_for_additional_work(end - start, $track);
+                                for i in start..end {
+                                    process_work_item!($advance, scratch, i, end, $track);
+                                }
+                            });
                         }
                     });
                 }};
@@ -1706,18 +1709,24 @@ impl TurboLife {
 
                 macro_rules! parallel_kernel_lockfree {
                     ($advance:path, $track:expr) => {{
-                        (0..worker_count).into_par_iter().for_each(|worker_id| {
-                            let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
-                            loop {
-                                let start = cursor.fetch_add(chunk_size, Ordering::Relaxed);
-                                if start >= active_len {
-                                    break;
-                                }
-                                let end = (start + chunk_size).min(active_len);
-                                scratch.reserve_for_additional_work(end - start, $track);
-                                for i in start..end {
-                                    process_work_item!($advance, scratch, i, end, $track);
-                                }
+                        let cursor_ref = &cursor;
+                        rayon::scope(|scope| {
+                            for worker_id in 0..worker_count {
+                                scope.spawn(move |_| {
+                                    let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
+                                    loop {
+                                        let start =
+                                            cursor_ref.fetch_add(chunk_size, Ordering::Relaxed);
+                                        if start >= active_len {
+                                            break;
+                                        }
+                                        let end = start.saturating_add(chunk_size).min(active_len);
+                                        scratch.reserve_for_additional_work(end - start, $track);
+                                        for i in start..end {
+                                            process_work_item!($advance, scratch, i, end, $track);
+                                        }
+                                    }
+                                });
                             }
                         });
                     }};
@@ -2143,7 +2152,7 @@ mod tests {
         assert_eq!(small, 100);
         assert_eq!(medium_balanced, 512);
         assert_eq!(medium_high, 256);
-        assert_eq!(large, 512);
+        assert_eq!(large, 2_048);
     }
 
     #[test]
