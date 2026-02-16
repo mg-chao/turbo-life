@@ -77,7 +77,7 @@ const KERNEL_CHUNK_MIN: usize = 32;
 const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
 const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 32_768;
 // Dynamic scheduler chunking target per worker.
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 2;
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 4;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 16;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 #[cfg(target_arch = "x86_64")]
@@ -579,6 +579,11 @@ fn dynamic_parallel_chunk_size(
         .max(workers);
     let size = active_len.div_ceil(target_chunks);
     size.clamp(PARALLEL_DYNAMIC_CHUNK_MIN, PARALLEL_DYNAMIC_CHUNK_MAX)
+}
+
+#[inline(always)]
+fn should_queue_prune(has_live: bool, changed: bool, emit_changed: bool) -> bool {
+    !has_live && (!changed || !emit_changed)
 }
 
 #[inline(always)]
@@ -1289,21 +1294,22 @@ impl TurboLife {
                             )
                         };
 
-                        if result.changed {
-                            if emit_changed {
+                        let changed = result.changed;
+                        let has_live = result.has_live;
+                        if changed && emit_changed {
+                            unsafe {
+                                vec_push_unchecked(&mut self.arena.changed_list, idx);
+                            }
+                            if $track {
                                 unsafe {
-                                    vec_push_unchecked(&mut self.arena.changed_list, idx);
-                                }
-                                if $track {
-                                    unsafe {
-                                        vec_push_unchecked(
-                                            &mut self.arena.changed_influence,
-                                            result.neighbor_influence_mask,
-                                        );
-                                    }
+                                    vec_push_unchecked(
+                                        &mut self.arena.changed_influence,
+                                        result.neighbor_influence_mask,
+                                    );
                                 }
                             }
-                        } else if !result.has_live {
+                        }
+                        if should_queue_prune(has_live, changed, emit_changed) {
                             unsafe {
                                 vec_push_unchecked(&mut self.arena.prune_buf, idx);
                             }
@@ -1413,21 +1419,22 @@ impl TurboLife {
                             )
                         };
 
-                        if result.changed {
-                            if emit_changed {
+                        let changed = result.changed;
+                        let has_live = result.has_live;
+                        if changed && emit_changed {
+                            unsafe {
+                                vec_push_unchecked(&mut self.arena.changed_list, idx);
+                            }
+                            if $track {
                                 unsafe {
-                                    vec_push_unchecked(&mut self.arena.changed_list, idx);
-                                }
-                                if $track {
-                                    unsafe {
-                                        vec_push_unchecked(
-                                            &mut self.arena.changed_influence,
-                                            result.neighbor_influence_mask,
-                                        );
-                                    }
+                                    vec_push_unchecked(
+                                        &mut self.arena.changed_influence,
+                                        result.neighbor_influence_mask,
+                                    );
                                 }
                             }
-                        } else if !result.has_live {
+                        }
+                        if should_queue_prune(has_live, changed, emit_changed) {
                             unsafe {
                                 vec_push_unchecked(&mut self.arena.prune_buf, idx);
                             }
@@ -1675,21 +1682,22 @@ impl TurboLife {
                         )
                     };
 
-                    if result.changed {
-                        if emit_changed {
+                    let changed = result.changed;
+                    let has_live = result.has_live;
+                    if changed && emit_changed {
+                        unsafe {
+                            vec_push_unchecked(&mut ($scratch).changed, idx);
+                        }
+                        if $track {
                             unsafe {
-                                vec_push_unchecked(&mut ($scratch).changed, idx);
-                            }
-                            if $track {
-                                unsafe {
-                                    vec_push_unchecked(
-                                        &mut ($scratch).changed_influence,
-                                        result.neighbor_influence_mask,
-                                    );
-                                }
+                                vec_push_unchecked(
+                                    &mut ($scratch).changed_influence,
+                                    result.neighbor_influence_mask,
+                                );
                             }
                         }
-                    } else if !result.has_live {
+                    }
+                    if should_queue_prune(has_live, changed, emit_changed) {
                         unsafe {
                             vec_push_unchecked(&mut ($scratch).prune, idx);
                         }
@@ -2272,12 +2280,12 @@ mod tests {
 
     #[test]
     fn dynamic_chunk_targets_stay_flat_across_frontier_sizes() {
-        assert_eq!(dynamic_target_chunks_per_worker(1, 1), 2);
-        assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 2);
-        assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 2);
-        assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 2);
-        assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 2);
-        assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 2);
+        assert_eq!(dynamic_target_chunks_per_worker(1, 1), 4);
+        assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 4);
+        assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 4);
+        assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 4);
+        assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 4);
+        assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 4);
     }
 
     #[test]
@@ -2297,10 +2305,23 @@ mod tests {
         let medium_balanced = dynamic_parallel_chunk_size(4_096, 1_200, 4);
         let medium_high = dynamic_parallel_chunk_size(4_096, 3_000, 4);
         let large = dynamic_parallel_chunk_size(65_536, 50_000, 4);
-        assert_eq!(small, 100);
-        assert_eq!(medium_balanced, 512);
-        assert_eq!(medium_high, 512);
+        assert_eq!(small, 50);
+        assert_eq!(medium_balanced, 256);
+        assert_eq!(medium_high, 256);
         assert_eq!(large, 2_048);
+    }
+
+    #[test]
+    fn prune_queue_gate_handles_assume_changed_mode() {
+        assert!(!super::should_queue_prune(true, false, true));
+        assert!(!super::should_queue_prune(true, true, true));
+        assert!(!super::should_queue_prune(true, false, false));
+        assert!(!super::should_queue_prune(true, true, false));
+
+        assert!(super::should_queue_prune(false, false, true));
+        assert!(!super::should_queue_prune(false, true, true));
+        assert!(super::should_queue_prune(false, false, false));
+        assert!(super::should_queue_prune(false, true, false));
     }
 
     #[test]
