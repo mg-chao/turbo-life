@@ -85,7 +85,9 @@ const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 #[cfg(target_arch = "aarch64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 32_768;
 #[cfg(target_arch = "aarch64")]
-const PREFETCH_TILE_DATA_AARCH64: bool = true;
+// AArch64 PRFM hints regressed end-to-end throughput on the main harness;
+// keep them compiled but disabled by default for this target.
+const PREFETCH_TILE_DATA_AARCH64: bool = false;
 // Tuned for Apple perf cores: i+3 gives L2 enough lookahead while i+1 keeps
 // the immediate tile in L1 under heavy frontier churn.
 #[cfg(target_arch = "aarch64")]
