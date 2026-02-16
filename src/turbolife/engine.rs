@@ -10,14 +10,14 @@ use super::arena::TileArena;
 #[cfg(target_arch = "x86_64")]
 use super::kernel::advance_core;
 #[cfg(target_arch = "aarch64")]
-use super::kernel::advance_tile_fused_neon_assume_changed_no_track;
+use super::kernel::advance_tile_fused_neon_assume_changed_no_track_fast;
 use super::kernel::{
     KernelBackend, advance_tile_fused_scalar_no_track, advance_tile_fused_scalar_track,
 };
 #[cfg(target_arch = "x86_64")]
 use super::kernel::{advance_tile_fused_avx2_no_track, advance_tile_fused_avx2_track};
 #[cfg(target_arch = "aarch64")]
-use super::kernel::{advance_tile_fused_neon_no_track, advance_tile_fused_neon_track};
+use super::kernel::{advance_tile_fused_neon_no_track_fast, advance_tile_fused_neon_track};
 use super::tile::{self, Direction, NO_NEIGHBOR, POPULATION_UNKNOWN, TileIdx};
 use super::tile_cache::{
     TileCache, advance_tile_cached_scalar_no_track, advance_tile_cached_scalar_track,
@@ -104,19 +104,9 @@ const _: [(); 1] = [(); (PREFETCH_TILE_NEAR_AHEAD_AARCH64 >= 1) as usize];
 const _: [(); 1] =
     [(); (PREFETCH_TILE_FAR_AHEAD_AARCH64 > PREFETCH_TILE_NEAR_AHEAD_AARCH64) as usize];
 #[cfg(target_arch = "aarch64")]
+// Enable `assume_changed` once the active frontier is large enough to
+// amortize the extra follow-up bookkeeping in the engine.
 const ASSUME_CHANGED_NEON_MIN_ACTIVE: usize = 2_048;
-// `assume_changed` reports every live tile as changed; once enabled it can
-// self-inflate churn metrics. Keep this gate conservative so we only enter it
-// when churn is already very high.
-#[cfg(target_arch = "aarch64")]
-#[cfg(feature = "aggressive-neon-assume-changed")]
-const ASSUME_CHANGED_NEON_MIN_CHURN_PCT: usize = 84;
-#[cfg(target_arch = "aarch64")]
-#[cfg(not(feature = "aggressive-neon-assume-changed"))]
-const ASSUME_CHANGED_NEON_MIN_CHURN_PCT: usize = 94;
-#[cfg(target_arch = "aarch64")]
-const _: [(); 1] = [(); ((ASSUME_CHANGED_NEON_MIN_CHURN_PCT >= 80
-    && ASSUME_CHANGED_NEON_MIN_CHURN_PCT <= 100) as usize)];
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -578,7 +568,7 @@ fn churn_at_most_percent(changed_len: usize, active_len: usize, max_churn_pct: u
     (changed_len as u128) * 100 <= (active_len as u128) * (max_churn_pct as u128)
 }
 
-#[cfg(any(test, target_arch = "aarch64"))]
+#[cfg(test)]
 #[inline]
 fn churn_below_percent(changed_len: usize, active_len: usize, churn_pct_threshold: usize) -> bool {
     (changed_len as u128) * 100 < (active_len as u128) * (churn_pct_threshold as u128)
@@ -1182,8 +1172,7 @@ impl TurboLife {
         #[cfg(target_arch = "aarch64")]
         let assume_changed_neon = !track_neighbor_influence
             && backend == KernelBackend::Neon
-            && active_len >= ASSUME_CHANGED_NEON_MIN_ACTIVE
-            && !churn_below_percent(changed_len, active_len, ASSUME_CHANGED_NEON_MIN_CHURN_PCT);
+            && active_len >= ASSUME_CHANGED_NEON_MIN_ACTIVE;
         #[cfg(target_arch = "aarch64")]
         let assume_changed_mode = assume_changed_neon;
         #[cfg(not(target_arch = "aarch64"))]
@@ -1655,13 +1644,13 @@ impl TurboLife {
                             if assume_changed_neon {
                                 dispatch_by_emit!(
                                     serial_loop_fused,
-                                    advance_tile_fused_neon_assume_changed_no_track,
+                                    advance_tile_fused_neon_assume_changed_no_track_fast,
                                     false
                                 );
                             } else {
                                 dispatch_by_emit!(
                                     serial_loop_fused,
-                                    advance_tile_fused_neon_no_track,
+                                    advance_tile_fused_neon_no_track_fast,
                                     false
                                 );
                             }
@@ -1950,13 +1939,13 @@ impl TurboLife {
                                 if assume_changed_neon {
                                     dispatch_by_emit!(
                                         parallel_kernel_static,
-                                        advance_tile_fused_neon_assume_changed_no_track,
+                                        advance_tile_fused_neon_assume_changed_no_track_fast,
                                         false
                                     )
                                 } else {
                                     dispatch_by_emit!(
                                         parallel_kernel_static,
-                                        advance_tile_fused_neon_no_track,
+                                        advance_tile_fused_neon_no_track_fast,
                                         false
                                     )
                                 }
@@ -2098,13 +2087,13 @@ impl TurboLife {
                                 if assume_changed_neon {
                                     dispatch_by_emit!(
                                         parallel_kernel_lockfree,
-                                        advance_tile_fused_neon_assume_changed_no_track,
+                                        advance_tile_fused_neon_assume_changed_no_track_fast,
                                         false
                                     )
                                 } else {
                                     dispatch_by_emit!(
                                         parallel_kernel_lockfree,
-                                        advance_tile_fused_neon_no_track,
+                                        advance_tile_fused_neon_no_track_fast,
                                         false
                                     )
                                 }
