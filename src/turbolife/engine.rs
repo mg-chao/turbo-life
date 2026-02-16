@@ -76,25 +76,20 @@ const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
 const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
 const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 32_768;
-// Dynamic scheduler chunking tiers:
-// - small frontiers: fewer chunks to minimize atomic overhead
-// - medium frontiers: more chunks to improve load balance
-// - very large frontiers: fewer chunks again to reduce scheduler pressure
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_BASE: usize = 2;
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_MID: usize = 4;
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_HIGH: usize = 2;
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_MID_ACTIVE: usize = 2_048;
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_HIGH_ACTIVE: usize = 16_384;
-const PARALLEL_DYNAMIC_MID_CHURN_PCT: usize = 35;
-const _: [(); 1] = [(); (PARALLEL_DYNAMIC_MID_CHURN_PCT <= 100) as usize];
+// Dynamic scheduler chunking target per worker.
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 2;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 16;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 #[cfg(target_arch = "x86_64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 #[cfg(target_arch = "aarch64")]
-// Keep software tile-data prefetch opt-in on ARM64; hardware prefetchers tend
-// to do as well or better for this workload in current benchmarks.
-const PREFETCH_TILE_DATA_AARCH64: bool = false;
+const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 2_048;
+#[cfg(target_arch = "aarch64")]
+const PREFETCH_TILE_DATA_AARCH64: bool = true;
+#[cfg(target_arch = "aarch64")]
+const PREFETCH_TILE_FAR_AHEAD_AARCH64: usize = 4;
+#[cfg(target_arch = "aarch64")]
+const PREFETCH_TILE_NEAR_AHEAD_AARCH64: usize = 2;
 const PRECISE_INFLUENCE_MAX_ACTIVE: usize = 256;
 const PRECISE_INFLUENCE_DYNAMIC_MAX_ACTIVE: usize = 4_096;
 const PRECISE_INFLUENCE_DYNAMIC_MAX_CHURN_PCT: usize = 65;
@@ -500,18 +495,8 @@ fn churn_below_percent(changed_len: usize, active_len: usize, churn_pct_threshol
 }
 
 #[inline]
-fn dynamic_target_chunks_per_worker(active_len: usize, changed_len: usize) -> usize {
-    if active_len < PARALLEL_DYNAMIC_TARGET_CHUNKS_MID_ACTIVE {
-        PARALLEL_DYNAMIC_TARGET_CHUNKS_BASE
-    } else if active_len < PARALLEL_DYNAMIC_TARGET_CHUNKS_HIGH_ACTIVE {
-        if churn_below_percent(changed_len, active_len, PARALLEL_DYNAMIC_MID_CHURN_PCT) {
-            PARALLEL_DYNAMIC_TARGET_CHUNKS_BASE
-        } else {
-            PARALLEL_DYNAMIC_TARGET_CHUNKS_MID
-        }
-    } else {
-        PARALLEL_DYNAMIC_TARGET_CHUNKS_HIGH
-    }
+fn dynamic_target_chunks_per_worker(_active_len: usize, _changed_len: usize) -> usize {
+    PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER
 }
 
 #[inline]
@@ -1087,7 +1072,7 @@ impl TurboLife {
             #[cfg(target_arch = "x86_64")]
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
             #[cfg(target_arch = "aarch64")]
-            let prefetch_neighbor_borders = false;
+            let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
 
             macro_rules! serial_loop_cached {
                 ($advance:path, $track:expr) => {{
@@ -1128,15 +1113,19 @@ impl TurboLife {
                         #[cfg(target_arch = "aarch64")]
                         unsafe {
                             if PREFETCH_TILE_DATA_AARCH64 {
-                                // Prefetch tile i+2 cell buffers into L2.
-                                if i + 2 < active_len {
-                                    let far_ii = (*active_ptr.add(i + 2)).index();
+                                // Prefetch a farther-ahead tile's cell buffers into L2.
+                                if i + PREFETCH_TILE_FAR_AHEAD_AARCH64 < active_len {
+                                    let far_ii = (*active_ptr
+                                        .add(i + PREFETCH_TILE_FAR_AHEAD_AARCH64))
+                                    .index();
                                     prefetch_l2_read(current_ptr.add(far_ii));
                                     prefetch_l2_write(next_ptr.add(far_ii));
                                 }
-                                // Prefetch tile i+1 into L1, plus neighbor metadata and borders.
-                                if i + 1 < active_len {
-                                    let near_ii = (*active_ptr.add(i + 1)).index();
+                                // Prefetch a near-ahead tile into L1 plus neighbor metadata.
+                                if i + PREFETCH_TILE_NEAR_AHEAD_AARCH64 < active_len {
+                                    let near_ii = (*active_ptr
+                                        .add(i + PREFETCH_TILE_NEAR_AHEAD_AARCH64))
+                                    .index();
                                     prefetch_l1_read(current_ptr.add(near_ii));
                                     prefetch_l1_write(next_ptr.add(near_ii));
                                     prefetch_l1_read(neighbors_ptr.add(near_ii));
@@ -1247,15 +1236,19 @@ impl TurboLife {
                         #[cfg(target_arch = "aarch64")]
                         unsafe {
                             if PREFETCH_TILE_DATA_AARCH64 {
-                                // Prefetch tile i+2 cell buffers into L2.
-                                if i + 2 < active_len {
-                                    let far_ii = (*active_ptr.add(i + 2)).index();
+                                // Prefetch a farther-ahead tile's cell buffers into L2.
+                                if i + PREFETCH_TILE_FAR_AHEAD_AARCH64 < active_len {
+                                    let far_ii = (*active_ptr
+                                        .add(i + PREFETCH_TILE_FAR_AHEAD_AARCH64))
+                                    .index();
                                     prefetch_l2_read(current_ptr.add(far_ii));
                                     prefetch_l2_write(next_ptr.add(far_ii));
                                 }
-                                // Prefetch tile i+1 into L1, plus neighbor metadata and borders.
-                                if i + 1 < active_len {
-                                    let near_ii = (*active_ptr.add(i + 1)).index();
+                                // Prefetch a near-ahead tile into L1 plus neighbor metadata.
+                                if i + PREFETCH_TILE_NEAR_AHEAD_AARCH64 < active_len {
+                                    let near_ii = (*active_ptr
+                                        .add(i + PREFETCH_TILE_NEAR_AHEAD_AARCH64))
+                                    .index();
                                     prefetch_l1_read(current_ptr.add(near_ii));
                                     prefetch_l1_write(next_ptr.add(near_ii));
                                     prefetch_l1_read(neighbors_ptr.add(near_ii));
@@ -1456,7 +1449,7 @@ impl TurboLife {
             #[cfg(target_arch = "x86_64")]
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
             #[cfg(target_arch = "aarch64")]
-            let prefetch_neighbor_borders = false;
+            let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
 
             macro_rules! prefetch_for_work_item {
                 ($i:expr, $end:expr) => {
@@ -1493,13 +1486,17 @@ impl TurboLife {
                     #[cfg(target_arch = "aarch64")]
                     unsafe {
                         if PREFETCH_TILE_DATA_AARCH64 {
-                            if $i + 2 < $end {
-                                let far_ii = (*active_ptr.get().add($i + 2)).index();
+                            if $i + PREFETCH_TILE_FAR_AHEAD_AARCH64 < $end {
+                                let far_ii =
+                                    (*active_ptr.get().add($i + PREFETCH_TILE_FAR_AHEAD_AARCH64))
+                                        .index();
                                 prefetch_l2_read(current_ptr.get().add(far_ii));
                                 prefetch_l2_write(next_ptr.get().add(far_ii));
                             }
-                            if $i + 1 < $end {
-                                let near_ii = (*active_ptr.get().add($i + 1)).index();
+                            if $i + PREFETCH_TILE_NEAR_AHEAD_AARCH64 < $end {
+                                let near_ii =
+                                    (*active_ptr.get().add($i + PREFETCH_TILE_NEAR_AHEAD_AARCH64))
+                                        .index();
                                 prefetch_l1_read(current_ptr.get().add(near_ii));
                                 prefetch_l1_write(next_ptr.get().add(near_ii));
                                 prefetch_l1_read(neighbors_ptr.get().add(near_ii));
@@ -2121,12 +2118,12 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_chunk_targets_switch_at_expected_frontier_sizes() {
+    fn dynamic_chunk_targets_stay_flat_across_frontier_sizes() {
         assert_eq!(dynamic_target_chunks_per_worker(1, 1), 2);
         assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 2);
         assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 2);
-        assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 4);
-        assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 4);
+        assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 2);
+        assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 2);
         assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 2);
     }
 
@@ -2149,7 +2146,7 @@ mod tests {
         let large = dynamic_parallel_chunk_size(65_536, 50_000, 4);
         assert_eq!(small, 100);
         assert_eq!(medium_balanced, 512);
-        assert_eq!(medium_high, 256);
+        assert_eq!(medium_high, 512);
         assert_eq!(large, 2_048);
     }
 
