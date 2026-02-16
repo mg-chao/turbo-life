@@ -682,10 +682,18 @@ unsafe fn neon_half_add(
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool, const FORCE_STORE: bool>(
+#[allow(clippy::too_many_arguments)]
+unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: bool>(
     current: &[u64; TILE_SIZE],
     next: &mut [u64; TILE_SIZE],
-    ghost: &GhostZone,
+    ghost_north: u64,
+    ghost_south: u64,
+    ghost_west: u64,
+    ghost_east: u64,
+    ghost_nw: u64,
+    ghost_ne: u64,
+    ghost_sw: u64,
+    ghost_se: u64,
 ) -> (bool, BorderData, bool) {
     use std::arch::aarch64::{
         vandq_u64, vbicq_u64, veorq_u64, vgetq_lane_u64, vld1q_u64, vorrq_u64, vshlq_n_u64,
@@ -699,12 +707,17 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool, const FORCE_STORE: bool
     let current_ptr = current.as_ptr();
     let next_ptr = next.as_mut_ptr();
 
-    let mut west_self_bits = ghost.west;
-    let mut east_self_bits = ghost.east;
-    let mut west_above_bits = (ghost.west >> 1) | ((ghost.nw as u64) << 63);
-    let mut east_above_bits = (ghost.east >> 1) | ((ghost.ne as u64) << 63);
-    let mut west_below_bits = (ghost.west << 1) | (ghost.sw as u64);
-    let mut east_below_bits = (ghost.east << 1) | (ghost.se as u64);
+    debug_assert!(ghost_nw <= 1);
+    debug_assert!(ghost_ne <= 1);
+    debug_assert!(ghost_sw <= 1);
+    debug_assert!(ghost_se <= 1);
+
+    let mut west_self_bits = ghost_west;
+    let mut east_self_bits = ghost_east;
+    let mut west_above_bits = (ghost_west >> 1) | (ghost_nw << 63);
+    let mut east_above_bits = (ghost_east >> 1) | (ghost_ne << 63);
+    let mut west_below_bits = (ghost_west << 1) | ghost_sw;
+    let mut east_below_bits = (ghost_east << 1) | ghost_se;
 
     macro_rules! process_pair {
         ($row_base:expr, $row_above:expr, $row_self:expr, $row_below:expr) => {{
@@ -774,7 +787,7 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool, const FORCE_STORE: bool
 
     let row_self_0 = unsafe { vld1q_u64(current_ptr) };
     let row_above_0 = unsafe { vld1q_u64(current_ptr.add(1)) };
-    let row_below_0 = unsafe { neon_set_u64x2_lane_order(ghost.south, current[0]) };
+    let row_below_0 = unsafe { neon_set_u64x2_lane_order(ghost_south, current[0]) };
     let (border_south, _) = process_pair!(0, row_above_0, row_self_0, row_below_0);
     west_self_bits >>= 2;
     east_self_bits >>= 2;
@@ -827,12 +840,35 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool, const FORCE_STORE: bool
 
     let last_base = TILE_SIZE - 2;
     let row_self_last = unsafe { vld1q_u64(current_ptr.add(last_base)) };
-    let row_above_last = unsafe { neon_set_u64x2_lane_order(current[63], ghost.north) };
+    let row_above_last = unsafe { neon_set_u64x2_lane_order(current[63], ghost_north) };
     let row_below_last = prev_above;
     let (_, border_north) = process_pair!(last_base, row_above_last, row_self_last, row_below_last);
 
     let border = BorderData::from_edges(border_north, border_south, border_west, border_east);
     (changed, border, has_live)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool, const FORCE_STORE: bool>(
+    current: &[u64; TILE_SIZE],
+    next: &mut [u64; TILE_SIZE],
+    ghost: &GhostZone,
+) -> (bool, BorderData, bool) {
+    unsafe {
+        advance_core_neon_impl_raw::<TRACK_DIFF, FORCE_STORE>(
+            current,
+            next,
+            ghost.north,
+            ghost.south,
+            ghost.west,
+            ghost.east,
+            ghost.nw as u64,
+            ghost.ne as u64,
+            ghost.sw as u64,
+            ghost.se as u64,
+        )
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -847,6 +883,71 @@ pub unsafe fn advance_core_neon(
         unsafe { advance_core_neon_impl::<true, true>(current, next, ghost) }
     } else {
         unsafe { advance_core_neon_impl::<true, false>(current, next, ghost) }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn advance_core_neon_raw<const ASSUME_CHANGED: bool>(
+    current: &[u64; TILE_SIZE],
+    next: &mut [u64; TILE_SIZE],
+    ghost_north: u64,
+    ghost_south: u64,
+    ghost_west: u64,
+    ghost_east: u64,
+    ghost_nw: u64,
+    ghost_ne: u64,
+    ghost_sw: u64,
+    ghost_se: u64,
+    force_store: bool,
+) -> (bool, BorderData, bool) {
+    if ASSUME_CHANGED {
+        return unsafe {
+            advance_core_neon_impl_raw::<false, true>(
+                current,
+                next,
+                ghost_north,
+                ghost_south,
+                ghost_west,
+                ghost_east,
+                ghost_nw,
+                ghost_ne,
+                ghost_sw,
+                ghost_se,
+            )
+        };
+    }
+    if force_store {
+        unsafe {
+            advance_core_neon_impl_raw::<true, true>(
+                current,
+                next,
+                ghost_north,
+                ghost_south,
+                ghost_west,
+                ghost_east,
+                ghost_nw,
+                ghost_ne,
+                ghost_sw,
+                ghost_se,
+            )
+        }
+    } else {
+        unsafe {
+            advance_core_neon_impl_raw::<true, false>(
+                current,
+                next,
+                ghost_north,
+                ghost_south,
+                ghost_west,
+                ghost_east,
+                ghost_nw,
+                ghost_ne,
+                ghost_sw,
+                ghost_se,
+            )
+        }
     }
 }
 
@@ -987,23 +1088,62 @@ unsafe fn advance_tile_fused_impl<
     let se_i = nb[7] as usize;
 
     let (changed, border, has_live) = if tile_has_live {
+        let ghost_north = unsafe { *borders_south_read_ptr.add(north_i) };
+        let ghost_south = unsafe { *borders_north_read_ptr.add(south_i) };
+        let ghost_west = unsafe { *borders_east_read_ptr.add(west_i) };
+        let ghost_east = unsafe { *borders_west_read_ptr.add(east_i) };
         let nw_live = unsafe { *live_masks_read_ptr.add(nw_i) };
         let ne_live = unsafe { *live_masks_read_ptr.add(ne_i) };
         let sw_live = unsafe { *live_masks_read_ptr.add(sw_i) };
         let se_live = unsafe { *live_masks_read_ptr.add(se_i) };
-        let ghost = GhostZone {
-            north: unsafe { *borders_south_read_ptr.add(north_i) },
-            south: unsafe { *borders_north_read_ptr.add(south_i) },
-            west: unsafe { *borders_east_read_ptr.add(west_i) },
-            east: unsafe { *borders_west_read_ptr.add(east_i) },
-            nw: (nw_live & LIVE_SE) != 0,
-            ne: (ne_live & LIVE_SW) != 0,
-            sw: (sw_live & LIVE_NE) != 0,
-            se: (se_live & LIVE_NW) != 0,
-        };
+        let ghost_nw = (nw_live & LIVE_SE) != 0;
+        let ghost_ne = (ne_live & LIVE_SW) != 0;
+        let ghost_sw = (sw_live & LIVE_NE) != 0;
+        let ghost_se = (se_live & LIVE_NW) != 0;
         let force_store = meta.alt_phase_dirty();
-        unsafe {
-            advance_core_const::<CORE_BACKEND, ASSUME_CHANGED>(current, next, &ghost, force_store)
+
+        if CORE_BACKEND == CORE_BACKEND_NEON {
+            #[cfg(target_arch = "aarch64")]
+            {
+                unsafe {
+                    advance_core_neon_raw::<ASSUME_CHANGED>(
+                        current,
+                        next,
+                        ghost_north,
+                        ghost_south,
+                        ghost_west,
+                        ghost_east,
+                        ghost_nw as u64,
+                        ghost_ne as u64,
+                        ghost_sw as u64,
+                        ghost_se as u64,
+                        force_store,
+                    )
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                unreachable!("NEON backend selected on non-aarch64 target");
+            }
+        } else {
+            let ghost = GhostZone {
+                north: ghost_north,
+                south: ghost_south,
+                west: ghost_west,
+                east: ghost_east,
+                nw: ghost_nw,
+                ne: ghost_ne,
+                sw: ghost_sw,
+                se: ghost_se,
+            };
+            unsafe {
+                advance_core_const::<CORE_BACKEND, ASSUME_CHANGED>(
+                    current,
+                    next,
+                    &ghost,
+                    force_store,
+                )
+            }
         }
     } else {
         if missing_mask == MISSING_ALL_NEIGHBORS {
