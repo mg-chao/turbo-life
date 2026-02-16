@@ -34,16 +34,27 @@ Main-harness benchmark helper (parses the `TurboLife` summary line and reports m
 ./scripts/bench_main.sh 10
 ```
 
-PGO build helper (uses `src/main.rs` as the training workload and produces `target/pgo-use/release/turbo-life`):
+Quiet mode prints median milliseconds only (useful for automation):
 
 ```
-./scripts/build_pgo.sh 3
+./scripts/bench_main.sh 10 target/release/turbo-life --quiet
 ```
 
-To pass CLI args through to the training/benchmark harness, append them after the run count:
+PGO build helper (uses `src/main.rs` as the training workload, benchmarks before/after with the same harness, and rejects regressions):
 
 ```
-./scripts/build_pgo.sh 3 --threads 6 --kernel neon
+./scripts/build_pgo.sh 3 9
+```
+
+Arguments:
+
+- First positional: `train_runs` for profile collection (default `3`).
+- Second positional: `bench_runs` for baseline vs PGO comparison (default `9`).
+
+To pass CLI args through to both training and benchmarking harness runs, append them after run counts:
+
+```
+./scripts/build_pgo.sh 3 9 --threads 6 --kernel neon
 ```
 
 ## Threading behavior
