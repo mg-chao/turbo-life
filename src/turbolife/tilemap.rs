@@ -2,11 +2,11 @@
 //! `(i64, i64) → TileIdx` lookups.
 //!
 //! Design goals:
-//! - Flat, cache-friendly layout: 32-byte slots, two per cache line.
+//! - Flat, cache-friendly layout with compact control metadata.
 //! - Robin Hood probing with backward-shift deletion (no tombstones).
-//! - Specialized hash for tile coordinates (distinct multipliers + rotation).
+//! - Specialized hash for tile coordinates with a final avalanche mix.
 //! - Fingerprint check in the control word to skip full key comparisons.
-//! - Cached hash eliminates rehashing in probes, deletes, and resizes.
+//! - Probe distance encoded in the control word (no per-probe hash reload).
 
 use super::tile::TileIdx;
 
@@ -20,34 +20,42 @@ const MY: u64 = 0x6c62_272e_07bb_0142;
 
 #[inline(always)]
 pub(crate) fn tile_hash(x: i64, y: i64) -> u64 {
-    let hx = (x as u64).wrapping_mul(MX);
-    let hy = (y as u64).wrapping_mul(MY);
-    hx ^ hy.rotate_right(32)
+    let mut h = (x as u64).wrapping_mul(MX) ^ (y as u64).wrapping_mul(MY).rotate_right(32);
+    // SplitMix64 finalizer to avalanche coordinate patterns across all bits.
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
 }
 
 // ── Slot layout ─────────────────────────────────────────────────────────
 
 const EMPTY: u32 = 0;
 const OCCUPIED_BIT: u32 = 0x8000_0000;
+const DIST_SHIFT: u32 = 12;
+const DIST_MASK: u32 = 0x7fff_f000;
+const FP_MASK: u32 = 0x0000_0fff;
+const MATCH_MASK: u32 = OCCUPIED_BIT | FP_MASK;
+const MAX_DIST: usize = (DIST_MASK >> DIST_SHIFT) as usize;
 
 /// A single slot in the hash table.
 ///
-/// Layout: key_x(8) + key_y(8) + value(4) + ctrl(4) + hash(8) = 32 bytes.
-/// Two slots fill one 64-byte cache line.
+/// Layout: key_x(8) + key_y(8) + value(4) + ctrl(4) = 24 bytes.
 ///
-/// The cached `hash` field eliminates rehashing during Robin Hood probes,
-/// displacement comparisons, backward-shift deletion, and resize.
+/// Control word layout:
+/// - bit 31: occupied flag
+/// - bits 12..30: probe distance (Robin Hood DIB)
+/// - bits 0..11: key fingerprint
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Slot {
     key_x: i64,
     key_y: i64,
     value: u32,
-    /// High bit = occupied flag.  Lower 31 bits = hash fingerprint.
+    /// High bit = occupied, mid bits = probe distance, low bits = fingerprint.
     /// `0` means empty.
     ctrl: u32,
-    /// Cached full hash of (key_x, key_y). Only meaningful when occupied.
-    hash: u64,
 }
 
 impl Slot {
@@ -56,7 +64,6 @@ impl Slot {
         key_y: 0,
         value: 0,
         ctrl: EMPTY,
-        hash: 0,
     };
 
     #[inline(always)]
@@ -67,6 +74,25 @@ impl Slot {
     #[inline(always)]
     fn is_empty(self) -> bool {
         self.ctrl == EMPTY
+    }
+
+    #[inline(always)]
+    fn distance(self) -> usize {
+        ((self.ctrl & DIST_MASK) >> DIST_SHIFT) as usize
+    }
+
+    #[inline(always)]
+    fn set_distance(&mut self, distance: usize) {
+        assert!(
+            distance <= MAX_DIST,
+            "TileMap probe distance overflow (distance={distance}, max={MAX_DIST})"
+        );
+        self.ctrl = (self.ctrl & !DIST_MASK) | ((distance as u32) << DIST_SHIFT);
+    }
+
+    #[inline(always)]
+    fn match_ctrl(self) -> u32 {
+        self.ctrl & MATCH_MASK
     }
 }
 
@@ -134,7 +160,7 @@ impl TileMap {
     #[inline(always)]
     pub(crate) fn get_hashed(&self, x: i64, y: i64, hash: u64) -> Option<TileIdx> {
         debug_assert_eq!(hash, tile_hash(x, y));
-        let target_ctrl = OCCUPIED_BIT | fingerprint_of(hash);
+        let target_ctrl = match_ctrl_of(hash);
         let mut pos = hash as usize & self.mask;
         let mask = self.mask;
         let slots_ptr = self.slots.as_ptr();
@@ -149,15 +175,15 @@ impl TileMap {
             }
             // Robin Hood early exit: if this occupied slot is closer to its
             // home than we are to ours, our key was never inserted here.
-            let their_dist = pos.wrapping_sub(slot.hash as usize & mask) & mask;
+            let their_dist = slot.distance();
             if our_dist > their_dist {
                 return None;
             }
-            if slot.ctrl == target_ctrl && slot.key_x == x && slot.key_y == y {
+            if slot.match_ctrl() == target_ctrl && slot.key_x == x && slot.key_y == y {
                 return Some(TileIdx(slot.value));
             }
             pos = (pos + 1) & mask;
-            our_dist = (our_dist + 1) & mask;
+            our_dist += 1;
         }
     }
 
@@ -189,7 +215,7 @@ impl TileMap {
     /// Insert without checking capacity — caller must ensure space.
     #[inline]
     fn insert_no_grow(&mut self, x: i64, y: i64, value: TileIdx, hash: u64) -> Option<TileIdx> {
-        let target_ctrl = OCCUPIED_BIT | fingerprint_of(hash);
+        let target_ctrl = match_ctrl_of(hash);
         let mask = self.mask;
         let mut pos = hash as usize & mask;
         let slots_ptr = self.slots.as_mut_ptr();
@@ -198,10 +224,8 @@ impl TileMap {
             key_x: x,
             key_y: y,
             value: value.0,
-            ctrl: target_ctrl,
-            hash,
+            ctrl: occupied_ctrl(fingerprint_of(hash), 0),
         };
-        let mut ins_dist = 0usize;
 
         loop {
             // SAFETY: pos is always & mask which is < slots.len().
@@ -214,34 +238,33 @@ impl TileMap {
             }
 
             // Exact match — update in place.
-            if slot.ctrl == target_ctrl && slot.key_x == x && slot.key_y == y {
+            if slot.match_ctrl() == target_ctrl && slot.key_x == x && slot.key_y == y {
                 let old = TileIdx(slot.value);
                 slot.value = value.0;
                 return Some(old);
             }
 
             // Robin Hood: if the existing entry is closer to home, steal its spot.
-            // Uses cached hash — no rehashing needed.
-            let existing_home = slot.hash as usize & mask;
-            let existing_dist = pos.wrapping_sub(existing_home) & mask;
+            let ins_dist = ins.distance();
+            let existing_dist = slot.distance();
             if ins_dist > existing_dist {
                 std::mem::swap(&mut *slot, &mut ins);
-                ins_dist = existing_dist;
             }
 
+            ins.set_distance(ins.distance() + 1);
             pos = (pos + 1) & mask;
-            ins_dist = (ins_dist + 1) & mask;
         }
     }
 
-    /// Insert during resize — uses pre-computed hash, skips duplicate check.
+    /// Insert during resize — recomputes home position, skips duplicate check.
     #[inline]
-    fn insert_rehash(&mut self, slot_in: Slot) {
+    fn insert_rehash(&mut self, mut slot_in: Slot) {
         let mask = self.mask;
         let slots_ptr = self.slots.as_mut_ptr();
-        let mut pos = slot_in.hash as usize & mask;
+        let hash = tile_hash(slot_in.key_x, slot_in.key_y);
+        let mut pos = hash as usize & mask;
+        slot_in.set_distance(0);
         let mut ins = slot_in;
-        let mut ins_dist = 0usize;
 
         loop {
             // SAFETY: pos is always & mask which is < slots.len().
@@ -253,15 +276,14 @@ impl TileMap {
                 return;
             }
 
-            let existing_home = slot.hash as usize & mask;
-            let existing_dist = pos.wrapping_sub(existing_home) & mask;
+            let ins_dist = ins.distance();
+            let existing_dist = slot.distance();
             if ins_dist > existing_dist {
                 std::mem::swap(&mut *slot, &mut ins);
-                ins_dist = existing_dist;
             }
 
+            ins.set_distance(ins.distance() + 1);
             pos = (pos + 1) & mask;
-            ins_dist = (ins_dist + 1) & mask;
         }
     }
 
@@ -278,7 +300,7 @@ impl TileMap {
     #[inline]
     pub(crate) fn remove_hashed(&mut self, x: i64, y: i64, hash: u64) -> Option<TileIdx> {
         debug_assert_eq!(hash, tile_hash(x, y));
-        let target_ctrl = OCCUPIED_BIT | fingerprint_of(hash);
+        let target_ctrl = match_ctrl_of(hash);
         let mask = self.mask;
         let mut pos = hash as usize & mask;
         let mut our_dist = 0usize;
@@ -290,22 +312,22 @@ impl TileMap {
                 return None;
             }
             // Robin Hood early exit on miss.
-            let their_dist = pos.wrapping_sub(slot.hash as usize & mask) & mask;
+            let their_dist = slot.distance();
             if our_dist > their_dist {
                 return None;
             }
-            if slot.ctrl == target_ctrl && slot.key_x == x && slot.key_y == y {
+            if slot.match_ctrl() == target_ctrl && slot.key_x == x && slot.key_y == y {
                 let old = TileIdx(slot.value);
                 self.backward_shift_delete(pos);
                 self.len -= 1;
                 return Some(old);
             }
             pos = (pos + 1) & mask;
-            our_dist = (our_dist + 1) & mask;
+            our_dist += 1;
         }
     }
 
-    /// Backward-shift deletion using cached hash — no rehashing needed.
+    /// Backward-shift deletion using stored probe distances.
     fn backward_shift_delete(&mut self, removed: usize) {
         let mask = self.mask;
         let slots_ptr = self.slots.as_mut_ptr();
@@ -313,7 +335,7 @@ impl TileMap {
         loop {
             let next = (gap + 1) & mask;
             // SAFETY: next is always & mask which is < slots.len().
-            let candidate = unsafe { *slots_ptr.add(next) };
+            let mut candidate = unsafe { *slots_ptr.add(next) };
 
             if candidate.is_empty() {
                 unsafe {
@@ -322,9 +344,9 @@ impl TileMap {
                 return;
             }
 
-            // Use cached hash to check displacement without rehashing.
-            let home = candidate.hash as usize & mask;
-            if home == next {
+            // Distance 0 means the candidate is at home and cannot be shifted.
+            let candidate_dist = candidate.distance();
+            if candidate_dist == 0 {
                 // Candidate is at its home position — doesn't need to shift.
                 unsafe {
                     *slots_ptr.add(gap) = Slot::EMPTY;
@@ -333,6 +355,7 @@ impl TileMap {
             }
 
             // Shift it back.
+            candidate.set_distance(candidate_dist - 1);
             unsafe {
                 *slots_ptr.add(gap) = candidate;
             }
@@ -352,7 +375,7 @@ impl TileMap {
         self.resize(new_cap);
     }
 
-    /// Resize using cached hashes — no rehashing of keys needed.
+    /// Resize and reinsert entries.
     fn resize(&mut self, new_cap: usize) {
         debug_assert!(new_cap.is_power_of_two());
         let old_slots = std::mem::replace(&mut self.slots, vec![Slot::EMPTY; new_cap]);
@@ -383,14 +406,22 @@ impl TileMap {
 
 // ── Free helpers ────────────────────────────────────────────────────────
 
-/// Extract the 31-bit fingerprint from a hash — branchless.
+/// Extract fingerprint bits from a hash.
 #[inline(always)]
 fn fingerprint_of(hash: u64) -> u32 {
-    // Use the upper 32 bits (the lower bits select the bucket).
-    // Ensure at least one bit is set so fingerprint != 0 (which would
-    // collide with EMPTY's ctrl == 0 after masking).
-    // Branchless: OR with 1 guarantees non-zero without a branch.
-    (hash >> 32) as u32 & !OCCUPIED_BIT | 1
+    // Use high bits (bucket selection uses low bits).
+    // Keep at least one bit set so EMPTY remains ctrl == 0.
+    ((hash >> 52) as u32 & FP_MASK) | 1
+}
+
+#[inline(always)]
+fn occupied_ctrl(fp: u32, distance: usize) -> u32 {
+    OCCUPIED_BIT | ((distance as u32) << DIST_SHIFT) | fp
+}
+
+#[inline(always)]
+fn match_ctrl_of(hash: u64) -> u32 {
+    OCCUPIED_BIT | fingerprint_of(hash)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -481,7 +512,32 @@ mod tests {
     }
 
     #[test]
-    fn slot_size_is_32_bytes() {
-        assert_eq!(std::mem::size_of::<Slot>(), 32);
+    fn slot_size_is_24_bytes() {
+        assert_eq!(std::mem::size_of::<Slot>(), 24);
+    }
+
+    #[test]
+    fn hash_mix_avoids_simple_axis_cancellation_pattern() {
+        let mut hashes = std::collections::BTreeSet::new();
+        for k in 0..64i64 {
+            hashes.insert(tile_hash(-k, k << 32));
+        }
+        assert_eq!(
+            hashes.len(),
+            64,
+            "tile_hash should not collapse axis-canceling coordinates"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "TileMap probe distance overflow")]
+    fn slot_distance_overflow_panics() {
+        let mut slot = Slot {
+            key_x: 0,
+            key_y: 0,
+            value: 0,
+            ctrl: occupied_ctrl(1, 0),
+        };
+        slot.set_distance(MAX_DIST + 1);
     }
 }

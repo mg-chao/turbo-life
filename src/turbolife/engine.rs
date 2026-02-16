@@ -932,14 +932,19 @@ impl TurboLife {
 
         self.update_current_border_for_row_mutation(idx, local_x, local_y, row_after);
 
+        let should_mark_changed;
         {
             let meta = self.arena.meta_mut(idx);
+            let was_dirty = meta.alt_phase_dirty();
             meta.population = POPULATION_UNKNOWN;
             meta.set_has_live(true);
             meta.set_alt_phase_dirty(true);
+            should_mark_changed = !was_dirty;
         }
         self.population_cache = None;
-        self.arena.mark_changed(idx);
+        if should_mark_changed {
+            self.arena.mark_changed(idx);
+        }
         self.ensure_frontier_neighbors(idx, tile_coord, local_x, local_y);
     }
 
@@ -979,14 +984,19 @@ impl TurboLife {
 
         self.update_current_border_for_row_mutation(idx, local_x, local_y, row_after);
 
+        let should_mark_changed;
         {
             let meta = self.arena.meta_mut(idx);
+            let was_dirty = meta.alt_phase_dirty();
             meta.population = POPULATION_UNKNOWN;
             meta.set_has_live(has_live_after_clear);
             meta.set_alt_phase_dirty(true);
+            should_mark_changed = !was_dirty;
         }
         self.population_cache = None;
-        self.arena.mark_changed(idx);
+        if should_mark_changed {
+            self.arena.mark_changed(idx);
+        }
     }
 
     /// Batch-update many cells, amortizing per-tile metadata recompute.
@@ -1032,7 +1042,9 @@ impl TurboLife {
             let i = idx.index();
             if !self.touched_test_and_set(i) {
                 touched_tiles.push(idx);
-                self.arena.mark_changed(idx);
+                if !self.arena.meta(idx).alt_phase_dirty() {
+                    self.arena.mark_changed(idx);
+                }
             }
 
             if alive {
