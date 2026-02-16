@@ -8,11 +8,13 @@
 use super::tile::{
     BorderData, CellBuf, EMPTY_NEIGHBORS, NO_NEIGHBOR, Neighbors, TILE_SIZE, TileIdx, TileMeta,
 };
-use super::tilemap::TileMap;
+use super::tilemap::{TileMap, tile_hash};
 
 const INITIAL_TILE_CAPACITY: usize = 256;
 const MIN_GROW_TILES: usize = 256;
 const ACTIVE_SORT_RADIX_BUCKETS: usize = 1 << 16;
+const COORD_LOOKUP_CACHE_SIZE: usize = 1 << 12;
+const COORD_LOOKUP_CACHE_MASK: usize = COORD_LOOKUP_CACHE_SIZE - 1;
 pub(crate) const CHANGED_INFLUENCE_ALL: u8 = 0xFF;
 const DIR_OFFSETS: [(i64, i64); 8] = [
     (0, 1),
@@ -58,6 +60,18 @@ const fn build_expand_neighbor_hints() -> [[i8; 8]; 8] {
 }
 
 const EXPAND_NEIGHBOR_HINTS: [[i8; 8]; 8] = build_expand_neighbor_hints();
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct CoordLookupCacheEntry {
+    x: i64,
+    y: i64,
+    idx: u32,
+}
+
+impl CoordLookupCacheEntry {
+    const EMPTY: Self = Self { x: 0, y: 0, idx: 0 };
+}
 
 #[derive(Clone)]
 pub struct BorderPlanes {
@@ -182,7 +196,8 @@ pub struct TileArena {
     /// Cached `BorderData::live_mask` for each border phase.
     pub border_live_masks: [Vec<u8>; 2],
     pub border_phase: usize,
-    pub coord_to_idx: TileMap,
+    coord_to_idx: TileMap,
+    coord_lookup_cache: Box<[CoordLookupCacheEntry]>,
     pub free_list: Vec<TileIdx>,
     pub changed_list: Vec<TileIdx>,
     pub changed_influence: Vec<u8>,
@@ -247,6 +262,8 @@ impl TileArena {
             border_live_masks: [border_live_masks0, border_live_masks1],
             border_phase: 0,
             coord_to_idx: TileMap::with_capacity(INITIAL_TILE_CAPACITY),
+            coord_lookup_cache: vec![CoordLookupCacheEntry::EMPTY; COORD_LOOKUP_CACHE_SIZE]
+                .into_boxed_slice(),
             free_list: Vec::new(),
             changed_list: Vec::new(),
             changed_influence: Vec::new(),
@@ -317,8 +334,59 @@ impl TileArena {
     }
 
     #[inline(always)]
+    fn coord_lookup_cache_slot(hash: u64) -> usize {
+        hash as usize & COORD_LOOKUP_CACHE_MASK
+    }
+
+    #[inline(always)]
+    fn coord_lookup_cache_get(&self, coord: (i64, i64), hash: u64) -> Option<TileIdx> {
+        let entry = unsafe {
+            self.coord_lookup_cache
+                .get_unchecked(Self::coord_lookup_cache_slot(hash))
+        };
+        if entry.idx != 0 && entry.x == coord.0 && entry.y == coord.1 {
+            Some(TileIdx(entry.idx))
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn coord_lookup_cache_set(&mut self, coord: (i64, i64), idx: TileIdx, hash: u64) {
+        let entry = unsafe {
+            self.coord_lookup_cache
+                .get_unchecked_mut(Self::coord_lookup_cache_slot(hash))
+        };
+        entry.x = coord.0;
+        entry.y = coord.1;
+        entry.idx = idx.0;
+    }
+
+    #[inline(always)]
+    fn coord_lookup_cache_clear(&mut self, coord: (i64, i64), idx: TileIdx, hash: u64) {
+        let entry = unsafe {
+            self.coord_lookup_cache
+                .get_unchecked_mut(Self::coord_lookup_cache_slot(hash))
+        };
+        if entry.idx == idx.0 && entry.x == coord.0 && entry.y == coord.1 {
+            entry.idx = 0;
+        }
+    }
+
+    #[inline(always)]
     pub fn idx_at(&self, coord: (i64, i64)) -> Option<TileIdx> {
         self.coord_to_idx.get(coord.0, coord.1)
+    }
+
+    #[inline(always)]
+    pub fn idx_at_cached(&mut self, coord: (i64, i64)) -> Option<TileIdx> {
+        let hash = tile_hash(coord.0, coord.1);
+        if let Some(idx) = self.coord_lookup_cache_get(coord, hash) {
+            return Some(idx);
+        }
+        let idx = self.coord_to_idx.get_hashed(coord.0, coord.1, hash)?;
+        self.coord_lookup_cache_set(coord, idx, hash);
+        Some(idx)
     }
 
     #[inline(always)]
@@ -689,7 +757,7 @@ impl TileArena {
         let meta_ptr = self.meta.as_mut_ptr();
 
         for (dir_idx, (dx, dy)) in DIR_OFFSETS.iter().copied().enumerate() {
-            if let Some(neighbor_idx) = self.coord_to_idx.get(cx + dx, cy + dy) {
+            if let Some(neighbor_idx) = self.idx_at_cached((cx + dx, cy + dy)) {
                 let ni = neighbor_idx.index();
                 // SAFETY: idx and neighbor_idx are valid arena indices.
                 unsafe {
@@ -702,8 +770,10 @@ impl TileArena {
     #[inline]
     pub(crate) fn allocate_absent(&mut self, coord: (i64, i64)) -> TileIdx {
         debug_assert!(self.coord_to_idx.get(coord.0, coord.1).is_none());
+        let hash = tile_hash(coord.0, coord.1);
         let idx = self.allocate_slot(coord);
-        self.coord_to_idx.insert(coord.0, coord.1, idx);
+        self.coord_to_idx.insert_hashed(coord.0, coord.1, idx, hash);
+        self.coord_lookup_cache_set(coord, idx, hash);
         self.occupied_count += 1;
 
         self.link_neighbors(idx, coord);
@@ -726,7 +796,8 @@ impl TileArena {
         let (sx, sy) = self.coords[src_i];
         let (dx, dy) = DIR_OFFSETS[dir_idx];
         let coord = (sx + dx, sy + dy);
-        if let Some(existing_idx) = self.coord_to_idx.get(coord.0, coord.1) {
+        let hash = tile_hash(coord.0, coord.1);
+        if let Some(existing_idx) = self.idx_at_cached(coord) {
             unsafe {
                 Self::link_neighbor_pair_raw(
                     self.neighbors.as_mut_ptr(),
@@ -740,7 +811,8 @@ impl TileArena {
         }
 
         let idx = self.allocate_slot(coord);
-        self.coord_to_idx.insert(coord.0, coord.1, idx);
+        self.coord_to_idx.insert_hashed(coord.0, coord.1, idx, hash);
+        self.coord_lookup_cache_set(coord, idx, hash);
         self.occupied_count += 1;
 
         let idx_i = idx.index();
@@ -775,18 +847,15 @@ impl TileArena {
                     if self.meta[hinted_i].occupied() && self.coords[hinted_i] == neighbor_coord {
                         hinted_raw
                     } else {
-                        self.coord_to_idx
-                            .get(neighbor_coord.0, neighbor_coord.1)
+                        self.idx_at_cached(neighbor_coord)
                             .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
                     }
                 } else {
-                    self.coord_to_idx
-                        .get(neighbor_coord.0, neighbor_coord.1)
+                    self.idx_at_cached(neighbor_coord)
                         .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
                 }
             } else {
-                self.coord_to_idx
-                    .get(neighbor_coord.0, neighbor_coord.1)
+                self.idx_at_cached(neighbor_coord)
                     .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
             };
 
@@ -810,7 +879,7 @@ impl TileArena {
 
     #[allow(dead_code)]
     pub fn allocate(&mut self, coord: (i64, i64)) -> TileIdx {
-        if let Some(existing) = self.idx_at(coord) {
+        if let Some(existing) = self.idx_at_cached(coord) {
             return existing;
         }
 
@@ -846,7 +915,9 @@ impl TileArena {
         }
 
         let coord = self.coords[i];
-        self.coord_to_idx.remove(coord.0, coord.1);
+        let hash = tile_hash(coord.0, coord.1);
+        self.coord_to_idx.remove_hashed(coord.0, coord.1, hash);
+        self.coord_lookup_cache_clear(coord, idx, hash);
         self.meta[i] = TileMeta::released();
         self.free_list.push(idx);
         self.occupied_count = self.occupied_count.saturating_sub(1);
@@ -855,7 +926,7 @@ impl TileArena {
     #[inline]
     pub fn ensure_neighbor(&mut self, tx: i64, ty: i64) {
         let coord = (tx, ty);
-        if self.idx_at(coord).is_some() {
+        if self.idx_at_cached(coord).is_some() {
             return;
         }
         let idx = self.allocate_absent(coord);

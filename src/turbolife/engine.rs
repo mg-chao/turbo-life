@@ -818,7 +818,7 @@ impl TurboLife {
 
         let idx = self
             .arena
-            .idx_at(tile_coord)
+            .idx_at_cached(tile_coord)
             .unwrap_or_else(|| self.arena.allocate_absent(tile_coord));
 
         let row_after: u64;
@@ -857,7 +857,7 @@ impl TurboLife {
         let local_x = x.rem_euclid(TILE_SIZE_I64) as usize;
         let local_y = y.rem_euclid(TILE_SIZE_I64) as usize;
 
-        let Some(idx) = self.arena.idx_at(tile_coord) else {
+        let Some(idx) = self.arena.idx_at_cached(tile_coord) else {
             return;
         };
 
@@ -906,7 +906,7 @@ impl TurboLife {
             let local_x = x.rem_euclid(TILE_SIZE_I64) as usize;
             let local_y = y.rem_euclid(TILE_SIZE_I64) as usize;
 
-            let idx = match self.arena.idx_at(tile_coord) {
+            let idx = match self.arena.idx_at_cached(tile_coord) {
                 Some(existing) => existing,
                 None if alive => self.arena.allocate_absent(tile_coord),
                 None => continue,

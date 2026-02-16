@@ -19,7 +19,7 @@ const MX: u64 = 0x517c_c1b7_2722_0a95;
 const MY: u64 = 0x6c62_272e_07bb_0142;
 
 #[inline(always)]
-fn tile_hash(x: i64, y: i64) -> u64 {
+pub(crate) fn tile_hash(x: i64, y: i64) -> u64 {
     let hx = (x as u64).wrapping_mul(MX);
     let hy = (y as u64).wrapping_mul(MY);
     hx ^ hy.rotate_right(32)
@@ -67,18 +67,6 @@ impl Slot {
     #[inline(always)]
     fn is_empty(self) -> bool {
         self.ctrl == EMPTY
-    }
-
-    #[inline(always)]
-    fn fingerprint(self) -> u32 {
-        self.ctrl & !OCCUPIED_BIT
-    }
-
-    /// Home bucket for this slot (only valid when occupied).
-    #[inline(always)]
-    #[allow(dead_code)]
-    fn home(self, mask: usize) -> usize {
-        self.hash as usize & mask
     }
 }
 
@@ -140,11 +128,17 @@ impl TileMap {
     #[inline(always)]
     pub fn get(&self, x: i64, y: i64) -> Option<TileIdx> {
         let hash = tile_hash(x, y);
-        let fp = fingerprint_of(hash);
-        let home = hash as usize & self.mask;
-        let mut pos = home;
+        self.get_hashed(x, y, hash)
+    }
+
+    #[inline(always)]
+    pub(crate) fn get_hashed(&self, x: i64, y: i64, hash: u64) -> Option<TileIdx> {
+        debug_assert_eq!(hash, tile_hash(x, y));
+        let target_ctrl = OCCUPIED_BIT | fingerprint_of(hash);
+        let mut pos = hash as usize & self.mask;
         let mask = self.mask;
         let slots_ptr = self.slots.as_ptr();
+        let mut our_dist = 0usize;
 
         // SAFETY: `pos` is always `& self.mask` which is < self.slots.len()
         // (capacity is a power of two, mask = capacity - 1).
@@ -155,15 +149,15 @@ impl TileMap {
             }
             // Robin Hood early exit: if this occupied slot is closer to its
             // home than we are to ours, our key was never inserted here.
-            let our_dist = pos.wrapping_sub(home) & mask;
             let their_dist = pos.wrapping_sub(slot.hash as usize & mask) & mask;
             if our_dist > their_dist {
                 return None;
             }
-            if slot.fingerprint() == fp && slot.key_x == x && slot.key_y == y {
+            if slot.ctrl == target_ctrl && slot.key_x == x && slot.key_y == y {
                 return Some(TileIdx(slot.value));
             }
             pos = (pos + 1) & mask;
+            our_dist = (our_dist + 1) & mask;
         }
     }
 
@@ -171,19 +165,31 @@ impl TileMap {
 
     /// Insert a mapping.  Returns the previous value if the key was present.
     #[inline]
+    #[allow(dead_code)]
     pub fn insert(&mut self, x: i64, y: i64, value: TileIdx) -> Option<TileIdx> {
+        let hash = tile_hash(x, y);
+        self.insert_hashed(x, y, value, hash)
+    }
+
+    #[inline]
+    pub(crate) fn insert_hashed(
+        &mut self,
+        x: i64,
+        y: i64,
+        value: TileIdx,
+        hash: u64,
+    ) -> Option<TileIdx> {
+        debug_assert_eq!(hash, tile_hash(x, y));
         if self.needs_grow() {
             self.grow();
         }
-        self.insert_no_grow(x, y, value)
+        self.insert_no_grow(x, y, value, hash)
     }
 
     /// Insert without checking capacity — caller must ensure space.
     #[inline]
-    fn insert_no_grow(&mut self, x: i64, y: i64, value: TileIdx) -> Option<TileIdx> {
-        let hash = tile_hash(x, y);
-        let fp = fingerprint_of(hash);
-        let ctrl = OCCUPIED_BIT | fp;
+    fn insert_no_grow(&mut self, x: i64, y: i64, value: TileIdx, hash: u64) -> Option<TileIdx> {
+        let target_ctrl = OCCUPIED_BIT | fingerprint_of(hash);
         let mask = self.mask;
         let mut pos = hash as usize & mask;
         let slots_ptr = self.slots.as_mut_ptr();
@@ -192,10 +198,10 @@ impl TileMap {
             key_x: x,
             key_y: y,
             value: value.0,
-            ctrl,
+            ctrl: target_ctrl,
             hash,
         };
-        let mut ins_home = pos;
+        let mut ins_dist = 0usize;
 
         loop {
             // SAFETY: pos is always & mask which is < slots.len().
@@ -208,7 +214,7 @@ impl TileMap {
             }
 
             // Exact match — update in place.
-            if slot.fingerprint() == fp && slot.key_x == x && slot.key_y == y {
+            if slot.ctrl == target_ctrl && slot.key_x == x && slot.key_y == y {
                 let old = TileIdx(slot.value);
                 slot.value = value.0;
                 return Some(old);
@@ -218,14 +224,13 @@ impl TileMap {
             // Uses cached hash — no rehashing needed.
             let existing_home = slot.hash as usize & mask;
             let existing_dist = pos.wrapping_sub(existing_home) & mask;
-            let ins_dist = pos.wrapping_sub(ins_home) & mask;
-
             if ins_dist > existing_dist {
                 std::mem::swap(&mut *slot, &mut ins);
-                ins_home = existing_home;
+                ins_dist = existing_dist;
             }
 
             pos = (pos + 1) & mask;
+            ins_dist = (ins_dist + 1) & mask;
         }
     }
 
@@ -236,7 +241,7 @@ impl TileMap {
         let slots_ptr = self.slots.as_mut_ptr();
         let mut pos = slot_in.hash as usize & mask;
         let mut ins = slot_in;
-        let mut ins_home = pos;
+        let mut ins_dist = 0usize;
 
         loop {
             // SAFETY: pos is always & mask which is < slots.len().
@@ -250,14 +255,13 @@ impl TileMap {
 
             let existing_home = slot.hash as usize & mask;
             let existing_dist = pos.wrapping_sub(existing_home) & mask;
-            let ins_dist = pos.wrapping_sub(ins_home) & mask;
-
             if ins_dist > existing_dist {
                 std::mem::swap(&mut *slot, &mut ins);
-                ins_home = existing_home;
+                ins_dist = existing_dist;
             }
 
             pos = (pos + 1) & mask;
+            ins_dist = (ins_dist + 1) & mask;
         }
     }
 
@@ -265,12 +269,19 @@ impl TileMap {
 
     /// Remove a mapping.  Returns the value if the key was present.
     #[inline]
+    #[allow(dead_code)]
     pub fn remove(&mut self, x: i64, y: i64) -> Option<TileIdx> {
         let hash = tile_hash(x, y);
-        let fp = fingerprint_of(hash);
+        self.remove_hashed(x, y, hash)
+    }
+
+    #[inline]
+    pub(crate) fn remove_hashed(&mut self, x: i64, y: i64, hash: u64) -> Option<TileIdx> {
+        debug_assert_eq!(hash, tile_hash(x, y));
+        let target_ctrl = OCCUPIED_BIT | fingerprint_of(hash);
         let mask = self.mask;
-        let home = hash as usize & mask;
-        let mut pos = home;
+        let mut pos = hash as usize & mask;
+        let mut our_dist = 0usize;
 
         loop {
             // SAFETY: pos is always & mask which is < slots.len().
@@ -279,18 +290,18 @@ impl TileMap {
                 return None;
             }
             // Robin Hood early exit on miss.
-            let our_dist = pos.wrapping_sub(home) & mask;
             let their_dist = pos.wrapping_sub(slot.hash as usize & mask) & mask;
             if our_dist > their_dist {
                 return None;
             }
-            if slot.fingerprint() == fp && slot.key_x == x && slot.key_y == y {
+            if slot.ctrl == target_ctrl && slot.key_x == x && slot.key_y == y {
                 let old = TileIdx(slot.value);
                 self.backward_shift_delete(pos);
                 self.len -= 1;
                 return Some(old);
             }
             pos = (pos + 1) & mask;
+            our_dist = (our_dist + 1) & mask;
         }
     }
 
@@ -380,13 +391,6 @@ fn fingerprint_of(hash: u64) -> u32 {
     // collide with EMPTY's ctrl == 0 after masking).
     // Branchless: OR with 1 guarantees non-zero without a branch.
     (hash >> 32) as u32 & !OCCUPIED_BIT | 1
-}
-
-/// Displacement (distance from home) in a power-of-two table.
-#[inline(always)]
-#[allow(dead_code)]
-fn displacement(home: usize, pos: usize, mask: usize) -> usize {
-    pos.wrapping_sub(home) & mask
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
