@@ -1418,7 +1418,9 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use super::advance_core_avx2;
     #[cfg(target_arch = "aarch64")]
-    use super::{advance_core_neon, advance_core_neon_assume_changed};
+    use super::{
+        CORE_BACKEND_NEON, advance_core_const, advance_core_neon, advance_core_neon_assume_changed,
+    };
 
     use rand::RngCore;
     use rand::SeedableRng;
@@ -1660,6 +1662,30 @@ mod tests {
             assert_eq!(neon.1.east, assume.1.east);
             assert_eq!(neon.1.live_mask(), assume.1.live_mask());
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_const_backend_respects_force_store_flag() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+
+        let current = [0u64; TILE_SIZE];
+        let ghost = GhostZone::default();
+        let mut next = [u64::MAX; TILE_SIZE];
+
+        let (changed, border, has_live) = unsafe {
+            advance_core_const::<{ CORE_BACKEND_NEON }, false>(&current, &mut next, &ghost, false)
+        };
+
+        assert!(!changed);
+        assert!(!has_live);
+        assert_eq!(border.north, 0);
+        assert_eq!(border.south, 0);
+        assert_eq!(border.west, 0);
+        assert_eq!(border.east, 0);
+        assert_eq!(next, [u64::MAX; TILE_SIZE]);
     }
 
     #[test]
