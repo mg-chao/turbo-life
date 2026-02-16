@@ -107,7 +107,7 @@ const ASSUME_CHANGED_NEON_MIN_ACTIVE: usize = 2_048;
 // self-inflate churn metrics. Keep this gate conservative so we only enter it
 // when churn is already very high.
 #[cfg(target_arch = "aarch64")]
-const ASSUME_CHANGED_NEON_MIN_CHURN_PCT: usize = 85;
+const ASSUME_CHANGED_NEON_MIN_CHURN_PCT: usize = 93;
 #[cfg(target_arch = "aarch64")]
 const _: [(); 1] = [(); ((ASSUME_CHANGED_NEON_MIN_CHURN_PCT >= 80
     && ASSUME_CHANGED_NEON_MIN_CHURN_PCT <= 100) as usize)];
