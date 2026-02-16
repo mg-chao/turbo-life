@@ -1001,13 +1001,9 @@ unsafe fn advance_tile_fused_impl<
             sw: (sw_live & LIVE_NE) != 0,
             se: (se_live & LIVE_NW) != 0,
         };
+        let force_store = meta.alt_phase_dirty();
         unsafe {
-            advance_core_const::<CORE_BACKEND, ASSUME_CHANGED>(
-                current,
-                next,
-                &ghost,
-                meta.alt_phase_dirty(),
-            )
+            advance_core_const::<CORE_BACKEND, ASSUME_CHANGED>(current, next, &ghost, force_store)
         }
     } else {
         if missing_mask == MISSING_ALL_NEIGHBORS {
@@ -1438,9 +1434,9 @@ pub unsafe fn advance_tile_split(
 #[cfg(test)]
 mod tests {
     use super::{
-        BorderData, GhostZone, TILE_SIZE, advance_core_empty, advance_core_scalar, ghost_bit,
-        ghost_is_empty, ghost_is_empty_from_live_masks, ghost_is_empty_from_live_masks_ptr,
-        tile_is_empty,
+        BorderData, CellBuf, GhostZone, TILE_SIZE, TileMeta, advance_core_empty,
+        advance_core_scalar, ghost_bit, ghost_is_empty, ghost_is_empty_from_live_masks,
+        ghost_is_empty_from_live_masks_ptr, tile_is_empty,
     };
 
     #[cfg(target_arch = "x86_64")]
@@ -1448,6 +1444,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     use super::{
         CORE_BACKEND_NEON, advance_core_const, advance_core_neon, advance_core_neon_assume_changed,
+        advance_tile_fused_neon_no_track,
     };
 
     use rand::RngCore;
@@ -1472,6 +1469,15 @@ mod tests {
             sw: (rng.next_u64() & 1) != 0,
             se: (rng.next_u64() & 1) != 0,
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn stable_block_tile() -> [u64; TILE_SIZE] {
+        let mut tile = [0u64; TILE_SIZE];
+        let block = (1u64 << 10) | (1u64 << 11);
+        tile[10] = block;
+        tile[11] = block;
+        tile
     }
 
     #[test]
@@ -1714,6 +1720,122 @@ mod tests {
         assert_eq!(border.west, 0);
         assert_eq!(border.east, 0);
         assert_eq!(next, [u64::MAX; TILE_SIZE]);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_fused_no_track_skips_writes_when_alt_phase_is_clean() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+
+        let mut current = [CellBuf::empty()];
+        current[0].0 = stable_block_tile();
+        let mut next = [CellBuf([u64::MAX; TILE_SIZE])];
+        let mut meta = [TileMeta::empty()];
+        meta[0].set_has_live(true);
+        meta[0].set_alt_phase_dirty(false);
+
+        let mut next_borders_north = [u64::MAX];
+        let mut next_borders_south = [u64::MAX];
+        let mut next_borders_west = [u64::MAX];
+        let mut next_borders_east = [u64::MAX];
+        let borders_north_read = [0u64];
+        let borders_south_read = [0u64];
+        let borders_west_read = [0u64];
+        let borders_east_read = [0u64];
+        let neighbors = [[0u32; 8]];
+        let live_masks_read = [0u8];
+        let mut next_live_masks = [u8::MAX];
+
+        let result = unsafe {
+            advance_tile_fused_neon_no_track(
+                current.as_ptr(),
+                next.as_mut_ptr(),
+                meta.as_mut_ptr(),
+                next_borders_north.as_mut_ptr(),
+                next_borders_south.as_mut_ptr(),
+                next_borders_west.as_mut_ptr(),
+                next_borders_east.as_mut_ptr(),
+                borders_north_read.as_ptr(),
+                borders_south_read.as_ptr(),
+                borders_west_read.as_ptr(),
+                borders_east_read.as_ptr(),
+                neighbors.as_ptr(),
+                live_masks_read.as_ptr(),
+                next_live_masks.as_mut_ptr(),
+                0,
+            )
+        };
+
+        assert!(!result.changed);
+        assert!(result.has_live);
+        assert_eq!(result.live_mask, 0);
+        assert_eq!(next_borders_north[0], 0);
+        assert_eq!(next_borders_south[0], 0);
+        assert_eq!(next_borders_west[0], 0);
+        assert_eq!(next_borders_east[0], 0);
+        assert_eq!(next_live_masks[0], 0);
+        assert_eq!(next[0].0, [u64::MAX; TILE_SIZE]);
+        assert!(!meta[0].alt_phase_dirty());
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_fused_no_track_writes_when_alt_phase_is_dirty() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+
+        let mut current = [CellBuf::empty()];
+        current[0].0 = stable_block_tile();
+        let mut next = [CellBuf([u64::MAX; TILE_SIZE])];
+        let mut meta = [TileMeta::empty()];
+        meta[0].set_has_live(true);
+        meta[0].set_alt_phase_dirty(true);
+
+        let mut next_borders_north = [u64::MAX];
+        let mut next_borders_south = [u64::MAX];
+        let mut next_borders_west = [u64::MAX];
+        let mut next_borders_east = [u64::MAX];
+        let borders_north_read = [0u64];
+        let borders_south_read = [0u64];
+        let borders_west_read = [0u64];
+        let borders_east_read = [0u64];
+        let neighbors = [[0u32; 8]];
+        let live_masks_read = [0u8];
+        let mut next_live_masks = [u8::MAX];
+
+        let result = unsafe {
+            advance_tile_fused_neon_no_track(
+                current.as_ptr(),
+                next.as_mut_ptr(),
+                meta.as_mut_ptr(),
+                next_borders_north.as_mut_ptr(),
+                next_borders_south.as_mut_ptr(),
+                next_borders_west.as_mut_ptr(),
+                next_borders_east.as_mut_ptr(),
+                borders_north_read.as_ptr(),
+                borders_south_read.as_ptr(),
+                borders_west_read.as_ptr(),
+                borders_east_read.as_ptr(),
+                neighbors.as_ptr(),
+                live_masks_read.as_ptr(),
+                next_live_masks.as_mut_ptr(),
+                0,
+            )
+        };
+
+        assert!(!result.changed);
+        assert!(result.has_live);
+        assert_eq!(result.live_mask, 0);
+        assert_eq!(next_borders_north[0], 0);
+        assert_eq!(next_borders_south[0], 0);
+        assert_eq!(next_borders_west[0], 0);
+        assert_eq!(next_borders_east[0], 0);
+        assert_eq!(next_live_masks[0], 0);
+        assert_eq!(next[0].0, current[0].0);
+        assert!(!meta[0].alt_phase_dirty());
     }
 
     #[test]
