@@ -480,7 +480,22 @@ fn physical_core_count() -> usize {
         let physical = num_cpus::get_physical().max(1);
         #[cfg(target_os = "macos")]
         {
-            if let Some(perf) = apple_perf_core_count() {
+            let perf_only = std::env::var("TURBOLIFE_MACOS_PERF_ONLY")
+                .ok()
+                .and_then(|v| {
+                    let v = v.trim();
+                    if v.is_empty() {
+                        None
+                    } else if v == "1" || v.eq_ignore_ascii_case("true") {
+                        Some(true)
+                    } else if v == "0" || v.eq_ignore_ascii_case("false") {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(false);
+            if perf_only && let Some(perf) = apple_perf_core_count() {
                 return perf.min(physical).max(1);
             }
         }
