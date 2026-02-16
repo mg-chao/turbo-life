@@ -86,10 +86,17 @@ const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 2_048;
 #[cfg(target_arch = "aarch64")]
 const PREFETCH_TILE_DATA_AARCH64: bool = true;
+// Tuned for Apple perf cores: i+3 gives L2 enough lookahead without pushing
+// the soon-to-be-used tile out of L1 under heavy frontier churn.
 #[cfg(target_arch = "aarch64")]
-const PREFETCH_TILE_FAR_AHEAD_AARCH64: usize = 4;
+const PREFETCH_TILE_FAR_AHEAD_AARCH64: usize = 3;
 #[cfg(target_arch = "aarch64")]
-const PREFETCH_TILE_NEAR_AHEAD_AARCH64: usize = 2;
+const PREFETCH_TILE_NEAR_AHEAD_AARCH64: usize = 1;
+#[cfg(target_arch = "aarch64")]
+const _: [(); 1] = [(); (PREFETCH_TILE_NEAR_AHEAD_AARCH64 >= 1) as usize];
+#[cfg(target_arch = "aarch64")]
+const _: [(); 1] =
+    [(); (PREFETCH_TILE_FAR_AHEAD_AARCH64 > PREFETCH_TILE_NEAR_AHEAD_AARCH64) as usize];
 const PRECISE_INFLUENCE_MAX_ACTIVE: usize = 256;
 const PRECISE_INFLUENCE_DYNAMIC_MAX_ACTIVE: usize = 4_096;
 const PRECISE_INFLUENCE_DYNAMIC_MAX_CHURN_PCT: usize = 65;
