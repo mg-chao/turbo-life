@@ -305,9 +305,16 @@ impl WorkerScratch {
     }
 
     #[inline]
-    fn reserve_for_chunk(&mut self, chunk_len: usize, track_neighbor_influence: bool) {
-        Self::reserve_total_capacity(&mut self.changed, chunk_len);
-        if track_neighbor_influence {
+    fn reserve_for_chunk(
+        &mut self,
+        chunk_len: usize,
+        emit_changed: bool,
+        track_neighbor_influence: bool,
+    ) {
+        if emit_changed {
+            Self::reserve_total_capacity(&mut self.changed, chunk_len);
+        }
+        if emit_changed && track_neighbor_influence {
             Self::reserve_total_capacity(&mut self.changed_influence, chunk_len);
         }
         Self::reserve_total_capacity(&mut self.prune, chunk_len);
@@ -316,9 +323,16 @@ impl WorkerScratch {
     }
 
     #[inline(always)]
-    fn reserve_for_additional_work(&mut self, work_items: usize, track_neighbor_influence: bool) {
-        Self::reserve_additional_capacity(&mut self.changed, work_items);
-        if track_neighbor_influence {
+    fn reserve_for_additional_work(
+        &mut self,
+        work_items: usize,
+        emit_changed: bool,
+        track_neighbor_influence: bool,
+    ) {
+        if emit_changed {
+            Self::reserve_additional_capacity(&mut self.changed, work_items);
+        }
+        if emit_changed && track_neighbor_influence {
             Self::reserve_additional_capacity(&mut self.changed_influence, work_items);
         }
         Self::reserve_additional_capacity(&mut self.prune, work_items);
@@ -715,6 +729,7 @@ impl TurboLife {
         &mut self,
         worker_count: usize,
         active_len: usize,
+        emit_changed: bool,
         track_neighbor_influence: bool,
     ) {
         if self.worker_scratch.len() < worker_count {
@@ -727,7 +742,7 @@ impl TurboLife {
         let chunk_len = active_len.div_ceil(worker_count);
         for scratch in self.worker_scratch.iter_mut().take(worker_count) {
             scratch.clear();
-            scratch.reserve_for_chunk(chunk_len, track_neighbor_influence);
+            scratch.reserve_for_chunk(chunk_len, emit_changed, track_neighbor_influence);
         }
     }
 
@@ -756,6 +771,45 @@ impl TurboLife {
         let word = idx >> 6;
         let bit = 1u64 << (idx & 63);
         self.touched_bitmap[word] &= !bit;
+    }
+
+    #[inline]
+    fn derive_changed_from_active_minus_prune(&mut self) {
+        self.arena.changed_influence.clear();
+        std::mem::swap(&mut self.arena.changed_list, &mut self.arena.active_set);
+        self.arena.active_set.clear();
+        self.arena.active_set_dense_contiguous = false;
+        if self.arena.changed_list.is_empty() || self.arena.prune_buf.is_empty() {
+            return;
+        }
+
+        // Remove tiles queued for pruning from the synthesized changed list.
+        // This avoids carrying released slots into the next active rebuild.
+        for i in 0..self.arena.prune_buf.len() {
+            let idx = self.arena.prune_buf[i];
+            self.ensure_touched_capacity(idx.index());
+            let word = idx.index() >> 6;
+            let bit = 1u64 << (idx.index() & 63);
+            self.touched_bitmap[word] |= bit;
+        }
+
+        let mut write = 0usize;
+        for read in 0..self.arena.changed_list.len() {
+            let idx = self.arena.changed_list[read];
+            let ii = idx.index();
+            let word = ii >> 6;
+            let bit = 1u64 << (ii & 63);
+            if word >= self.touched_bitmap.len() || (self.touched_bitmap[word] & bit) == 0 {
+                self.arena.changed_list[write] = idx;
+                write += 1;
+            }
+        }
+        self.arena.changed_list.truncate(write);
+
+        for i in 0..self.arena.prune_buf.len() {
+            let idx = self.arena.prune_buf[i];
+            self.touched_clear(idx.index());
+        }
     }
 
     #[inline(always)]
@@ -1063,6 +1117,11 @@ impl TurboLife {
             && backend == KernelBackend::Neon
             && active_len >= ASSUME_CHANGED_NEON_MIN_ACTIVE
             && !churn_below_percent(changed_len, active_len, ASSUME_CHANGED_NEON_MIN_CHURN_PCT);
+        #[cfg(target_arch = "aarch64")]
+        let assume_changed_mode = assume_changed_neon;
+        #[cfg(not(target_arch = "aarch64"))]
+        let assume_changed_mode = false;
+        let emit_changed = !assume_changed_mode;
 
         let (cb_lo, cb_hi) = self.arena.cell_bufs.split_at_mut(1);
         let (current_vec, next_vec) = if cp == 0 {
@@ -1212,15 +1271,17 @@ impl TurboLife {
                         };
 
                         if result.changed {
-                            unsafe {
-                                vec_push_unchecked(&mut self.arena.changed_list, idx);
-                            }
-                            if $track {
+                            if emit_changed {
                                 unsafe {
-                                    vec_push_unchecked(
-                                        &mut self.arena.changed_influence,
-                                        result.neighbor_influence_mask,
-                                    );
+                                    vec_push_unchecked(&mut self.arena.changed_list, idx);
+                                }
+                                if $track {
+                                    unsafe {
+                                        vec_push_unchecked(
+                                            &mut self.arena.changed_influence,
+                                            result.neighbor_influence_mask,
+                                        );
+                                    }
                                 }
                             }
                         } else if !result.has_live {
@@ -1334,15 +1395,17 @@ impl TurboLife {
                         };
 
                         if result.changed {
-                            unsafe {
-                                vec_push_unchecked(&mut self.arena.changed_list, idx);
-                            }
-                            if $track {
+                            if emit_changed {
                                 unsafe {
-                                    vec_push_unchecked(
-                                        &mut self.arena.changed_influence,
-                                        result.neighbor_influence_mask,
-                                    );
+                                    vec_push_unchecked(&mut self.arena.changed_list, idx);
+                                }
+                                if $track {
+                                    unsafe {
+                                        vec_push_unchecked(
+                                            &mut self.arena.changed_influence,
+                                            result.neighbor_influence_mask,
+                                        );
+                                    }
                                 }
                             }
                         } else if !result.has_live {
@@ -1491,7 +1554,12 @@ impl TurboLife {
             // Keep dynamic scheduling whenever the frontier is not huge; it handles
             // heterogeneous cores much better than fixed contiguous slices.
             let use_static_schedule = active_len >= PARALLEL_STATIC_SCHEDULE_THRESHOLD;
-            self.prepare_worker_scratch(worker_count, active_len, track_neighbor_influence);
+            self.prepare_worker_scratch(
+                worker_count,
+                active_len,
+                emit_changed,
+                track_neighbor_influence,
+            );
             let scratch_ptr = SendPtr::new(self.worker_scratch.as_mut_ptr());
             #[cfg(target_arch = "x86_64")]
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
@@ -1589,15 +1657,17 @@ impl TurboLife {
                     };
 
                     if result.changed {
-                        unsafe {
-                            vec_push_unchecked(&mut ($scratch).changed, idx);
-                        }
-                        if $track {
+                        if emit_changed {
                             unsafe {
-                                vec_push_unchecked(
-                                    &mut ($scratch).changed_influence,
-                                    result.neighbor_influence_mask,
-                                );
+                                vec_push_unchecked(&mut ($scratch).changed, idx);
+                            }
+                            if $track {
+                                unsafe {
+                                    vec_push_unchecked(
+                                        &mut ($scratch).changed_influence,
+                                        result.neighbor_influence_mask,
+                                    );
+                                }
                             }
                         }
                     } else if !result.has_live {
@@ -1631,7 +1701,11 @@ impl TurboLife {
                                 }
                                 let end = start.saturating_add($chunk_size).min(active_len);
                                 let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
-                                scratch.reserve_for_additional_work(end - start, $track);
+                                scratch.reserve_for_additional_work(
+                                    end - start,
+                                    emit_changed,
+                                    $track,
+                                );
                                 for i in start..end {
                                     process_work_item!($advance, scratch, i, end, $track);
                                 }
@@ -1763,7 +1837,11 @@ impl TurboLife {
                                             break;
                                         }
                                         let end = start.saturating_add(chunk_size).min(active_len);
-                                        scratch.reserve_for_additional_work(end - start, $track);
+                                        scratch.reserve_for_additional_work(
+                                            end - start,
+                                            emit_changed,
+                                            $track,
+                                        );
                                         for i in start..end {
                                             process_work_item!($advance, scratch, i, end, $track);
                                         }
@@ -1891,17 +1969,25 @@ impl TurboLife {
 
             merge_worker_vectors!(self.arena.expand_buf, expand, total_expand, max_expand);
             merge_worker_vectors!(self.arena.prune_buf, prune, total_prune, max_prune);
-            merge_worker_vectors!(self.arena.changed_list, changed, total_changed, max_changed);
-            if track_neighbor_influence {
-                merge_worker_vectors!(
-                    self.arena.changed_influence,
-                    changed_influence,
-                    total_changed,
-                    max_changed
-                );
+            if emit_changed {
+                merge_worker_vectors!(self.arena.changed_list, changed, total_changed, max_changed);
+                if track_neighbor_influence {
+                    merge_worker_vectors!(
+                        self.arena.changed_influence,
+                        changed_influence,
+                        total_changed,
+                        max_changed
+                    );
+                } else {
+                    self.arena.changed_influence.clear();
+                }
             } else {
+                self.arena.changed_list.clear();
                 self.arena.changed_influence.clear();
             }
+        }
+        if assume_changed_mode {
+            self.derive_changed_from_active_minus_prune();
         }
         if !self.arena.changed_list.is_empty() {
             if track_neighbor_influence {
@@ -2206,10 +2292,10 @@ mod tests {
     #[test]
     fn worker_scratch_reserve_for_chunk_reaches_requested_capacity() {
         let mut scratch = super::WorkerScratch::default();
-        scratch.reserve_for_chunk(8, true);
+        scratch.reserve_for_chunk(8, true, true);
 
         let chunk_target = scratch.changed.capacity() + 1;
-        scratch.reserve_for_chunk(chunk_target, true);
+        scratch.reserve_for_chunk(chunk_target, true, true);
         assert!(
             scratch.changed.capacity() >= chunk_target,
             "changed capacity {} < chunk target {chunk_target}",
@@ -2228,12 +2314,38 @@ mod tests {
 
         let expand_chunk_target = scratch.expand.capacity().div_ceil(3) + 1;
         let expand_target = expand_chunk_target.saturating_mul(3);
-        scratch.reserve_for_chunk(expand_chunk_target, false);
+        scratch.reserve_for_chunk(expand_chunk_target, false, false);
         assert!(
             scratch.expand.capacity() >= expand_target,
             "expand capacity {} < expand target {expand_target}",
             scratch.expand.capacity()
         );
+    }
+
+    #[test]
+    fn derive_changed_from_active_minus_prune_excludes_pruned_tiles() {
+        let mut engine = TurboLife::new();
+        let keep_a = engine.arena.allocate((0, 0));
+        let drop_b = engine.arena.allocate((1, 0));
+        let keep_c = engine.arena.allocate((2, 0));
+
+        engine.arena.active_set = vec![keep_a, drop_b, keep_c];
+        engine.arena.active_set_dense_contiguous = true;
+        engine.arena.prune_buf = vec![drop_b];
+        engine.arena.changed_influence = vec![1, 2, 3];
+
+        engine.derive_changed_from_active_minus_prune();
+
+        assert_eq!(engine.arena.changed_list, vec![keep_a, keep_c]);
+        assert!(engine.arena.changed_influence.is_empty());
+        assert!(engine.arena.active_set.is_empty());
+        assert!(!engine.arena.active_set_dense_contiguous);
+
+        // Ensure prune-mark scratch cleanup does not leak into future calls.
+        engine.arena.active_set = vec![drop_b];
+        engine.arena.prune_buf.clear();
+        engine.derive_changed_from_active_minus_prune();
+        assert_eq!(engine.arena.changed_list, vec![drop_b]);
     }
 
     #[test]
