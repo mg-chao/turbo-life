@@ -9,7 +9,7 @@ use super::tile::{MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
 const PARALLEL_PRUNE_CANDIDATES_MIN: usize = 512;
 const PRUNE_FILTER_CHUNK_MIN: usize = 64;
 const PRUNE_FILTER_CHUNK_MAX: usize = 512;
-const PARALLEL_PRUNE_BITMAP_MIN: usize = 65_536;
+const PARALLEL_PRUNE_BITMAP_MIN: usize = 4_096;
 const ACTIVE_SORT_STD_MAX: usize = 8_192;
 const ACTIVE_SORT_RADIX_MIN: usize = 32_768;
 const ACTIVE_BITMAP_REBUILD_MIN_OCCUPIED: usize = 2_048;
@@ -26,8 +26,8 @@ const _: [(); 1] =
 struct SendConstPtr<T> {
     inner: *const T,
 }
-unsafe impl<T> Send for SendConstPtr<T> {}
-unsafe impl<T> Sync for SendConstPtr<T> {}
+unsafe impl<T: Sync> Send for SendConstPtr<T> {}
+unsafe impl<T: Sync> Sync for SendConstPtr<T> {}
 impl<T> Copy for SendConstPtr<T> {}
 impl<T> Clone for SendConstPtr<T> {
     fn clone(&self) -> Self {
