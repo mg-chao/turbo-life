@@ -629,6 +629,7 @@ pub struct TurboLife {
     generation: u64,
     population_cache: Option<u64>,
     pool: rayon::ThreadPool,
+    pool_threads: usize,
     backend: KernelBackend,
     /// Reusable per-tile marker for batch dedup in `set_cells`.
     /// Packed bitset indexed by `TileIdx.index()`, grown on demand.
@@ -654,11 +655,12 @@ impl TurboLife {
 
     /// Create a TurboLife engine with explicit configuration.
     pub fn with_config(config: TurboLifeConfig) -> Self {
-        let threads = resolve_thread_count(&config);
+        let configured_threads = resolve_thread_count(&config);
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
+            .num_threads(configured_threads)
             .build()
             .expect("failed to build TurboLife rayon thread pool");
+        let pool_threads = pool.current_num_threads().max(1);
         let backend = resolve_kernel_backend(&config);
 
         Self {
@@ -666,10 +668,13 @@ impl TurboLife {
             generation: 0,
             population_cache: Some(0),
             pool,
+            pool_threads,
             backend,
             touched_bitmap: Vec::new(),
             tile_cache: TileCache::new(),
-            worker_scratch: (0..threads).map(|_| WorkerScratch::default()).collect(),
+            worker_scratch: (0..pool_threads)
+                .map(|_| WorkerScratch::default())
+                .collect(),
             set_cells_scratch: Vec::new(),
         }
     }
@@ -1014,7 +1019,7 @@ impl TurboLife {
         let bp = self.arena.border_phase;
         let cp = self.arena.cell_phase;
         let backend = self.backend;
-        let thread_count = rayon::current_num_threads().max(1);
+        let thread_count = self.pool_threads;
         let effective_threads = tuned_parallel_threads(active_len, thread_count);
         let run_parallel = effective_threads > 1;
         let track_neighbor_influence = active_len <= PRECISE_INFLUENCE_MAX_ACTIVE
@@ -2184,6 +2189,15 @@ mod tests {
         let engine = TurboLife::new();
         let expected = auto_pool_thread_count_for_physical(num_cpus::get_physical().max(1));
         assert_eq!(engine.pool.current_num_threads(), expected);
+    }
+
+    #[test]
+    fn pool_thread_metadata_tracks_runtime_pool_size() {
+        let engine = TurboLife::with_config(TurboLifeConfig::default().thread_count(3));
+        let runtime_threads = engine.pool.current_num_threads();
+
+        assert_eq!(engine.pool_threads, runtime_threads);
+        assert_eq!(engine.worker_scratch.len(), runtime_threads);
     }
 
     #[test]
