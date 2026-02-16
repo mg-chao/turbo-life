@@ -178,6 +178,9 @@ pub struct GhostZone {
 
 const FLAG_OCCUPIED: u8 = 1 << 0;
 const FLAG_HAS_LIVE: u8 = 1 << 1;
+// Indicates whether the non-current (alternate) cell phase buffer for this tile
+// may differ from the current buffer. When false, kernels can safely skip
+// unchanged-row stores because both phases are already in sync.
 const FLAG_ALT_PHASE_DIRTY: u8 = 1 << 2;
 pub const MISSING_ALL_NEIGHBORS: u8 = 0xFF;
 
@@ -226,9 +229,8 @@ impl TileMeta {
     }
     #[inline(always)]
     pub fn update_after_step(&mut self, changed: bool, has_live: bool) {
-        let was_live = self.has_live();
         self.set_has_live(has_live);
-        self.set_alt_phase_dirty(!has_live && was_live);
+        self.set_alt_phase_dirty(changed);
         if changed {
             if self.population != POPULATION_UNKNOWN {
                 self.population = POPULATION_UNKNOWN;
@@ -357,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn tile_meta_tracks_alt_phase_dirty_only_on_live_to_dead_transition() {
+    fn tile_meta_tracks_alt_phase_dirty_from_change_state() {
         let mut meta = TileMeta::empty();
         assert!(!meta.alt_phase_dirty());
 
@@ -369,5 +371,9 @@ mod tests {
         meta.update_after_step(false, false);
         assert!(!meta.has_live());
         assert!(!meta.alt_phase_dirty());
+
+        meta.update_after_step(true, true);
+        assert!(meta.has_live());
+        assert!(meta.alt_phase_dirty());
     }
 }

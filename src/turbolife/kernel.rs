@@ -686,14 +686,15 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool>(
     current: &[u64; TILE_SIZE],
     next: &mut [u64; TILE_SIZE],
     ghost: &GhostZone,
+    force_store: bool,
 ) -> (bool, BorderData, bool) {
     use std::arch::aarch64::{
-        vandq_u64, vbicq_u64, vdupq_n_u64, veorq_u64, vgetq_lane_u64, vld1q_u64, vorrq_u64,
-        vshlq_n_u64, vshrq_n_u64, vst1q_u64,
+        vandq_u64, vbicq_u64, veorq_u64, vgetq_lane_u64, vld1q_u64, vorrq_u64, vshlq_n_u64,
+        vshrq_n_u64, vst1q_u64,
     };
 
-    let mut diff_acc = vdupq_n_u64(0);
-    let mut live_acc = vdupq_n_u64(0);
+    let mut changed = !TRACK_DIFF;
+    let mut has_live = false;
     let mut border_west = 0u64;
     let mut border_east = 0u64;
     let current_ptr = current.as_ptr();
@@ -749,15 +750,21 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool>(
 
             if TRACK_DIFF {
                 let diff = veorq_u64(next_rows, $row_self);
-                diff_acc = vorrq_u64(diff_acc, diff);
-            }
-            live_acc = vorrq_u64(live_acc, next_rows);
-
-            unsafe {
-                vst1q_u64(next_ptr.add($row_base), next_rows);
+                let pair_changed = (vgetq_lane_u64(diff, 0) | vgetq_lane_u64(diff, 1)) != 0;
+                changed |= pair_changed;
+                if force_store || pair_changed {
+                    unsafe {
+                        vst1q_u64(next_ptr.add($row_base), next_rows);
+                    }
+                }
+            } else {
+                unsafe {
+                    vst1q_u64(next_ptr.add($row_base), next_rows);
+                }
             }
             let row0 = vgetq_lane_u64(next_rows, 0);
             let row1 = vgetq_lane_u64(next_rows, 1);
+            has_live |= (row0 | row1) != 0;
             border_west |= (row0 & 1) << $row_base;
             border_west |= (row1 & 1) << ($row_base + 1);
             border_east |= ((row0 >> 63) & 1) << $row_base;
@@ -801,12 +808,6 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool>(
     let (_, border_north) = process_pair!(last_base, row_above_last, row_self_last, row_below_last);
 
     let border = BorderData::from_edges(border_north, border_south, border_west, border_east);
-    let changed = if TRACK_DIFF {
-        (vgetq_lane_u64(diff_acc, 0) | vgetq_lane_u64(diff_acc, 1)) != 0
-    } else {
-        true
-    };
-    let has_live = (vgetq_lane_u64(live_acc, 0) | vgetq_lane_u64(live_acc, 1)) != 0;
     (changed, border, has_live)
 }
 
@@ -816,8 +817,9 @@ pub unsafe fn advance_core_neon(
     current: &[u64; TILE_SIZE],
     next: &mut [u64; TILE_SIZE],
     ghost: &GhostZone,
+    force_store: bool,
 ) -> (bool, BorderData, bool) {
-    unsafe { advance_core_neon_impl::<true>(current, next, ghost) }
+    unsafe { advance_core_neon_impl::<true>(current, next, ghost, force_store) }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -827,7 +829,7 @@ unsafe fn advance_core_neon_assume_changed(
     next: &mut [u64; TILE_SIZE],
     ghost: &GhostZone,
 ) -> (bool, BorderData, bool) {
-    unsafe { advance_core_neon_impl::<false>(current, next, ghost) }
+    unsafe { advance_core_neon_impl::<false>(current, next, ghost, true) }
 }
 
 #[inline(always)]
@@ -853,7 +855,7 @@ pub fn advance_core(
             #[cfg(target_arch = "aarch64")]
             {
                 if std::arch::is_aarch64_feature_detected!("neon") {
-                    unsafe { advance_core_neon(current, next, ghost) }
+                    unsafe { advance_core_neon(current, next, ghost, true) }
                 } else {
                     advance_core_scalar(current, next, ghost)
                 }
@@ -875,6 +877,7 @@ unsafe fn advance_core_const<const CORE_BACKEND: u8, const ASSUME_CHANGED: bool>
     current: &[u64; TILE_SIZE],
     next: &mut [u64; TILE_SIZE],
     ghost: &GhostZone,
+    force_store: bool,
 ) -> (bool, BorderData, bool) {
     debug_assert!(
         !ASSUME_CHANGED || CORE_BACKEND == CORE_BACKEND_NEON,
@@ -897,7 +900,7 @@ unsafe fn advance_core_const<const CORE_BACKEND: u8, const ASSUME_CHANGED: bool>
             if ASSUME_CHANGED {
                 return unsafe { advance_core_neon_assume_changed(current, next, ghost) };
             }
-            return unsafe { advance_core_neon(current, next, ghost) };
+            return unsafe { advance_core_neon(current, next, ghost, force_store) };
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
@@ -970,7 +973,14 @@ unsafe fn advance_tile_fused_impl<
             sw: (sw_live & LIVE_NE) != 0,
             se: (se_live & LIVE_NW) != 0,
         };
-        unsafe { advance_core_const::<CORE_BACKEND, ASSUME_CHANGED>(current, next, &ghost) }
+        unsafe {
+            advance_core_const::<CORE_BACKEND, ASSUME_CHANGED>(
+                current,
+                next,
+                &ghost,
+                meta.alt_phase_dirty(),
+            )
+        }
     } else {
         if missing_mask == MISSING_ALL_NEIGHBORS {
             debug_assert!(tile_is_empty(current));
@@ -1610,7 +1620,7 @@ mod tests {
             let mut next_neon = [0u64; TILE_SIZE];
 
             let scalar = advance_core_scalar(&current, &mut next_scalar, &ghost);
-            let neon = unsafe { advance_core_neon(&current, &mut next_neon, &ghost) };
+            let neon = unsafe { advance_core_neon(&current, &mut next_neon, &ghost, true) };
 
             assert_eq!(next_scalar, next_neon);
             assert_eq!(scalar.0, neon.0);
@@ -1637,7 +1647,7 @@ mod tests {
             let mut next_neon = [0u64; TILE_SIZE];
             let mut next_assume = [0u64; TILE_SIZE];
 
-            let neon = unsafe { advance_core_neon(&current, &mut next_neon, &ghost) };
+            let neon = unsafe { advance_core_neon(&current, &mut next_neon, &ghost, true) };
             let assume =
                 unsafe { advance_core_neon_assume_changed(&current, &mut next_assume, &ghost) };
 
