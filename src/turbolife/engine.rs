@@ -1979,7 +1979,6 @@ impl TurboLife {
                     }
                 }
             } else {
-                let chunk_size = dynamic_parallel_chunk_size(active_len, changed_len, worker_count);
                 let cursor = AtomicUsize::new(0);
 
                 macro_rules! parallel_kernel_lockfree {
@@ -1994,6 +1993,15 @@ impl TurboLife {
                             }
                             let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
                             loop {
+                                let observed = cursor_ref.load(Ordering::Relaxed);
+                                if observed >= active_len {
+                                    break;
+                                }
+                                let chunk_size = dynamic_parallel_chunk_size(
+                                    active_len - observed,
+                                    changed_len,
+                                    active_workers,
+                                );
                                 let start = cursor_ref.fetch_add(chunk_size, Ordering::Relaxed);
                                 if start >= active_len {
                                     break;
