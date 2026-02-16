@@ -103,10 +103,6 @@ const _: [(); 1] = [(); (PREFETCH_TILE_NEAR_AHEAD_AARCH64 >= 1) as usize];
 #[cfg(target_arch = "aarch64")]
 const _: [(); 1] =
     [(); (PREFETCH_TILE_FAR_AHEAD_AARCH64 > PREFETCH_TILE_NEAR_AHEAD_AARCH64) as usize];
-const PRECISE_INFLUENCE_MAX_ACTIVE: usize = 256;
-const PRECISE_INFLUENCE_DYNAMIC_MAX_ACTIVE: usize = 4_096;
-const PRECISE_INFLUENCE_DYNAMIC_MAX_CHURN_PCT: usize = 65;
-const _: [(); 1] = [(); (PRECISE_INFLUENCE_DYNAMIC_MAX_CHURN_PCT <= 100) as usize];
 #[cfg(target_arch = "aarch64")]
 const ASSUME_CHANGED_NEON_MIN_ACTIVE: usize = 2_048;
 // `assume_changed` reports every live tile as changed; once enabled it can
@@ -576,11 +572,13 @@ fn tuned_parallel_threads(active_len: usize, thread_count: usize) -> usize {
     effective.max(1)
 }
 
+#[cfg(test)]
 #[inline]
 fn churn_at_most_percent(changed_len: usize, active_len: usize, max_churn_pct: usize) -> bool {
     (changed_len as u128) * 100 <= (active_len as u128) * (max_churn_pct as u128)
 }
 
+#[cfg(any(test, target_arch = "aarch64"))]
 #[inline]
 fn churn_below_percent(changed_len: usize, active_len: usize, churn_pct_threshold: usize) -> bool {
     (changed_len as u128) * 100 < (active_len as u128) * (churn_pct_threshold as u128)
@@ -1178,13 +1176,9 @@ impl TurboLife {
         let thread_count = self.pool_threads;
         let effective_threads = tuned_parallel_threads(active_len, thread_count);
         let run_parallel = effective_threads > 1;
-        let track_neighbor_influence = active_len <= PRECISE_INFLUENCE_MAX_ACTIVE
-            || (active_len <= PRECISE_INFLUENCE_DYNAMIC_MAX_ACTIVE
-                && churn_at_most_percent(
-                    changed_len,
-                    active_len,
-                    PRECISE_INFLUENCE_DYNAMIC_MAX_CHURN_PCT,
-                ));
+        // Throughput-first mode: skip per-tile directional influence tracking
+        // and use uniform neighbor activation to reduce kernel-side write churn.
+        let track_neighbor_influence = false;
         #[cfg(target_arch = "aarch64")]
         let assume_changed_neon = !track_neighbor_influence
             && backend == KernelBackend::Neon
