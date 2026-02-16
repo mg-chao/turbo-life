@@ -1101,6 +1101,28 @@ mod tests {
     }
 
     #[test]
+    fn idx_at_rejects_stale_coord_mapping() {
+        let mut arena = TileArena::new();
+        let idx = arena.allocate((0, 0));
+        arena.coords[idx.index()] = (9, 9);
+
+        assert!(arena.idx_at((0, 0)).is_none());
+    }
+
+    #[test]
+    fn idx_at_cached_prunes_stale_coord_mapping() {
+        let mut arena = TileArena::new();
+        let idx = arena.allocate((0, 0));
+
+        assert_eq!(arena.idx_at_cached((0, 0)), Some(idx));
+        arena.coords[idx.index()] = (9, 9);
+
+        assert!(arena.idx_at_cached((0, 0)).is_none());
+        assert!(arena.coord_to_idx.get(0, 0).is_none());
+        assert!(arena.idx_at_cached((0, 0)).is_none());
+    }
+
+    #[test]
     fn structural_slot_changes_invalidate_dense_active_cache_flag() {
         let mut arena = TileArena::new();
         let idx = arena.allocate((0, 0));

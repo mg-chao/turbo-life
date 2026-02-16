@@ -218,11 +218,6 @@ fn pack_expand_candidate(idx: TileIdx, dir: usize) -> u32 {
     (idx.0 << 3) | dir as u32
 }
 
-#[inline(always)]
-fn prune_candidate_invalid(meta: super::tile::TileMeta) -> bool {
-    !meta.occupied() || meta.has_live()
-}
-
 /// # Safety
 /// Caller must ensure `expand` has enough spare capacity for all candidates in
 /// `missing_mask & live_mask` before calling.
@@ -605,7 +600,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                             // SAFETY: pointers are valid for the entire prune phase.
                             let should_prune = unsafe {
                                 let meta = *mp.add(ii);
-                                if prune_candidate_invalid(meta) {
+                                if !meta.occupied() || meta.has_live() {
                                     false
                                 } else {
                                     let missing_mask = meta.missing_mask;
@@ -634,7 +629,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                         // SAFETY: pointers are valid for the entire prune phase.
                         let should_prune = unsafe {
                             let meta = *mp.add(ii);
-                            if prune_candidate_invalid(meta) {
+                            if !meta.occupied() || meta.has_live() {
                                 false
                             } else {
                                 let missing_mask = meta.missing_mask;
@@ -651,7 +646,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
             let idx = arena.prune_buf[i];
             let ii = idx.index();
             let meta = arena.meta[ii];
-            if prune_candidate_invalid(meta) {
+            if !meta.occupied() || meta.has_live() {
                 continue;
             }
             let should_prune = meta.missing_mask == MISSING_ALL_NEIGHBORS
