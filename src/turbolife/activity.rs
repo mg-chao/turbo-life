@@ -283,7 +283,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     arena.begin_active_rebuild_with_capacity(meta_len);
 
     let dense_rebuild = arena.occupied_count >= 4096
-        && changed_count.saturating_mul(100) >= arena.occupied_count.saturating_mul(95);
+        && changed_count.saturating_mul(100) >= arena.occupied_count.saturating_mul(90);
     if dense_rebuild {
         let can_reuse_full_contiguous_active = arena.free_list.is_empty()
             && arena.occupied_count + 1 == arena.meta.len()
