@@ -371,18 +371,13 @@ pub(crate) fn advance_core_empty_with_clear(
     next[0] = south_row;
     next[TILE_SIZE - 1] = north_row;
 
-    let mut west_bits = west_trip;
-    while west_bits != 0 {
-        let row = west_bits.trailing_zeros() as usize;
-        next[row] |= 1;
-        west_bits &= west_bits - 1;
-    }
-
-    let mut east_bits = east_trip;
-    while east_bits != 0 {
-        let row = east_bits.trailing_zeros() as usize;
-        next[row] |= 1u64 << 63;
-        east_bits &= east_bits - 1;
+    let mut edge_rows = west_trip | east_trip;
+    while edge_rows != 0 {
+        let row = edge_rows.trailing_zeros() as usize;
+        let west_bit = (west_trip >> row) & 1;
+        let east_bit = ((east_trip >> row) & 1) << 63;
+        next[row] |= west_bit | east_bit;
+        edge_rows &= edge_rows - 1;
     }
 
     let has_live = (south_row | north_row | border_west | border_east) != 0;
@@ -791,10 +786,10 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
             let row0 = vgetq_lane_u64(next_rows, 0);
             let row1 = vgetq_lane_u64(next_rows, 1);
             has_live |= (row0 | row1) != 0;
-            border_west |= (row0 & 1) << $row_base;
-            border_west |= (row1 & 1) << ($row_base + 1);
-            border_east |= ((row0 >> 63) & 1) << $row_base;
-            border_east |= ((row1 >> 63) & 1) << ($row_base + 1);
+            let west_bits = (row0 & 1) | ((row1 & 1) << 1);
+            let east_bits = ((row0 >> 63) & 1) | (((row1 >> 63) & 1) << 1);
+            border_west |= west_bits << $row_base;
+            border_east |= east_bits << $row_base;
             (row0, row1)
         }};
     }
