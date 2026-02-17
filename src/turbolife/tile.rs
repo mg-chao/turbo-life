@@ -89,8 +89,66 @@ impl Direction {
 pub const NO_NEIGHBOR: u32 = 0;
 const _: [(); 1] = [(); (NO_NEIGHBOR == 0) as usize];
 
-pub type Neighbors = [u32; 8];
-pub const EMPTY_NEIGHBORS: Neighbors = [NO_NEIGHBOR; 8];
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C, align(32))]
+pub struct Neighbors {
+    lanes: [u32; 8],
+}
+
+impl Neighbors {
+    #[inline(always)]
+    pub const fn new(lanes: [u32; 8]) -> Self {
+        Self { lanes }
+    }
+}
+
+impl Default for Neighbors {
+    #[inline(always)]
+    fn default() -> Self {
+        Self::new([NO_NEIGHBOR; 8])
+    }
+}
+
+impl From<[u32; 8]> for Neighbors {
+    #[inline(always)]
+    fn from(value: [u32; 8]) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::ops::Index<usize> for Neighbors {
+    type Output = u32;
+
+    #[inline(always)]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.lanes[index]
+    }
+}
+
+impl std::ops::IndexMut<usize> for Neighbors {
+    #[inline(always)]
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.lanes[index]
+    }
+}
+
+impl std::ops::Deref for Neighbors {
+    type Target = [u32; 8];
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.lanes
+    }
+}
+
+impl std::ops::DerefMut for Neighbors {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.lanes
+    }
+}
+
+pub const EMPTY_NEIGHBORS: Neighbors = Neighbors::new([NO_NEIGHBOR; 8]);
 
 /// Pre-extracted border data from a tile's current buffer.
 /// Corner activity is represented by the corner bits in `north` / `south`.

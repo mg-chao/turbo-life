@@ -781,7 +781,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
     if run_parallel {
         let candidate_chunk_size = prune_filter_chunk_size(prune_len, thread_count);
         let meta_ptr = SendConstPtr::new(arena.meta.as_ptr());
-        let neighbors_ptr = SendConstPtr::new(arena.neighbors.as_ptr());
+        let neighbors_ptr = SendConstPtr::new(arena.neighbors.as_ptr().cast::<[u32; 8]>());
         let live_masks_ptr = SendConstPtr::new(live_masks_ptr);
         if prune_len >= PARALLEL_PRUNE_BITMAP_MIN {
             used_bitmap_marks = true;
@@ -835,7 +835,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
         }
     } else {
         let meta_ptr = arena.meta.as_ptr();
-        let neighbors_ptr = arena.neighbors.as_ptr();
+        let neighbors_ptr = arena.neighbors.as_ptr().cast::<[u32; 8]>();
         for i in 0..prune_len {
             let idx = arena.prune_buf[i];
             let ii = idx.index();

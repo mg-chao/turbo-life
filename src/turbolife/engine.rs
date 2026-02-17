@@ -99,18 +99,14 @@ const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 #[cfg(target_arch = "aarch64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 32_768;
-// AArch64 PRFM hints are workload- and CPU-dependent. Keep them behind an
-// opt-in feature so the auto-tuner can accept/reject them per machine.
+// AArch64 PRFM prefetch hints are throughput-positive on the primary
+// main.rs harness (Apple M4 dense frontier), so keep them enabled.
 #[cfg(target_arch = "aarch64")]
-#[cfg(feature = "aggressive-prefetch-aarch64")]
 const PREFETCH_TILE_DATA_AARCH64: bool = true;
-#[cfg(target_arch = "aarch64")]
-#[cfg(not(feature = "aggressive-prefetch-aarch64"))]
-const PREFETCH_TILE_DATA_AARCH64: bool = false;
-// Tuned for Apple perf cores: i+3 gives L2 enough lookahead while i+1 keeps
+// Tuned for Apple perf cores: i+4 gives L2 enough lookahead while i+1 keeps
 // the immediate tile in L1 under heavy frontier churn.
 #[cfg(target_arch = "aarch64")]
-const PREFETCH_TILE_FAR_AHEAD_AARCH64: usize = 3;
+const PREFETCH_TILE_FAR_AHEAD_AARCH64: usize = 4;
 #[cfg(target_arch = "aarch64")]
 const PREFETCH_TILE_NEAR_AHEAD_AARCH64: usize = 1;
 #[cfg(target_arch = "aarch64")]
@@ -669,6 +665,32 @@ unsafe fn vec_push_unchecked<T>(buf: &mut Vec<T>, value: T) {
     unsafe {
         std::ptr::write(buf.as_mut_ptr().add(len), value);
         buf.set_len(len + 1);
+    }
+}
+
+#[inline(always)]
+unsafe fn active_index_at<const DENSE_CONTIGUOUS: bool>(
+    active_ptr: *const TileIdx,
+    pos: usize,
+) -> usize {
+    if DENSE_CONTIGUOUS {
+        debug_assert!(pos < u32::MAX as usize);
+        pos + 1
+    } else {
+        unsafe { (*active_ptr.add(pos)).index() }
+    }
+}
+
+#[inline(always)]
+unsafe fn active_tile_at<const DENSE_CONTIGUOUS: bool>(
+    active_ptr: *const TileIdx,
+    pos: usize,
+) -> TileIdx {
+    if DENSE_CONTIGUOUS {
+        debug_assert!(pos < u32::MAX as usize);
+        TileIdx((pos + 1) as u32)
+    } else {
+        unsafe { *active_ptr.add(pos) }
     }
 }
 
@@ -1251,13 +1273,22 @@ impl TurboLife {
         debug_assert_eq!(self.arena.meta.len(), live_masks_read.len());
         debug_assert_eq!(self.arena.meta.len(), next_live_masks_vec.len());
         debug_assert_eq!(self.arena.meta.len(), self.arena.neighbors.len());
+        let dense_active_contiguous = self.arena.active_set_dense_contiguous;
 
         macro_rules! dispatch_by_emit {
             ($macro_name:ident, $advance:path, $track:expr) => {{
-                if emit_changed {
-                    $macro_name!($advance, $track, true);
+                if dense_active_contiguous {
+                    if emit_changed {
+                        $macro_name!($advance, $track, true, true);
+                    } else {
+                        $macro_name!($advance, $track, false, true);
+                    }
                 } else {
-                    $macro_name!($advance, $track, false);
+                    if emit_changed {
+                        $macro_name!($advance, $track, true, false);
+                    } else {
+                        $macro_name!($advance, $track, false, false);
+                    }
                 }
             }};
         }
@@ -1271,7 +1302,7 @@ impl TurboLife {
             reserve_additional_capacity(&mut self.arena.expand_buf, active_len.saturating_mul(8));
 
             // Serial path: cached kernel with multi-level prefetching.
-            let neighbors_ptr = self.arena.neighbors.as_ptr();
+            let neighbors_ptr = self.arena.neighbors.as_ptr().cast::<[u32; 8]>();
             let borders_north_read_ptr = borders_read.north_ptr();
             let borders_south_read_ptr = borders_read.south_ptr();
             let borders_west_read_ptr = borders_read.west_ptr();
@@ -1293,9 +1324,9 @@ impl TurboLife {
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
 
             macro_rules! serial_loop_cached {
-                ($advance:path, $track:expr, $emit_changed:literal) => {{
+                ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
                     for i in 0..active_len {
-                        let idx = unsafe { *active_ptr.add(i) };
+                        let idx = unsafe { active_tile_at::<$dense>(active_ptr, i) };
                         let ii = idx.index();
 
                         #[cfg(target_arch = "x86_64")]
@@ -1304,14 +1335,14 @@ impl TurboLife {
 
                             // Prefetch tile i+2 cell buffers into L2.
                             if i + 2 < active_len {
-                                let far_ii = (*active_ptr.add(i + 2)).index();
+                                let far_ii = active_index_at::<$dense>(active_ptr, i + 2);
                                 _mm_prefetch(current_ptr.add(far_ii) as *const i8, _MM_HINT_T1);
                                 _mm_prefetch(next_ptr.add(far_ii) as *const i8, _MM_HINT_T1);
                             }
                             // Prefetch tile i+1: cell buffers into L1, plus neighbor borders
                             // for ghost zone gather.
                             if i + 1 < active_len {
-                                let near_ii = (*active_ptr.add(i + 1)).index();
+                                let near_ii = active_index_at::<$dense>(active_ptr, i + 1);
                                 _mm_prefetch(current_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(next_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(neighbors_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
@@ -1333,17 +1364,19 @@ impl TurboLife {
                             if PREFETCH_TILE_DATA_AARCH64 {
                                 // Prefetch a farther-ahead tile's cell buffers into L2.
                                 if i + PREFETCH_TILE_FAR_AHEAD_AARCH64 < active_len {
-                                    let far_ii = (*active_ptr
-                                        .add(i + PREFETCH_TILE_FAR_AHEAD_AARCH64))
-                                    .index();
+                                    let far_ii = active_index_at::<$dense>(
+                                        active_ptr,
+                                        i + PREFETCH_TILE_FAR_AHEAD_AARCH64,
+                                    );
                                     prefetch_l2_read(current_ptr.add(far_ii));
                                     prefetch_l2_write(next_ptr.add(far_ii));
                                 }
                                 // Prefetch a near-ahead tile into L1 plus neighbor metadata.
                                 if i + PREFETCH_TILE_NEAR_AHEAD_AARCH64 < active_len {
-                                    let near_ii = (*active_ptr
-                                        .add(i + PREFETCH_TILE_NEAR_AHEAD_AARCH64))
-                                    .index();
+                                    let near_ii = active_index_at::<$dense>(
+                                        active_ptr,
+                                        i + PREFETCH_TILE_NEAR_AHEAD_AARCH64,
+                                    );
                                     prefetch_l1_read(current_ptr.add(near_ii));
                                     prefetch_l1_write(next_ptr.add(near_ii));
                                     prefetch_l1_read(neighbors_ptr.add(near_ii));
@@ -1419,9 +1452,9 @@ impl TurboLife {
             }
 
             macro_rules! serial_loop_fused {
-                ($advance:path, $track:expr, $emit_changed:literal) => {{
+                ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
                     for i in 0..active_len {
-                        let idx = unsafe { *active_ptr.add(i) };
+                        let idx = unsafe { active_tile_at::<$dense>(active_ptr, i) };
                         let ii = idx.index();
 
                         #[cfg(target_arch = "x86_64")]
@@ -1430,14 +1463,14 @@ impl TurboLife {
 
                             // Prefetch tile i+2 cell buffers into L2.
                             if i + 2 < active_len {
-                                let far_ii = (*active_ptr.add(i + 2)).index();
+                                let far_ii = active_index_at::<$dense>(active_ptr, i + 2);
                                 _mm_prefetch(current_ptr.add(far_ii) as *const i8, _MM_HINT_T1);
                                 _mm_prefetch(next_ptr.add(far_ii) as *const i8, _MM_HINT_T1);
                             }
                             // Prefetch tile i+1: cell buffers into L1, plus neighbor borders
                             // for ghost zone gather.
                             if i + 1 < active_len {
-                                let near_ii = (*active_ptr.add(i + 1)).index();
+                                let near_ii = active_index_at::<$dense>(active_ptr, i + 1);
                                 _mm_prefetch(current_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(next_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(neighbors_ptr.add(near_ii) as *const i8, _MM_HINT_T0);
@@ -1459,17 +1492,19 @@ impl TurboLife {
                             if PREFETCH_TILE_DATA_AARCH64 {
                                 // Prefetch a farther-ahead tile's cell buffers into L2.
                                 if i + PREFETCH_TILE_FAR_AHEAD_AARCH64 < active_len {
-                                    let far_ii = (*active_ptr
-                                        .add(i + PREFETCH_TILE_FAR_AHEAD_AARCH64))
-                                    .index();
+                                    let far_ii = active_index_at::<$dense>(
+                                        active_ptr,
+                                        i + PREFETCH_TILE_FAR_AHEAD_AARCH64,
+                                    );
                                     prefetch_l2_read(current_ptr.add(far_ii));
                                     prefetch_l2_write(next_ptr.add(far_ii));
                                 }
                                 // Prefetch a near-ahead tile into L1 plus neighbor metadata.
                                 if i + PREFETCH_TILE_NEAR_AHEAD_AARCH64 < active_len {
-                                    let near_ii = (*active_ptr
-                                        .add(i + PREFETCH_TILE_NEAR_AHEAD_AARCH64))
-                                    .index();
+                                    let near_ii = active_index_at::<$dense>(
+                                        active_ptr,
+                                        i + PREFETCH_TILE_NEAR_AHEAD_AARCH64,
+                                    );
                                     prefetch_l1_read(current_ptr.add(near_ii));
                                     prefetch_l1_write(next_ptr.add(near_ii));
                                     prefetch_l1_read(neighbors_ptr.add(near_ii));
@@ -1722,7 +1757,7 @@ impl TurboLife {
             let current_ptr = SendConstPtr::new(current_vec.as_ptr());
             let next_ptr = SendPtr::new(next_vec.as_mut_ptr());
             let meta_ptr = SendPtr::new(self.arena.meta.as_mut_ptr());
-            let neighbors_ptr = SendConstPtr::new(self.arena.neighbors.as_ptr());
+            let neighbors_ptr = SendConstPtr::new(self.arena.neighbors.as_ptr().cast::<[u32; 8]>());
             let next_borders_north_ptr = SendPtr::new(next_borders_vec.north_mut_ptr());
             let next_borders_south_ptr = SendPtr::new(next_borders_vec.south_mut_ptr());
             let next_borders_west_ptr = SendPtr::new(next_borders_vec.west_mut_ptr());
@@ -1755,18 +1790,18 @@ impl TurboLife {
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
 
             macro_rules! prefetch_for_work_item {
-                ($i:expr, $end:expr) => {
+                ($i:expr, $end:expr, $dense:literal) => {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
                         use std::arch::x86_64::*;
 
                         if $i + 2 < $end {
-                            let far_ii = (*active_ptr.get().add($i + 2)).index();
+                            let far_ii = active_index_at::<$dense>(active_ptr.get(), $i + 2);
                             _mm_prefetch(current_ptr.get().add(far_ii) as *const i8, _MM_HINT_T1);
                             _mm_prefetch(next_ptr.get().add(far_ii) as *const i8, _MM_HINT_T1);
                         }
                         if $i + 1 < $end {
-                            let near_ii = (*active_ptr.get().add($i + 1)).index();
+                            let near_ii = active_index_at::<$dense>(active_ptr.get(), $i + 1);
                             _mm_prefetch(current_ptr.get().add(near_ii) as *const i8, _MM_HINT_T0);
                             _mm_prefetch(next_ptr.get().add(near_ii) as *const i8, _MM_HINT_T0);
                             _mm_prefetch(
@@ -1790,16 +1825,18 @@ impl TurboLife {
                     unsafe {
                         if PREFETCH_TILE_DATA_AARCH64 {
                             if $i + PREFETCH_TILE_FAR_AHEAD_AARCH64 < $end {
-                                let far_ii =
-                                    (*active_ptr.get().add($i + PREFETCH_TILE_FAR_AHEAD_AARCH64))
-                                        .index();
+                                let far_ii = active_index_at::<$dense>(
+                                    active_ptr.get(),
+                                    $i + PREFETCH_TILE_FAR_AHEAD_AARCH64,
+                                );
                                 prefetch_l2_read(current_ptr.get().add(far_ii));
                                 prefetch_l2_write(next_ptr.get().add(far_ii));
                             }
                             if $i + PREFETCH_TILE_NEAR_AHEAD_AARCH64 < $end {
-                                let near_ii =
-                                    (*active_ptr.get().add($i + PREFETCH_TILE_NEAR_AHEAD_AARCH64))
-                                        .index();
+                                let near_ii = active_index_at::<$dense>(
+                                    active_ptr.get(),
+                                    $i + PREFETCH_TILE_NEAR_AHEAD_AARCH64,
+                                );
                                 prefetch_l1_read(current_ptr.get().add(near_ii));
                                 prefetch_l1_write(next_ptr.get().add(near_ii));
                                 prefetch_l1_read(neighbors_ptr.get().add(near_ii));
@@ -1826,10 +1863,11 @@ impl TurboLife {
                     $i:expr,
                     $end:expr,
                     $track:expr,
-                    $emit_changed:literal
+                    $emit_changed:literal,
+                    $dense:literal
                 ) => {{
-                    prefetch_for_work_item!($i, $end);
-                    let idx = unsafe { *active_ptr.get().add($i) };
+                    prefetch_for_work_item!($i, $end, $dense);
+                    let idx = unsafe { active_tile_at::<$dense>(active_ptr.get(), $i) };
                     let ii = idx.index();
                     let result = unsafe {
                         $advance(
@@ -1887,7 +1925,7 @@ impl TurboLife {
             }
 
             macro_rules! parallel_kernel_static {
-                ($advance:path, $track:expr, $emit_changed:literal) => {{
+                ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
                     let _ = rayon::broadcast(|ctx| {
                         let worker_id = ctx.index();
                         if worker_id >= active_workers {
@@ -1901,7 +1939,15 @@ impl TurboLife {
                         let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
                         scratch.reserve_for_additional_work::<$emit_changed, $track>(end - start);
                         for i in start..end {
-                            process_work_item!($advance, scratch, i, end, $track, $emit_changed);
+                            process_work_item!(
+                                $advance,
+                                scratch,
+                                i,
+                                end,
+                                $track,
+                                $emit_changed,
+                                $dense
+                            );
                         }
                     });
                 }};
@@ -2017,7 +2063,7 @@ impl TurboLife {
 
                 #[cfg(target_arch = "aarch64")]
                 macro_rules! parallel_kernel_lockfree {
-                    ($advance:path, $track:expr, $emit_changed:literal) => {{
+                    ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
                         let cursor_ref = &cursor;
                         let _ = rayon::broadcast(|ctx| {
                             let worker_id = ctx.index();
@@ -2042,7 +2088,8 @@ impl TurboLife {
                                         i,
                                         end,
                                         $track,
-                                        $emit_changed
+                                        $emit_changed,
+                                        $dense
                                     );
                                 }
                             }
@@ -2052,7 +2099,7 @@ impl TurboLife {
 
                 #[cfg(not(target_arch = "aarch64"))]
                 macro_rules! parallel_kernel_lockfree {
-                    ($advance:path, $track:expr, $emit_changed:literal) => {{
+                    ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
                         let cursor_ref = &cursor;
                         let _ = rayon::broadcast(|ctx| {
                             let worker_id = ctx.index();
@@ -2085,7 +2132,8 @@ impl TurboLife {
                                         i,
                                         end,
                                         $track,
-                                        $emit_changed
+                                        $emit_changed,
+                                        $dense
                                     );
                                 }
                             }

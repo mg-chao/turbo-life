@@ -768,8 +768,8 @@ impl TileArena {
     ) {
         let reverse_dir = DIR_REVERSE[dir_idx];
         unsafe {
-            (*neighbors_ptr.add(tile_i))[dir_idx] = neighbor_i as u32;
-            (*neighbors_ptr.add(neighbor_i))[reverse_dir] = tile_i as u32;
+            (&mut *neighbors_ptr.add(tile_i))[dir_idx] = neighbor_i as u32;
+            (&mut *neighbors_ptr.add(neighbor_i))[reverse_dir] = tile_i as u32;
             (*meta_ptr.add(tile_i)).missing_mask &= !(1u8 << dir_idx);
             (*meta_ptr.add(neighbor_i)).missing_mask &= !(1u8 << reverse_dir);
         }
@@ -955,13 +955,13 @@ impl TileArena {
         let neighbors_ptr = self.neighbors.as_mut_ptr();
         let meta_ptr = self.meta.as_mut_ptr();
         unsafe {
-            let nb = &*neighbors_ptr.add(i);
+            let nb = *neighbors_ptr.add(i);
             for dir_idx in 0..8u8 {
                 let neighbor_raw = nb[dir_idx as usize];
                 if neighbor_raw != NO_NEIGHBOR {
                     let rev = DIR_REVERSE[dir_idx as usize];
                     let ni = neighbor_raw as usize;
-                    (*neighbors_ptr.add(ni))[rev] = NO_NEIGHBOR;
+                    (&mut *neighbors_ptr.add(ni))[rev] = NO_NEIGHBOR;
                     (*meta_ptr.add(ni)).missing_mask |= 1u8 << rev;
                 }
             }
