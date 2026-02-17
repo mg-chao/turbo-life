@@ -4,7 +4,7 @@
 //! Design goals:
 //! - Flat, cache-friendly layout with compact control metadata.
 //! - Robin Hood probing with backward-shift deletion (no tombstones).
-//! - Specialized hash for tile coordinates with a throughput-first final fold.
+//! - Specialized hash for tile coordinates with a throughput-first fast mix.
 //! - Fingerprint check in the control word to skip full key comparisons.
 //! - Probe distance encoded in the control word (no per-probe hash reload).
 
@@ -20,11 +20,9 @@ const MY: u64 = 0x6c62_272e_07bb_0142;
 
 #[inline(always)]
 pub(crate) fn tile_hash(x: i64, y: i64) -> u64 {
-    // Throughput-first 2-multiply mix: strong enough for structured tile
-    // coordinates while avoiding an extra avalanche multiply on the lookup
-    // hot path.
-    let h = (x as u64).wrapping_mul(MX) ^ (y as u64).wrapping_mul(MY).rotate_right(31);
-    h ^ (h >> 32)
+    // Throughput-first 2-multiply mix (no final fold). Rotate y's lane so
+    // both axes contribute entropy to low bucket bits.
+    (x as u64).wrapping_mul(MX) ^ (y as u64).wrapping_mul(MY).rotate_right(31)
 }
 
 // ── Slot layout ─────────────────────────────────────────────────────────
@@ -96,9 +94,9 @@ impl Slot {
 
 // ── TileMap ─────────────────────────────────────────────────────────────
 
-/// Maximum load factor numerator / denominator: 3/4 = 75%.
-const LOAD_NUM: usize = 3;
-const LOAD_DEN: usize = 4;
+/// Maximum load factor numerator / denominator: 2/3 ≈ 66.7%.
+const LOAD_NUM: usize = 2;
+const LOAD_DEN: usize = 3;
 
 /// Open-addressed hashmap specialised for `(i64, i64) → TileIdx`.
 pub struct TileMap {
@@ -525,6 +523,41 @@ mod tests {
             64,
             "tile_hash should not collapse axis-canceling coordinates"
         );
+    }
+
+    #[test]
+    fn hash_mix_spreads_axis_aligned_coordinates() {
+        let mut x_buckets = std::collections::BTreeSet::new();
+        let mut y_buckets = std::collections::BTreeSet::new();
+        let bucket_mask = (1u64 << 16) - 1;
+        for i in 0..(1 << 16) {
+            let i = i as i64;
+            x_buckets.insert(tile_hash(i, 0) & bucket_mask);
+            y_buckets.insert(tile_hash(0, i) & bucket_mask);
+        }
+
+        assert!(
+            x_buckets.len() >= 40_000,
+            "x-axis bucket spread regressed: {}",
+            x_buckets.len()
+        );
+        assert!(
+            y_buckets.len() >= 40_000,
+            "y-axis bucket spread regressed: {}",
+            y_buckets.len()
+        );
+    }
+
+    #[test]
+    fn control_word_keeps_large_probe_distance_headroom() {
+        let mut slot = Slot {
+            key_x: 0,
+            key_y: 0,
+            value: 0,
+            ctrl: occupied_ctrl(1, 0),
+        };
+        slot.set_distance(1 << 18);
+        assert_eq!(slot.distance(), 1 << 18);
     }
 
     #[test]
