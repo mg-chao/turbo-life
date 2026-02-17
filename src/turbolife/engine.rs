@@ -127,10 +127,12 @@ const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 32_768;
 const CORE_BACKEND_SCALAR: u8 = 0;
 const CORE_BACKEND_AVX2: u8 = 1;
 const CORE_BACKEND_NEON: u8 = 2;
-// AArch64 PRFM prefetch hints are throughput-positive on the primary
-// main.rs harness (Apple M4 dense frontier), so keep them enabled.
-#[cfg(target_arch = "aarch64")]
+// AArch64 PRFM prefetching is workload-sensitive. Keep it off by default on
+// the primary main.rs harness and expose an opt-in feature for auto-tuners.
+#[cfg(all(target_arch = "aarch64", feature = "aggressive-prefetch-aarch64"))]
 const PREFETCH_TILE_DATA_AARCH64: bool = true;
+#[cfg(all(target_arch = "aarch64", not(feature = "aggressive-prefetch-aarch64")))]
+const PREFETCH_TILE_DATA_AARCH64: bool = false;
 // Tuned for Apple perf cores: i+5 gives L2 enough lookahead while i+1 keeps
 // the immediate tile in L1 under heavy frontier churn.
 #[cfg(target_arch = "aarch64")]
@@ -2554,10 +2556,18 @@ impl TurboLife {
                 }
             }
             KernelBackend::Neon => {
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(all(target_arch = "aarch64", feature = "aggressive-neon-assume-changed"))]
                 {
-                    // `assume_changed` over-expands the frontier on the main harness
-                    // and regresses wall clock.
+                    // Opt-in specialization: skip changed-list emission on high-churn
+                    // workloads and rebuild from active-prune delta instead.
+                    self.step_impl_backend::<{ CORE_BACKEND_NEON }, true>();
+                }
+                #[cfg(all(
+                    target_arch = "aarch64",
+                    not(feature = "aggressive-neon-assume-changed")
+                ))]
+                {
+                    // Default policy for the primary main.rs harness.
                     self.step_impl_backend::<{ CORE_BACKEND_NEON }, false>();
                 }
                 #[cfg(not(target_arch = "aarch64"))]
@@ -3086,14 +3096,25 @@ mod tests {
         engine.step();
         engine.step();
 
+        let tile_idx = engine
+            .arena
+            .idx_at_cached((0, 0))
+            .expect("stable block tile should still exist");
+        let was_already_queued = engine.arena.changed_list.contains(&tile_idx);
         let changed_before = engine.arena.changed_list.len();
         engine.set_cell(0, 0, false);
         let changed_after = engine.arena.changed_list.len();
+        let is_queued_after = engine.arena.changed_list.contains(&tile_idx);
+
+        assert!(
+            is_queued_after,
+            "set_cell should leave the mutated stable tile queued for followup frontier rebuilds"
+        );
 
         assert_eq!(
             changed_after,
-            changed_before + 1,
-            "set_cell should requeue a stable tile even after unrelated steps"
+            changed_before + usize::from(!was_already_queued),
+            "set_cell should add the stable tile exactly once when it was not already queued"
         );
     }
 

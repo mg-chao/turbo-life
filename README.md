@@ -78,7 +78,7 @@ target/maxperf/best/turbo-life
 Auto-tuned feature flags used by `build_maxperf.sh`:
 
 - `aggressive-prefetch-aarch64` — enables AArch64 PRFM prefetch hints.
-- `aggressive-neon-assume-changed` — lowers the NEON assume-changed churn gate.
+- `aggressive-neon-assume-changed` — switches NEON stepping to assume-changed mode (changed set is rebuilt from active-prune deltas).
 
 Both are opt-in only and are rejected automatically when they regress.
 

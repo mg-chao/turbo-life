@@ -11,9 +11,10 @@ default = []
 # Useful for machine-specific auto-tuning; disabled by default because it can
 # regress on some CPUs/workloads.
 aggressive-prefetch-aarch64 = []
-# AArch64-only: lowers the churn gate for NEON assume-changed mode.
-# This can improve high-churn workloads on some systems, but is not universally
-# faster, so it is opt-in for auto-tuning.
+# AArch64-only: switches NEON stepping to assume-changed mode
+# (no changed-list emission; rebuild changed from active-prune delta).
+# Can improve high-churn workloads on some systems, but is not universally
+# faster, so it remains opt-in for auto-tuning.
 aggressive-neon-assume-changed = []
 
 [dependencies]
