@@ -4,7 +4,7 @@
 //! Design goals:
 //! - Flat, cache-friendly layout with compact control metadata.
 //! - Robin Hood probing with backward-shift deletion (no tombstones).
-//! - Specialized hash for tile coordinates with a final avalanche mix.
+//! - Specialized hash for tile coordinates with a throughput-first final fold.
 //! - Fingerprint check in the control word to skip full key comparisons.
 //! - Probe distance encoded in the control word (no per-probe hash reload).
 
@@ -20,11 +20,10 @@ const MY: u64 = 0x6c62_272e_07bb_0142;
 
 #[inline(always)]
 pub(crate) fn tile_hash(x: i64, y: i64) -> u64 {
-    let mut h = (x as u64).wrapping_mul(MX) ^ (y as u64).wrapping_mul(MY).rotate_right(32);
-    // One-multiply avalanche (faster than full SplitMix finalizer on the
-    // coordinate-lookup hot path while preserving strong diffusion).
-    h ^= h >> 32;
-    h = h.wrapping_mul(0xd6e8_feb8_6659_fd93);
+    // Throughput-first 2-multiply mix: strong enough for structured tile
+    // coordinates while avoiding an extra avalanche multiply on the lookup
+    // hot path.
+    let h = (x as u64).wrapping_mul(MX) ^ (y as u64).wrapping_mul(MY).rotate_right(31);
     h ^ (h >> 32)
 }
 
