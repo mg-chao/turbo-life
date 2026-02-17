@@ -2245,6 +2245,103 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
+    fn neon_fused_no_track_fast_matches_reference_with_live_ghost_when_dirty() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+
+        let mut current_ref = [CellBuf::empty()];
+        current_ref[0].0 = stable_block_tile();
+        let mut next_ref = [CellBuf([u64::MAX; TILE_SIZE])];
+        let mut meta_ref = [TileMeta::empty()];
+        meta_ref[0].set_has_live(true);
+        meta_ref[0].set_alt_phase_dirty(true);
+        let mut next_borders_north_ref = [u64::MAX];
+        let mut next_borders_south_ref = [u64::MAX];
+        let mut next_borders_west_ref = [u64::MAX];
+        let mut next_borders_east_ref = [u64::MAX];
+        let borders_north_read = [0u64];
+        let borders_south_read = [1u64 << 40];
+        let borders_west_read = [0u64];
+        let borders_east_read = [0u64];
+        let neighbors = [[0u32; 8]];
+        let live_masks_read = [0u8];
+        let mut next_live_masks_ref = [u8::MAX];
+
+        let reference = unsafe {
+            advance_tile_fused_neon_no_track(
+                current_ref.as_ptr(),
+                next_ref.as_mut_ptr(),
+                meta_ref.as_mut_ptr(),
+                next_borders_north_ref.as_mut_ptr(),
+                next_borders_south_ref.as_mut_ptr(),
+                next_borders_west_ref.as_mut_ptr(),
+                next_borders_east_ref.as_mut_ptr(),
+                borders_north_read.as_ptr(),
+                borders_south_read.as_ptr(),
+                borders_west_read.as_ptr(),
+                borders_east_read.as_ptr(),
+                neighbors.as_ptr(),
+                live_masks_read.as_ptr(),
+                next_live_masks_ref.as_mut_ptr(),
+                0,
+            )
+        };
+
+        let mut current_fast = [CellBuf::empty()];
+        current_fast[0].0 = stable_block_tile();
+        let mut next_fast = [CellBuf([u64::MAX; TILE_SIZE])];
+        let mut meta_fast = [TileMeta::empty()];
+        meta_fast[0].set_has_live(true);
+        meta_fast[0].set_alt_phase_dirty(true);
+        let mut next_borders_north_fast = [u64::MAX];
+        let mut next_borders_south_fast = [u64::MAX];
+        let mut next_borders_west_fast = [u64::MAX];
+        let mut next_borders_east_fast = [u64::MAX];
+        let mut next_live_masks_fast = [u8::MAX];
+
+        let fast = unsafe {
+            advance_tile_fused_neon_no_track_fast(
+                current_fast.as_ptr(),
+                next_fast.as_mut_ptr(),
+                meta_fast.as_mut_ptr(),
+                next_borders_north_fast.as_mut_ptr(),
+                next_borders_south_fast.as_mut_ptr(),
+                next_borders_west_fast.as_mut_ptr(),
+                next_borders_east_fast.as_mut_ptr(),
+                borders_north_read.as_ptr(),
+                borders_south_read.as_ptr(),
+                borders_west_read.as_ptr(),
+                borders_east_read.as_ptr(),
+                neighbors.as_ptr(),
+                live_masks_read.as_ptr(),
+                next_live_masks_fast.as_mut_ptr(),
+                0,
+            )
+        };
+
+        assert!(!reference.changed);
+        assert_eq!(fast.changed, reference.changed);
+        assert_eq!(fast.has_live, reference.has_live);
+        assert_eq!(fast.live_mask, reference.live_mask);
+        assert_eq!(
+            fast.neighbor_influence_mask,
+            reference.neighbor_influence_mask
+        );
+        assert_eq!(next_fast[0].0, next_ref[0].0);
+        assert_eq!(next_borders_north_fast[0], next_borders_north_ref[0]);
+        assert_eq!(next_borders_south_fast[0], next_borders_south_ref[0]);
+        assert_eq!(next_borders_west_fast[0], next_borders_west_ref[0]);
+        assert_eq!(next_borders_east_fast[0], next_borders_east_ref[0]);
+        assert_eq!(next_live_masks_fast[0], next_live_masks_ref[0]);
+        assert_eq!(
+            meta_fast[0].alt_phase_dirty(),
+            meta_ref[0].alt_phase_dirty()
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
     fn neon_fused_assume_changed_fast_matches_reference() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
             return;
