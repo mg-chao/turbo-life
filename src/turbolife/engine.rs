@@ -74,7 +74,10 @@ const PARALLEL_KERNEL_MIN_ACTIVE: usize = 128;
 const PARALLEL_KERNEL_TILES_PER_THREAD: usize = 16;
 const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
-const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
+// The direct-mapped tile cache is throughput-negative on the primary
+// main.rs harness (dense frontier, multi-threaded NEON path).
+// Keep the machinery compiled for targeted experiments, but disable by default.
+const SERIAL_CACHE_MAX_ACTIVE: Option<usize> = None;
 // Tuned on the main.rs harness (Apple M4): keep lock-free dynamic scheduling
 // on Apple Silicon to avoid static-slice tail effects on heterogeneous cores.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -1179,8 +1182,8 @@ impl TurboLife {
         let changed_len = self.arena.changed_scratch.len();
         self.arena.expand_buf.clear();
         self.arena.prune_buf.clear();
-        let use_serial_cache =
-            active_len <= SERIAL_CACHE_MAX_ACTIVE && self.backend != KernelBackend::Neon;
+        let use_serial_cache = SERIAL_CACHE_MAX_ACTIVE.is_some_and(|limit| active_len <= limit)
+            && self.backend != KernelBackend::Neon;
         if use_serial_cache {
             self.tile_cache.begin_step();
         }

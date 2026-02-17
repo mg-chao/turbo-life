@@ -4,7 +4,7 @@ use rayon::prelude::*;
 
 use super::arena::TileArena;
 use super::kernel::ghost_is_empty_from_live_masks_ptr;
-use super::tile::{MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
+use super::tile::{MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx, TileMeta};
 
 const PARALLEL_PRUNE_CANDIDATES_MIN: usize = 512;
 const PRUNE_FILTER_CHUNK_MIN: usize = 64;
@@ -52,6 +52,24 @@ fn prune_filter_chunk_size(candidate_len: usize, threads: usize) -> usize {
     let target_chunks = threads.saturating_mul(4).max(1);
     let size = candidate_len.div_ceil(target_chunks);
     size.clamp(PRUNE_FILTER_CHUNK_MIN, PRUNE_FILTER_CHUNK_MAX)
+}
+
+#[inline(always)]
+unsafe fn should_prune_candidate(
+    meta_ptr: *const TileMeta,
+    neighbors_ptr: *const [u32; 8],
+    live_masks_ptr: *const u8,
+    idx: usize,
+) -> bool {
+    unsafe {
+        let meta = *meta_ptr.add(idx);
+        if !meta.occupied() || meta.has_live() {
+            return false;
+        }
+        let missing_mask = meta.missing_mask;
+        missing_mask == MISSING_ALL_NEIGHBORS
+            || ghost_is_empty_from_live_masks_ptr(live_masks_ptr, &*neighbors_ptr.add(idx))
+    }
 }
 
 #[inline(always)]
@@ -598,16 +616,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                             let idx = unsafe { *pp.add(start + offset) };
                             let ii = idx.index();
                             // SAFETY: pointers are valid for the entire prune phase.
-                            let should_prune = unsafe {
-                                let meta = *mp.add(ii);
-                                if !meta.occupied() || meta.has_live() {
-                                    false
-                                } else {
-                                    let missing_mask = meta.missing_mask;
-                                    missing_mask == MISSING_ALL_NEIGHBORS
-                                        || ghost_is_empty_from_live_masks_ptr(lp, &*np.add(ii))
-                                }
-                            };
+                            let should_prune = unsafe { should_prune_candidate(mp, np, lp, ii) };
                             word |= (should_prune as u64) << offset;
                         }
                         *marks_word = word;
@@ -627,32 +636,21 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                     for (mark, &idx) in marks.iter_mut().zip(chunk.iter()) {
                         let ii = idx.index();
                         // SAFETY: pointers are valid for the entire prune phase.
-                        let should_prune = unsafe {
-                            let meta = *mp.add(ii);
-                            if !meta.occupied() || meta.has_live() {
-                                false
-                            } else {
-                                let missing_mask = meta.missing_mask;
-                                missing_mask == MISSING_ALL_NEIGHBORS
-                                    || ghost_is_empty_from_live_masks_ptr(lp, &*np.add(ii))
-                            }
-                        };
+                        let should_prune = unsafe { should_prune_candidate(mp, np, lp, ii) };
                         *mark = should_prune as u8;
                     }
                 });
         }
     } else {
+        let meta_ptr = arena.meta.as_ptr();
+        let neighbors_ptr = arena.neighbors.as_ptr();
         for i in 0..prune_len {
             let idx = arena.prune_buf[i];
             let ii = idx.index();
-            let meta = arena.meta[ii];
-            if !meta.occupied() || meta.has_live() {
-                continue;
-            }
-            let should_prune = meta.missing_mask == MISSING_ALL_NEIGHBORS
-                || unsafe {
-                    ghost_is_empty_from_live_masks_ptr(live_masks_ptr, &arena.neighbors[ii])
-                };
+            // SAFETY: `meta_ptr`, `neighbors_ptr`, and `live_masks_ptr` stay
+            // valid for the duration of the serial prune pass.
+            let should_prune =
+                unsafe { should_prune_candidate(meta_ptr, neighbors_ptr, live_masks_ptr, ii) };
             if should_prune {
                 arena.release(idx);
             }
