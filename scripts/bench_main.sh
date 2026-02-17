@@ -52,11 +52,22 @@ if ! [[ "$RUNS" =~ ^[0-9]+$ ]] || [ "$RUNS" -eq 0 ]; then
     exit 2
 fi
 
-if [ ! -x "$BIN" ]; then
-    if [ "$BIN" = "$BIN_DEFAULT" ]; then
-        echo "building release binary: $BIN_DEFAULT" >&2
-        cargo build --release --bin turbo-life
+NEEDS_BUILD_DEFAULT="0"
+if [ "$BIN" = "$BIN_DEFAULT" ]; then
+    if [ ! -x "$BIN" ]; then
+        NEEDS_BUILD_DEFAULT="1"
+    elif [ Cargo.toml -nt "$BIN" ] || [ Cargo.lock -nt "$BIN" ]; then
+        NEEDS_BUILD_DEFAULT="1"
+    elif [ -f .cargo/config.toml ] && [ .cargo/config.toml -nt "$BIN" ]; then
+        NEEDS_BUILD_DEFAULT="1"
+    elif find src -type f -newer "$BIN" -print -quit | grep -q .; then
+        NEEDS_BUILD_DEFAULT="1"
     fi
+fi
+
+if [ "$NEEDS_BUILD_DEFAULT" = "1" ]; then
+    echo "building release binary: $BIN_DEFAULT" >&2
+    cargo build --release --bin turbo-life
 fi
 
 if [ ! -x "$BIN" ]; then
