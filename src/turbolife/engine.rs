@@ -784,13 +784,26 @@ fn apple_perf_core_count() -> Option<usize> {
     }
 }
 
-#[derive(Default)]
 #[repr(align(64))]
 struct WorkerScratch {
     changed: Vec<TileIdx>,
     changed_influence: Vec<u8>,
     expand: Vec<u32>,
     prune: Vec<TileIdx>,
+    prune_candidates_verified: bool,
+}
+
+impl Default for WorkerScratch {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            changed: Vec::new(),
+            changed_influence: Vec::new(),
+            expand: Vec::new(),
+            prune: Vec::new(),
+            prune_candidates_verified: true,
+        }
+    }
 }
 
 impl WorkerScratch {
@@ -820,6 +833,7 @@ impl WorkerScratch {
         self.changed_influence.clear();
         self.expand.clear();
         self.prune.clear();
+        self.prune_candidates_verified = true;
     }
 
     #[inline]
@@ -2321,6 +2335,9 @@ impl TurboLife {
                         unsafe {
                             vec_push_unchecked(&mut ($scratch).prune, idx);
                         }
+                        if $emit_changed && !result.prune_ready {
+                            ($scratch).prune_candidates_verified = false;
+                        }
                     }
 
                     let missing = result.missing_mask;
@@ -2451,6 +2468,7 @@ impl TurboLife {
             let mut max_expand = (0usize, 0usize);
             let mut max_prune = (0usize, 0usize);
             let mut max_changed = (0usize, 0usize);
+            let mut all_prune_candidates_verified = emit_changed;
             for worker_id in 0..worker_count {
                 let scratch = &self.worker_scratch[worker_id];
                 let expand_len = scratch.expand.len();
@@ -2469,6 +2487,9 @@ impl TurboLife {
                 }
                 if changed_len > max_changed.0 {
                     max_changed = (changed_len, worker_id);
+                }
+                if emit_changed && !scratch.prune_candidates_verified {
+                    all_prune_candidates_verified = false;
                 }
 
                 if TRACK_NEIGHBOR_INFLUENCE {
@@ -2513,6 +2534,7 @@ impl TurboLife {
                 self.arena.changed_list.clear();
                 self.arena.changed_influence.clear();
             }
+            self.arena.prune_candidates_verified = all_prune_candidates_verified;
         }
         if ASSUME_CHANGED_MODE {
             self.derive_changed_from_active_minus_prune();

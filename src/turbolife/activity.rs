@@ -744,6 +744,116 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
 
 /// Apply expansion and pruning from candidates collected during kernel execution.
 pub fn finalize_prune_and_expand(arena: &mut TileArena) {
+    let prune_len = arena.prune_buf.len();
+    if prune_len != 0 {
+        if arena.prune_candidates_verified {
+            for i in 0..prune_len {
+                let idx = arena.prune_buf[i];
+                arena.release(idx);
+            }
+        } else {
+            let border_phase = arena.border_phase;
+            let thread_count = rayon::current_num_threads().max(1);
+            let run_parallel = thread_count > 1 && prune_len >= PARALLEL_PRUNE_CANDIDATES_MIN;
+            let live_masks_ptr = arena.border_live_masks[border_phase].as_ptr();
+            debug_assert_eq!(
+                arena.border_live_masks[border_phase].len(),
+                arena.borders[border_phase].len()
+            );
+
+            if run_parallel {
+                let candidate_chunk_size = prune_filter_chunk_size(prune_len, thread_count);
+                let meta_ptr = SendConstPtr::new(arena.meta.as_ptr());
+                let neighbors_ptr = SendConstPtr::new(arena.neighbors.as_ptr().cast::<[u32; 8]>());
+                let live_masks_ptr = SendConstPtr::new(live_masks_ptr);
+                if prune_len >= PARALLEL_PRUNE_BITMAP_MIN {
+                    let words_len = prune_len.div_ceil(64);
+                    arena.prune_marks_words.resize(words_len, 0);
+                    let word_chunk_size = candidate_chunk_size.div_ceil(64).max(1);
+                    let prune_candidates_ptr = SendConstPtr::new(arena.prune_buf.as_ptr());
+                    let prune_marks_words = &mut arena.prune_marks_words;
+                    prune_marks_words
+                        .par_chunks_mut(word_chunk_size)
+                        .enumerate()
+                        .for_each(|(chunk_idx, marks_words)| {
+                            let word_start = chunk_idx * word_chunk_size;
+                            let mp = meta_ptr.get();
+                            let np = neighbors_ptr.get();
+                            let lp = live_masks_ptr.get();
+                            let pp = prune_candidates_ptr.get();
+                            for (word_offset, marks_word) in marks_words.iter_mut().enumerate() {
+                                let word_idx = word_start + word_offset;
+                                let start = word_idx << 6;
+                                let end = (start + 64).min(prune_len);
+                                let mut word = 0u64;
+                                for offset in 0..(end - start) {
+                                    let idx = unsafe { *pp.add(start + offset) };
+                                    let ii = idx.index();
+                                    // SAFETY: pointers are valid for the entire prune phase.
+                                    let should_prune =
+                                        unsafe { should_prune_candidate(mp, np, lp, ii) };
+                                    word |= (should_prune as u64) << offset;
+                                }
+                                *marks_word = word;
+                            }
+                        });
+
+                    let prune_word_len = arena.prune_marks_words.len();
+                    for word_idx in 0..prune_word_len {
+                        let mut bits = arena.prune_marks_words[word_idx];
+                        while bits != 0 {
+                            let bit = bits.trailing_zeros() as usize;
+                            let idx = arena.prune_buf[(word_idx << 6) + bit];
+                            arena.release(idx);
+                            bits &= bits - 1;
+                        }
+                    }
+                } else {
+                    arena.prune_marks.resize(prune_len, 0);
+                    let prune_candidates = &arena.prune_buf;
+                    let prune_marks = &mut arena.prune_marks;
+                    prune_candidates
+                        .par_chunks(candidate_chunk_size)
+                        .zip(prune_marks.par_chunks_mut(candidate_chunk_size))
+                        .for_each(|(chunk, marks)| {
+                            let mp = meta_ptr.get();
+                            let np = neighbors_ptr.get();
+                            let lp = live_masks_ptr.get();
+                            for (mark, &idx) in marks.iter_mut().zip(chunk.iter()) {
+                                let ii = idx.index();
+                                // SAFETY: pointers are valid for the entire prune phase.
+                                let should_prune =
+                                    unsafe { should_prune_candidate(mp, np, lp, ii) };
+                                *mark = should_prune as u8;
+                            }
+                        });
+
+                    for i in 0..prune_len {
+                        if arena.prune_marks[i] != 0 {
+                            let idx = arena.prune_buf[i];
+                            arena.release(idx);
+                        }
+                    }
+                }
+            } else {
+                let meta_ptr = arena.meta.as_ptr();
+                let neighbors_ptr = arena.neighbors.as_ptr().cast::<[u32; 8]>();
+                for i in 0..prune_len {
+                    let idx = arena.prune_buf[i];
+                    let ii = idx.index();
+                    // SAFETY: `meta_ptr`, `neighbors_ptr`, and `live_masks_ptr` stay
+                    // valid for the duration of the serial prune pass.
+                    let should_prune = unsafe {
+                        should_prune_candidate(meta_ptr, neighbors_ptr, live_masks_ptr, ii)
+                    };
+                    if should_prune {
+                        arena.release(idx);
+                    }
+                }
+            }
+        }
+    }
+
     if !arena.expand_buf.is_empty() {
         arena.reserve_additional_tiles(arena.expand_buf.len());
         for i in 0..arena.expand_buf.len() {
@@ -758,130 +868,6 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
             }
             arena.meta[idx.index()].population = 0;
             arena.mark_changed_new_unique(idx);
-        }
-    }
-
-    let prune_len = arena.prune_buf.len();
-    if prune_len == 0 {
-        arena.expand_buf.clear();
-        arena.prune_buf.clear();
-        arena.prune_candidates_verified = false;
-        return;
-    }
-
-    if arena.prune_candidates_verified {
-        for i in 0..prune_len {
-            let idx = arena.prune_buf[i];
-            arena.release(idx);
-        }
-        arena.expand_buf.clear();
-        arena.prune_buf.clear();
-        arena.prune_candidates_verified = false;
-        return;
-    }
-
-    let border_phase = arena.border_phase;
-    let thread_count = rayon::current_num_threads().max(1);
-    let run_parallel = thread_count > 1 && prune_len >= PARALLEL_PRUNE_CANDIDATES_MIN;
-    let live_masks_ptr = arena.border_live_masks[border_phase].as_ptr();
-    debug_assert_eq!(
-        arena.border_live_masks[border_phase].len(),
-        arena.borders[border_phase].len()
-    );
-    let mut used_bitmap_marks = false;
-
-    if run_parallel {
-        let candidate_chunk_size = prune_filter_chunk_size(prune_len, thread_count);
-        let meta_ptr = SendConstPtr::new(arena.meta.as_ptr());
-        let neighbors_ptr = SendConstPtr::new(arena.neighbors.as_ptr().cast::<[u32; 8]>());
-        let live_masks_ptr = SendConstPtr::new(live_masks_ptr);
-        if prune_len >= PARALLEL_PRUNE_BITMAP_MIN {
-            used_bitmap_marks = true;
-            let words_len = prune_len.div_ceil(64);
-            arena.prune_marks_words.resize(words_len, 0);
-            let word_chunk_size = candidate_chunk_size.div_ceil(64).max(1);
-            let prune_candidates_ptr = SendConstPtr::new(arena.prune_buf.as_ptr());
-            let prune_marks_words = &mut arena.prune_marks_words;
-            prune_marks_words
-                .par_chunks_mut(word_chunk_size)
-                .enumerate()
-                .for_each(|(chunk_idx, marks_words)| {
-                    let word_start = chunk_idx * word_chunk_size;
-                    let mp = meta_ptr.get();
-                    let np = neighbors_ptr.get();
-                    let lp = live_masks_ptr.get();
-                    let pp = prune_candidates_ptr.get();
-                    for (word_offset, marks_word) in marks_words.iter_mut().enumerate() {
-                        let word_idx = word_start + word_offset;
-                        let start = word_idx << 6;
-                        let end = (start + 64).min(prune_len);
-                        let mut word = 0u64;
-                        for offset in 0..(end - start) {
-                            let idx = unsafe { *pp.add(start + offset) };
-                            let ii = idx.index();
-                            // SAFETY: pointers are valid for the entire prune phase.
-                            let should_prune = unsafe { should_prune_candidate(mp, np, lp, ii) };
-                            word |= (should_prune as u64) << offset;
-                        }
-                        *marks_word = word;
-                    }
-                });
-        } else {
-            arena.prune_marks.resize(prune_len, 0);
-            let prune_candidates = &arena.prune_buf;
-            let prune_marks = &mut arena.prune_marks;
-            prune_candidates
-                .par_chunks(candidate_chunk_size)
-                .zip(prune_marks.par_chunks_mut(candidate_chunk_size))
-                .for_each(|(chunk, marks)| {
-                    let mp = meta_ptr.get();
-                    let np = neighbors_ptr.get();
-                    let lp = live_masks_ptr.get();
-                    for (mark, &idx) in marks.iter_mut().zip(chunk.iter()) {
-                        let ii = idx.index();
-                        // SAFETY: pointers are valid for the entire prune phase.
-                        let should_prune = unsafe { should_prune_candidate(mp, np, lp, ii) };
-                        *mark = should_prune as u8;
-                    }
-                });
-        }
-    } else {
-        let meta_ptr = arena.meta.as_ptr();
-        let neighbors_ptr = arena.neighbors.as_ptr().cast::<[u32; 8]>();
-        for i in 0..prune_len {
-            let idx = arena.prune_buf[i];
-            let ii = idx.index();
-            // SAFETY: `meta_ptr`, `neighbors_ptr`, and `live_masks_ptr` stay
-            // valid for the duration of the serial prune pass.
-            let should_prune =
-                unsafe { should_prune_candidate(meta_ptr, neighbors_ptr, live_masks_ptr, ii) };
-            if should_prune {
-                arena.release(idx);
-            }
-        }
-        arena.expand_buf.clear();
-        arena.prune_buf.clear();
-        arena.prune_candidates_verified = false;
-        return;
-    }
-
-    if used_bitmap_marks {
-        let prune_word_len = arena.prune_marks_words.len();
-        for word_idx in 0..prune_word_len {
-            let mut bits = arena.prune_marks_words[word_idx];
-            while bits != 0 {
-                let bit = bits.trailing_zeros() as usize;
-                let idx = arena.prune_buf[(word_idx << 6) + bit];
-                arena.release(idx);
-                bits &= bits - 1;
-            }
-        }
-    } else {
-        for i in 0..prune_len {
-            if arena.prune_marks[i] != 0 {
-                let idx = arena.prune_buf[i];
-                arena.release(idx);
-            }
         }
     }
 
