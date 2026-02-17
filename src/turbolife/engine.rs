@@ -1050,15 +1050,37 @@ fn dynamic_parallel_chunk_size(
     size.clamp(PARALLEL_DYNAMIC_CHUNK_MIN, PARALLEL_DYNAMIC_CHUNK_MAX)
 }
 
-#[cfg(test)]
-#[inline(always)]
-fn active_broadcast_workers(worker_count: usize, broadcast_threads: usize) -> usize {
-    worker_count.min(broadcast_threads)
-}
-
 #[inline(always)]
 fn should_queue_prune<const EMIT_CHANGED: bool>(has_live: bool, changed: bool) -> bool {
     !has_live && (!EMIT_CHANGED || !changed)
+}
+
+#[inline(always)]
+fn run_parallel_workers<F>(worker_count: usize, worker_fn: &F)
+where
+    F: Fn(usize) + Sync,
+{
+    #[inline(always)]
+    fn recurse<F>(start: usize, end: usize, worker_fn: &F)
+    where
+        F: Fn(usize) + Sync,
+    {
+        let len = end - start;
+        if len == 0 {
+            return;
+        }
+        if len == 1 {
+            worker_fn(start);
+            return;
+        }
+        let mid = start + (len >> 1);
+        rayon::join(
+            || recurse(start, mid, worker_fn),
+            || recurse(mid, end, worker_fn),
+        );
+    }
+
+    recurse(0, worker_count, worker_fn);
 }
 
 #[cold]
@@ -2200,11 +2222,7 @@ impl TurboLife {
 
             macro_rules! parallel_kernel_static {
                 ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
-                    let _ = rayon::broadcast(|ctx| {
-                        let worker_id = ctx.index();
-                        if worker_id >= active_workers {
-                            return;
-                        }
+                    run_parallel_workers(active_workers, &|worker_id| {
                         let start = worker_id.saturating_mul(static_chunk_size);
                         if start >= active_len {
                             return;
@@ -2247,11 +2265,7 @@ impl TurboLife {
                 macro_rules! parallel_kernel_lockfree {
                     ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
                         let cursor_ref = &cursor;
-                        let _ = rayon::broadcast(|ctx| {
-                            let worker_id = ctx.index();
-                            if worker_id >= active_workers {
-                                return;
-                            }
+                        run_parallel_workers(active_workers, &|worker_id| {
                             let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
                             loop {
                                 let start =
@@ -2283,11 +2297,7 @@ impl TurboLife {
                 macro_rules! parallel_kernel_lockfree {
                     ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
                         let cursor_ref = &cursor;
-                        let _ = rayon::broadcast(|ctx| {
-                            let worker_id = ctx.index();
-                            if worker_id >= active_workers {
-                                return;
-                            }
+                        run_parallel_workers(active_workers, &|worker_id| {
                             let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
                             loop {
                                 let observed = cursor_ref.load(Ordering::Relaxed);
@@ -2594,14 +2604,15 @@ impl TurboLife {
 mod tests {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use rand::{Rng, SeedableRng};
 
     use super::{
         KernelBackend, PARALLEL_KERNEL_MIN_ACTIVE, TILE_SIZE_I64, TurboLife, TurboLifeConfig,
-        active_broadcast_workers, auto_pool_thread_count_for_physical, churn_at_most_percent,
-        churn_below_percent, dynamic_parallel_chunk_size, dynamic_target_chunks_per_worker,
-        macos_perf_only_enabled, memory_parallel_cap, parse_env_bool, physical_core_count,
+        auto_pool_thread_count_for_physical, churn_at_most_percent, churn_below_percent,
+        dynamic_parallel_chunk_size, dynamic_target_chunks_per_worker, macos_perf_only_enabled,
+        memory_parallel_cap, parse_env_bool, physical_core_count, run_parallel_workers,
     };
 
     const PARALLEL_TEST_TILE_GRID: i64 = 12;
@@ -2724,11 +2735,32 @@ mod tests {
     }
 
     #[test]
-    fn active_broadcast_workers_caps_to_available_threads() {
-        assert_eq!(active_broadcast_workers(1, 1), 1);
-        assert_eq!(active_broadcast_workers(2, 8), 2);
-        assert_eq!(active_broadcast_workers(8, 2), 2);
-        assert_eq!(active_broadcast_workers(0, 4), 0);
+    fn run_parallel_workers_visits_each_worker_once() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("thread pool");
+
+        let visit_count = AtomicUsize::new(0);
+        let visited_mask = AtomicUsize::new(0);
+        pool.install(|| {
+            run_parallel_workers(8, &|worker_id| {
+                visit_count.fetch_add(1, Ordering::Relaxed);
+                visited_mask.fetch_or(1usize << worker_id, Ordering::Relaxed);
+            });
+        });
+
+        assert_eq!(visit_count.load(Ordering::Relaxed), 8);
+        assert_eq!(visited_mask.load(Ordering::Relaxed), (1usize << 8) - 1);
+    }
+
+    #[test]
+    fn run_parallel_workers_handles_zero_workers() {
+        let invocations = AtomicUsize::new(0);
+        run_parallel_workers(0, &|_| {
+            invocations.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(invocations.load(Ordering::Relaxed), 0);
     }
 
     #[test]
