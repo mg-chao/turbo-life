@@ -10,7 +10,7 @@ const PARALLEL_PRUNE_CANDIDATES_MIN: usize = 512;
 const PRUNE_FILTER_CHUNK_MIN: usize = 64;
 const PRUNE_FILTER_CHUNK_MAX: usize = 512;
 const PARALLEL_PRUNE_BITMAP_MIN: usize = 4_096;
-const ACTIVE_SORT_STD_MAX: usize = 8_192;
+const ACTIVE_SORT_STD_MAX: usize = 1_024;
 const ACTIVE_SORT_RADIX_MIN: usize = 32_768;
 const ACTIVE_SORT_RADIX_BUCKETS: usize = 1 << 16;
 const ACTIVE_BITMAP_REBUILD_MIN_OCCUPIED: usize = 2_048;
@@ -504,9 +504,9 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     }
 
     // Sort active set by index for better cache locality during kernel execution.
-    // Small and mid-size frontiers always use std sort; very large frontiers
-    // use a stable two-pass radix sort. The 8k-32k band still skips sorting
-    // to keep rebuild costs bounded.
+    // Small frontiers use std sort; very large frontiers use a stable two-pass
+    // radix sort. The ACTIVE_SORT_STD_MAX..ACTIVE_SORT_RADIX_MIN band still
+    // skips sorting to keep rebuild costs bounded.
     let active_len = arena.active_set.len();
     let mut active_set_sorted = false;
     if active_len <= ACTIVE_SORT_STD_MAX {
@@ -802,7 +802,7 @@ mod tests {
         // quick first/last checks.
         arena.active_set[1] = TileIdx(1);
 
-        // Keep churn intentionally below the old "skip std-sort" threshold.
+        // Keep churn intentionally below ACTIVE_SORT_STD_MAX.
         for &idx in tiles.iter().take(800) {
             arena.mark_changed(idx);
         }
