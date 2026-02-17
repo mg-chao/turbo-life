@@ -106,10 +106,10 @@ const CORE_BACKEND_NEON: u8 = 2;
 // main.rs harness (Apple M4 dense frontier), so keep them enabled.
 #[cfg(target_arch = "aarch64")]
 const PREFETCH_TILE_DATA_AARCH64: bool = true;
-// Tuned for Apple perf cores: i+4 gives L2 enough lookahead while i+1 keeps
+// Tuned for Apple perf cores: i+6 gives L2 enough lookahead while i+1 keeps
 // the immediate tile in L1 under heavy frontier churn.
 #[cfg(target_arch = "aarch64")]
-const PREFETCH_TILE_FAR_AHEAD_AARCH64: usize = 4;
+const PREFETCH_TILE_FAR_AHEAD_AARCH64: usize = 6;
 #[cfg(target_arch = "aarch64")]
 const PREFETCH_TILE_NEAR_AHEAD_AARCH64: usize = 1;
 #[cfg(target_arch = "aarch64")]
