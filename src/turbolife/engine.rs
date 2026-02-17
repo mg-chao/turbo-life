@@ -87,12 +87,12 @@ const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = Some(8_192);
 // Dynamic scheduler chunking target per worker.
 // Keep one chunk per worker by default to minimize cursor traffic.
 // On Apple Silicon, medium/large frontiers benefit from splitting work into
-// two chunks per worker to reduce tail effects without over-fragmenting.
+// three chunks per worker to reduce tail effects without over-fragmenting.
 const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 1;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE: usize = 2;
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE: usize = 3;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const PARALLEL_DYNAMIC_TWO_CHUNK_MIN_ACTIVE: usize = 2_048;
+const PARALLEL_DYNAMIC_APPLE_DENSE_CHUNK_MIN_ACTIVE: usize = 2_048;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 #[cfg(target_arch = "x86_64")]
@@ -106,10 +106,10 @@ const CORE_BACKEND_NEON: u8 = 2;
 // main.rs harness (Apple M4 dense frontier), so keep them enabled.
 #[cfg(target_arch = "aarch64")]
 const PREFETCH_TILE_DATA_AARCH64: bool = true;
-// Tuned for Apple perf cores: i+6 gives L2 enough lookahead while i+1 keeps
+// Tuned for Apple perf cores: i+5 gives L2 enough lookahead while i+1 keeps
 // the immediate tile in L1 under heavy frontier churn.
 #[cfg(target_arch = "aarch64")]
-const PREFETCH_TILE_FAR_AHEAD_AARCH64: usize = 6;
+const PREFETCH_TILE_FAR_AHEAD_AARCH64: usize = 5;
 #[cfg(target_arch = "aarch64")]
 const PREFETCH_TILE_NEAR_AHEAD_AARCH64: usize = 1;
 #[cfg(target_arch = "aarch64")]
@@ -997,13 +997,18 @@ fn churn_below_percent(changed_len: usize, active_len: usize, churn_pct_threshol
 }
 
 #[inline]
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 fn dynamic_target_chunks_per_worker(active_len: usize, _changed_len: usize) -> usize {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        if active_len >= PARALLEL_DYNAMIC_TWO_CHUNK_MIN_ACTIVE {
-            return PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE;
-        }
+    if active_len >= PARALLEL_DYNAMIC_APPLE_DENSE_CHUNK_MIN_ACTIVE {
+        PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE
+    } else {
+        PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE
     }
+}
+
+#[inline]
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+fn dynamic_target_chunks_per_worker(_active_len: usize, _changed_len: usize) -> usize {
     PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE
 }
 
@@ -2723,10 +2728,10 @@ mod tests {
         assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 1);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 2);
-            assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 2);
-            assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 2);
-            assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 2);
+            assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 3);
+            assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 3);
+            assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 3);
+            assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 3);
         }
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         {
@@ -2757,8 +2762,8 @@ mod tests {
         assert_eq!(small, 200);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            assert_eq!(medium_balanced, 512);
-            assert_eq!(medium_high, 512);
+            assert_eq!(medium_balanced, 342);
+            assert_eq!(medium_high, 342);
         }
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         {
