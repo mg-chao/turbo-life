@@ -76,7 +76,11 @@ const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
 const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
 // Tuned on the main.rs harness (Apple M4): switch to static slices earlier
-// to cut dynamic scheduler overhead on medium-large frontiers.
+// only on Apple Silicon to cut dynamic scheduler overhead on medium-large
+// frontiers without regressing other AArch64 platforms.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 2_048;
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 8_192;
 // Dynamic scheduler chunking target per worker.
 // Lower target (vs 4) reduces atomic cursor traffic while preserving balance.
@@ -487,17 +491,20 @@ fn parse_env_bool(value: &str) -> Option<bool> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[inline]
+fn macos_perf_only_enabled(env_value: Option<&str>) -> bool {
+    env_value.and_then(parse_env_bool).unwrap_or(true)
+}
+
 #[inline]
 fn physical_core_count() -> usize {
     *PHYSICAL_CORES.get_or_init(|| {
         let physical = num_cpus::get_physical().max(1);
         #[cfg(target_os = "macos")]
         {
-            let perf_only = std::env::var("TURBOLIFE_MACOS_PERF_ONLY")
-                .ok()
-                .as_deref()
-                .and_then(parse_env_bool)
-                .unwrap_or(false);
+            let perf_only_env = std::env::var("TURBOLIFE_MACOS_PERF_ONLY").ok();
+            let perf_only = macos_perf_only_enabled(perf_only_env.as_deref());
             if perf_only && let Some(perf) = apple_perf_core_count() {
                 return perf.min(physical).max(1);
             }
@@ -2405,7 +2412,7 @@ mod tests {
         KernelBackend, PARALLEL_KERNEL_MIN_ACTIVE, TILE_SIZE_I64, TurboLife, TurboLifeConfig,
         active_broadcast_workers, auto_pool_thread_count_for_physical, churn_at_most_percent,
         churn_below_percent, dynamic_parallel_chunk_size, dynamic_target_chunks_per_worker,
-        memory_parallel_cap, parse_env_bool, physical_core_count,
+        macos_perf_only_enabled, memory_parallel_cap, parse_env_bool, physical_core_count,
     };
 
     const PARALLEL_TEST_TILE_GRID: i64 = 12;
@@ -2500,6 +2507,21 @@ mod tests {
         assert_eq!(parse_env_bool("2"), None);
         assert_eq!(parse_env_bool("yes"), None);
         assert_eq!(parse_env_bool("off"), None);
+    }
+
+    #[test]
+    fn macos_perf_only_env_defaults_true_and_respects_overrides() {
+        assert!(macos_perf_only_enabled(None));
+        assert!(macos_perf_only_enabled(Some("1")));
+        assert!(macos_perf_only_enabled(Some("true")));
+        assert!(!macos_perf_only_enabled(Some("0")));
+        assert!(!macos_perf_only_enabled(Some("false")));
+    }
+
+    #[test]
+    fn macos_perf_only_env_invalid_values_fall_back_to_default() {
+        assert!(macos_perf_only_enabled(Some("")));
+        assert!(macos_perf_only_enabled(Some("maybe")));
     }
 
     #[test]
