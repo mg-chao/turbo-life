@@ -1,7 +1,7 @@
-use quick_life::turbolife::TurboLife;
 use rand::RngCore;
 use rand::SeedableRng;
 use std::time::Instant;
+use turbo_life::turbolife::TurboLife;
 
 fn bench_turbo(size: i64, density: f64, iterations: u64) -> (f64, u64) {
     let mut turbo = TurboLife::new();
@@ -27,22 +27,30 @@ fn bench_turbo(size: i64, density: f64, iterations: u64) -> (f64, u64) {
 
 fn main() {
     let scales: &[(i64, u64)] = &[
-        (1024, 200),   // ~256 tiles, below parallel threshold
-        (2048, 200),   // ~1024 tiles
-        (4096, 100),   // ~4096 tiles (current benchmark)
-        (8192, 50),    // ~16384 tiles
-        (16384, 20),   // ~65536 tiles
+        (1024, 200), // ~256 tiles, below parallel threshold
+        (2048, 200), // ~1024 tiles
+        (4096, 100), // ~4096 tiles (current benchmark)
+        (8192, 50),  // ~16384 tiles
+        (16384, 20), // ~65536 tiles
     ];
 
-    println!("{:<10} {:>8} {:>12} {:>12} {:>10}",
-        "Grid", "Tiles", "Iters", "Total(ms)", "Avg(ms)");
+    println!(
+        "{:<10} {:>8} {:>12} {:>12} {:>10}",
+        "Grid", "Tiles", "Iters", "Total(ms)", "Avg(ms)"
+    );
     println!("{}", "-".repeat(58));
 
     for &(size, iters) in scales {
         let tiles = (size / 64) * (size / 64);
         let (total_ms, _pop) = bench_turbo(size, 0.42, iters);
         let avg_ms = total_ms / iters as f64;
-        println!("{:<10} {:>8} {:>12} {:>12.1} {:>10.4}",
-            format!("{}x{}", size, size), tiles, iters, total_ms, avg_ms);
+        println!(
+            "{:<10} {:>8} {:>12} {:>12.1} {:>10.4}",
+            format!("{}x{}", size, size),
+            tiles,
+            iters,
+            total_ms,
+            avg_ms
+        );
     }
 }

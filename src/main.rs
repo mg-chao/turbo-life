@@ -1,12 +1,60 @@
-use turbo_life::quicklife::QuickLife;
-use turbo_life::turbolife::TurboLife;
 use rand::RngCore;
 use rand::SeedableRng;
 use std::time::Instant;
+use turbo_life::quicklife::QuickLife;
+use turbo_life::turbolife::{KernelBackend, TurboLife, TurboLifeConfig};
+
+fn parse_args() -> TurboLifeConfig {
+    let args: Vec<String> = std::env::args().collect();
+    let mut config = TurboLifeConfig::default();
+    let next_arg = |i: usize, flag: &str| -> &str {
+        args.get(i)
+            .map(String::as_str)
+            .unwrap_or_else(|| panic!("{flag} requires a value"))
+    };
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--threads" => {
+                i += 1;
+                let n: usize = next_arg(i, "--threads")
+                    .parse()
+                    .expect("--threads requires a positive integer");
+                config = config.thread_count(n);
+            }
+            "--max-threads" => {
+                i += 1;
+                let n: usize = next_arg(i, "--max-threads")
+                    .parse()
+                    .expect("--max-threads requires a positive integer");
+                config = config.max_threads(n);
+            }
+            "--kernel" => {
+                i += 1;
+                let backend = match next_arg(i, "--kernel").to_ascii_lowercase().as_str() {
+                    "scalar" => KernelBackend::Scalar,
+                    "avx2" => KernelBackend::Avx2,
+                    "neon" => KernelBackend::Neon,
+                    other => {
+                        panic!("unknown kernel backend: {other} (expected scalar, avx2, or neon)")
+                    }
+                };
+                config = config.kernel(backend);
+            }
+            other => panic!(
+                "unknown argument: {other}\nusage: turbo-life [--threads N] [--max-threads N] [--kernel scalar|avx2|neon]"
+            ),
+        }
+        i += 1;
+    }
+    config
+}
 
 fn main() {
+    let config = parse_args();
+
     let mut quick = QuickLife::new();
-    let mut turbo = TurboLife::new();
+    let mut turbo = TurboLife::with_config(config);
     let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_1234_ABCD_EF01);
     let threshold = (u64::MAX as f64 * 0.42) as u64;
 
@@ -14,33 +62,62 @@ fn main() {
         for x in 0..=4096 {
             if rng.next_u64() <= threshold {
                 quick.set_cell(x, y, true);
-                turbo.set_cell(x as i64, y as i64, true);
+                turbo.set_cell_alive(x as i64, y as i64);
             }
         }
     }
 
-    let iterations = 1000u64;
+    let total_iterations = 2000u64;
+    let check_interval = 1000u64;
+    let mut quick_total_duration = std::time::Duration::ZERO;
+    let mut turbo_total_duration = std::time::Duration::ZERO;
+    let mut quick_prev_duration = std::time::Duration::ZERO;
+    let mut turbo_prev_duration = std::time::Duration::ZERO;
 
-    let start = Instant::now();
-    quick.step(iterations);
-    let quick_duration = start.elapsed();
+    for checkpoint in 1..=(total_iterations / check_interval) {
+        let iteration = checkpoint * check_interval;
 
-    let start = Instant::now();
-    turbo.step_n(iterations);
-    let turbo_duration = start.elapsed();
+        let start = Instant::now();
+        quick.step(check_interval);
+        quick_total_duration += start.elapsed();
 
-    let quick_total_ms = quick_duration.as_secs_f64() * 1000.0;
-    let quick_avg_ms = quick_total_ms / iterations as f64;
-    let turbo_total_ms = turbo_duration.as_secs_f64() * 1000.0;
-    let turbo_avg_ms = turbo_total_ms / iterations as f64;
+        let start = Instant::now();
+        turbo.step_n(check_interval);
+        turbo_total_duration += start.elapsed();
 
-    println!("QuickLife total iteration time: {quick_total_ms:.3} ms");
-    println!("QuickLife average time per iteration: {quick_avg_ms:.6} ms");
-    println!("TurboLife total iteration time: {turbo_total_ms:.3} ms");
-    println!("TurboLife average time per iteration: {turbo_avg_ms:.6} ms");
+        let quick_phase = quick_total_duration - quick_prev_duration;
+        let turbo_phase = turbo_total_duration - turbo_prev_duration;
+        quick_prev_duration = quick_total_duration;
+        turbo_prev_duration = turbo_total_duration;
 
-    let quick_population = quick.population();
-    let turbo_population = turbo.population();
-    println!("QuickLife population: {quick_population}");
-    println!("TurboLife population: {turbo_population}");
+        let quick_ms = quick_phase.as_secs_f64() * 1000.0;
+        let turbo_ms = turbo_phase.as_secs_f64() * 1000.0;
+        let quick_avg_ms = quick_ms / check_interval as f64;
+        let turbo_avg_ms = turbo_ms / check_interval as f64;
+
+        let quick_population = quick.population();
+        let turbo_population = turbo.population();
+        let match_status = if quick_population == turbo_population {
+            "MATCH"
+        } else {
+            "MISMATCH"
+        };
+        println!(
+            "Iteration {iteration}: QuickLife pop = {quick_population}, TurboLife pop = {turbo_population} [{match_status}]"
+        );
+        println!(
+            "  QuickLife: {quick_ms:.3} ms total, {quick_avg_ms:.6} ms/iter | TurboLife: {turbo_ms:.3} ms total, {turbo_avg_ms:.6} ms/iter"
+        );
+    }
+
+    let quick_total_ms = quick_total_duration.as_secs_f64() * 1000.0;
+    let turbo_total_ms = turbo_total_duration.as_secs_f64() * 1000.0;
+    let quick_avg_ms = quick_total_ms / total_iterations as f64;
+    let turbo_avg_ms = turbo_total_ms / total_iterations as f64;
+    let speedup = quick_total_ms / turbo_total_ms;
+
+    println!("\n--- Summary ({total_iterations} iterations) ---");
+    println!("QuickLife: {quick_total_ms:.3} ms total, {quick_avg_ms:.6} ms/iter");
+    println!("TurboLife: {turbo_total_ms:.3} ms total, {turbo_avg_ms:.6} ms/iter");
+    println!("Speedup (QuickLife / TurboLife): {speedup:.2}x");
 }
