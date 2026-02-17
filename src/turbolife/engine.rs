@@ -99,8 +99,8 @@ const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 #[cfg(target_arch = "aarch64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 32_768;
-// AArch64 PRFM hints regressed end-to-end throughput on the main harness;
-// keep them compiled but disabled by default for this target.
+// AArch64 PRFM hints are workload- and CPU-dependent. Keep them behind an
+// opt-in feature so the auto-tuner can accept/reject them per machine.
 #[cfg(target_arch = "aarch64")]
 #[cfg(feature = "aggressive-prefetch-aarch64")]
 const PREFETCH_TILE_DATA_AARCH64: bool = true;

@@ -47,6 +47,19 @@ impl<T> SendConstPtr<T> {
     }
 }
 
+#[inline(always)]
+fn vec_push_fast<T>(buf: &mut Vec<T>, value: T) {
+    if buf.len() == buf.capacity() {
+        buf.push(value);
+        return;
+    }
+    let len = buf.len();
+    unsafe {
+        std::ptr::write(buf.as_mut_ptr().add(len), value);
+        buf.set_len(len + 1);
+    }
+}
+
 #[inline]
 fn prune_filter_chunk_size(candidate_len: usize, threads: usize) -> usize {
     let target_chunks = threads.saturating_mul(4).max(1);
@@ -231,11 +244,6 @@ const fn build_expand_mask_table() -> ExpandMaskTable {
 
 const EXPAND_MASK_TABLE: ExpandMaskTable = build_expand_mask_table();
 
-#[inline(always)]
-fn pack_expand_candidate(idx: TileIdx, dir: usize) -> u32 {
-    (idx.0 << 3) | dir as u32
-}
-
 /// # Safety
 /// Caller must ensure `expand` has enough spare capacity for all candidates in
 /// `missing_mask & live_mask` before calling.
@@ -252,14 +260,66 @@ pub(crate) unsafe fn append_expand_candidates_unchecked(
     }
     let dirs = &EXPAND_MASK_TABLE.dirs[expand_mask];
     let count = EXPAND_MASK_TABLE.len[expand_mask] as usize;
+    let base = idx.0 << 3;
 
     let len = expand.len();
     debug_assert!(len.saturating_add(count) <= expand.capacity());
     unsafe {
-        let mut write_ptr = expand.as_mut_ptr().add(len);
-        for &dir in dirs[..count].iter() {
-            write_ptr.write(pack_expand_candidate(idx, dir as usize));
-            write_ptr = write_ptr.add(1);
+        let write_ptr = expand.as_mut_ptr().add(len);
+        match count {
+            1 => {
+                write_ptr.add(0).write(base | dirs[0] as u32);
+            }
+            2 => {
+                write_ptr.add(0).write(base | dirs[0] as u32);
+                write_ptr.add(1).write(base | dirs[1] as u32);
+            }
+            3 => {
+                write_ptr.add(0).write(base | dirs[0] as u32);
+                write_ptr.add(1).write(base | dirs[1] as u32);
+                write_ptr.add(2).write(base | dirs[2] as u32);
+            }
+            4 => {
+                write_ptr.add(0).write(base | dirs[0] as u32);
+                write_ptr.add(1).write(base | dirs[1] as u32);
+                write_ptr.add(2).write(base | dirs[2] as u32);
+                write_ptr.add(3).write(base | dirs[3] as u32);
+            }
+            5 => {
+                write_ptr.add(0).write(base | dirs[0] as u32);
+                write_ptr.add(1).write(base | dirs[1] as u32);
+                write_ptr.add(2).write(base | dirs[2] as u32);
+                write_ptr.add(3).write(base | dirs[3] as u32);
+                write_ptr.add(4).write(base | dirs[4] as u32);
+            }
+            6 => {
+                write_ptr.add(0).write(base | dirs[0] as u32);
+                write_ptr.add(1).write(base | dirs[1] as u32);
+                write_ptr.add(2).write(base | dirs[2] as u32);
+                write_ptr.add(3).write(base | dirs[3] as u32);
+                write_ptr.add(4).write(base | dirs[4] as u32);
+                write_ptr.add(5).write(base | dirs[5] as u32);
+            }
+            7 => {
+                write_ptr.add(0).write(base | dirs[0] as u32);
+                write_ptr.add(1).write(base | dirs[1] as u32);
+                write_ptr.add(2).write(base | dirs[2] as u32);
+                write_ptr.add(3).write(base | dirs[3] as u32);
+                write_ptr.add(4).write(base | dirs[4] as u32);
+                write_ptr.add(5).write(base | dirs[5] as u32);
+                write_ptr.add(6).write(base | dirs[6] as u32);
+            }
+            8 => {
+                write_ptr.add(0).write(base | dirs[0] as u32);
+                write_ptr.add(1).write(base | dirs[1] as u32);
+                write_ptr.add(2).write(base | dirs[2] as u32);
+                write_ptr.add(3).write(base | dirs[3] as u32);
+                write_ptr.add(4).write(base | dirs[4] as u32);
+                write_ptr.add(5).write(base | dirs[5] as u32);
+                write_ptr.add(6).write(base | dirs[6] as u32);
+                write_ptr.add(7).write(base | dirs[7] as u32);
+            }
+            _ => unreachable!(),
         }
         expand.set_len(len + count);
     }
@@ -338,7 +398,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                         bits &= bits - 1;
                         continue;
                     }
-                    arena.active_set.push(TileIdx(i as u32));
+                    vec_push_fast(&mut arena.active_set, TileIdx(i as u32));
                     bits &= bits - 1;
                 }
             }
@@ -371,11 +431,22 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                     let word = i >> 6;
                     *marks_ptr.add(word) |= 1u64 << (i & 63);
                     let nb = *neighbors_ptr.add(i);
-                    for &ni_raw in nb.iter() {
-                        let ni = ni_raw as usize;
-                        let ni_word = ni >> 6;
-                        *marks_ptr.add(ni_word) |= 1u64 << (ni & 63);
-                    }
+                    let ni0 = nb[0] as usize;
+                    let ni1 = nb[1] as usize;
+                    let ni2 = nb[2] as usize;
+                    let ni3 = nb[3] as usize;
+                    let ni4 = nb[4] as usize;
+                    let ni5 = nb[5] as usize;
+                    let ni6 = nb[6] as usize;
+                    let ni7 = nb[7] as usize;
+                    *marks_ptr.add(ni0 >> 6) |= 1u64 << (ni0 & 63);
+                    *marks_ptr.add(ni1 >> 6) |= 1u64 << (ni1 & 63);
+                    *marks_ptr.add(ni2 >> 6) |= 1u64 << (ni2 & 63);
+                    *marks_ptr.add(ni3 >> 6) |= 1u64 << (ni3 & 63);
+                    *marks_ptr.add(ni4 >> 6) |= 1u64 << (ni4 & 63);
+                    *marks_ptr.add(ni5 >> 6) |= 1u64 << (ni5 & 63);
+                    *marks_ptr.add(ni6 >> 6) |= 1u64 << (ni6 & 63);
+                    *marks_ptr.add(ni7 >> 6) |= 1u64 << (ni7 & 63);
                 }
             }
         } else {
@@ -390,11 +461,22 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                     *marks_ptr.add(word) |= 1u64 << (i & 63);
                     let nb = *neighbors_ptr.add(i);
                     if influence_mask == u8::MAX {
-                        for &ni_raw in nb.iter() {
-                            let ni = ni_raw as usize;
-                            let ni_word = ni >> 6;
-                            *marks_ptr.add(ni_word) |= 1u64 << (ni & 63);
-                        }
+                        let ni0 = nb[0] as usize;
+                        let ni1 = nb[1] as usize;
+                        let ni2 = nb[2] as usize;
+                        let ni3 = nb[3] as usize;
+                        let ni4 = nb[4] as usize;
+                        let ni5 = nb[5] as usize;
+                        let ni6 = nb[6] as usize;
+                        let ni7 = nb[7] as usize;
+                        *marks_ptr.add(ni0 >> 6) |= 1u64 << (ni0 & 63);
+                        *marks_ptr.add(ni1 >> 6) |= 1u64 << (ni1 & 63);
+                        *marks_ptr.add(ni2 >> 6) |= 1u64 << (ni2 & 63);
+                        *marks_ptr.add(ni3 >> 6) |= 1u64 << (ni3 & 63);
+                        *marks_ptr.add(ni4 >> 6) |= 1u64 << (ni4 & 63);
+                        *marks_ptr.add(ni5 >> 6) |= 1u64 << (ni5 & 63);
+                        *marks_ptr.add(ni6 >> 6) |= 1u64 << (ni6 & 63);
+                        *marks_ptr.add(ni7 >> 6) |= 1u64 << (ni7 & 63);
                     } else {
                         let dirs = &EXPAND_MASK_TABLE.dirs[influence_mask as usize];
                         let count = EXPAND_MASK_TABLE.len[influence_mask as usize] as usize;
@@ -429,7 +511,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                 let i = (word_idx << 6) + bit;
                 debug_assert!(i < meta_len);
                 debug_assert!(arena.meta[i].occupied());
-                arena.active_set.push(TileIdx(i as u32));
+                vec_push_fast(&mut arena.active_set, TileIdx(i as u32));
                 bits &= bits - 1;
             }
         }
@@ -457,18 +539,66 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
             debug_assert!(i < meta_len);
             debug_assert!(unsafe { (*meta_ptr.add(i)).occupied() });
             if unsafe { !arena.active_test_and_set_unchecked(i) } {
-                arena.active_set.push(idx);
+                vec_push_fast(&mut arena.active_set, idx);
             }
 
             unsafe {
                 let nb = *neighbors_ptr.add(i);
-                for &ni_raw in nb.iter() {
-                    let ni_i = ni_raw as usize;
-                    debug_assert!(ni_i < meta_len);
-                    debug_assert!(ni_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni_i)).occupied());
-                    if !arena.active_test_and_set_unchecked(ni_i) {
-                        arena.active_set.push(TileIdx(ni_raw));
-                    }
+                let ni0 = nb[0];
+                let ni1 = nb[1];
+                let ni2 = nb[2];
+                let ni3 = nb[3];
+                let ni4 = nb[4];
+                let ni5 = nb[5];
+                let ni6 = nb[6];
+                let ni7 = nb[7];
+                let ni0_i = ni0 as usize;
+                let ni1_i = ni1 as usize;
+                let ni2_i = ni2 as usize;
+                let ni3_i = ni3 as usize;
+                let ni4_i = ni4 as usize;
+                let ni5_i = ni5 as usize;
+                let ni6_i = ni6 as usize;
+                let ni7_i = ni7 as usize;
+                debug_assert!(ni0_i < meta_len);
+                debug_assert!(ni1_i < meta_len);
+                debug_assert!(ni2_i < meta_len);
+                debug_assert!(ni3_i < meta_len);
+                debug_assert!(ni4_i < meta_len);
+                debug_assert!(ni5_i < meta_len);
+                debug_assert!(ni6_i < meta_len);
+                debug_assert!(ni7_i < meta_len);
+                debug_assert!(ni0_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni0_i)).occupied());
+                debug_assert!(ni1_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni1_i)).occupied());
+                debug_assert!(ni2_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni2_i)).occupied());
+                debug_assert!(ni3_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni3_i)).occupied());
+                debug_assert!(ni4_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni4_i)).occupied());
+                debug_assert!(ni5_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni5_i)).occupied());
+                debug_assert!(ni6_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni6_i)).occupied());
+                debug_assert!(ni7_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni7_i)).occupied());
+                if !arena.active_test_and_set_unchecked(ni0_i) {
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni0));
+                }
+                if !arena.active_test_and_set_unchecked(ni1_i) {
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni1));
+                }
+                if !arena.active_test_and_set_unchecked(ni2_i) {
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni2));
+                }
+                if !arena.active_test_and_set_unchecked(ni3_i) {
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni3));
+                }
+                if !arena.active_test_and_set_unchecked(ni4_i) {
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni4));
+                }
+                if !arena.active_test_and_set_unchecked(ni5_i) {
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni5));
+                }
+                if !arena.active_test_and_set_unchecked(ni6_i) {
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni6));
+                }
+                if !arena.active_test_and_set_unchecked(ni7_i) {
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni7));
                 }
             }
         }
@@ -481,7 +611,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
             debug_assert!(i < meta_len);
             debug_assert!(unsafe { (*meta_ptr.add(i)).occupied() });
             if unsafe { !arena.active_test_and_set_unchecked(i) } {
-                arena.active_set.push(idx);
+                vec_push_fast(&mut arena.active_set, idx);
             }
             if influence_mask == 0 {
                 continue;
@@ -492,15 +622,77 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
             unsafe {
                 let nb = *neighbors_ptr.add(i);
                 if influence_mask == u8::MAX {
-                    for &ni_raw in nb.iter() {
-                        let ni_i = ni_raw as usize;
-                        debug_assert!(ni_i < meta_len);
-                        debug_assert!(
-                            ni_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni_i)).occupied()
-                        );
-                        if !arena.active_test_and_set_unchecked(ni_i) {
-                            arena.active_set.push(TileIdx(ni_raw));
-                        }
+                    let ni0 = nb[0];
+                    let ni1 = nb[1];
+                    let ni2 = nb[2];
+                    let ni3 = nb[3];
+                    let ni4 = nb[4];
+                    let ni5 = nb[5];
+                    let ni6 = nb[6];
+                    let ni7 = nb[7];
+                    let ni0_i = ni0 as usize;
+                    let ni1_i = ni1 as usize;
+                    let ni2_i = ni2 as usize;
+                    let ni3_i = ni3 as usize;
+                    let ni4_i = ni4 as usize;
+                    let ni5_i = ni5 as usize;
+                    let ni6_i = ni6 as usize;
+                    let ni7_i = ni7 as usize;
+                    debug_assert!(ni0_i < meta_len);
+                    debug_assert!(ni1_i < meta_len);
+                    debug_assert!(ni2_i < meta_len);
+                    debug_assert!(ni3_i < meta_len);
+                    debug_assert!(ni4_i < meta_len);
+                    debug_assert!(ni5_i < meta_len);
+                    debug_assert!(ni6_i < meta_len);
+                    debug_assert!(ni7_i < meta_len);
+                    debug_assert!(
+                        ni0_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni0_i)).occupied()
+                    );
+                    debug_assert!(
+                        ni1_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni1_i)).occupied()
+                    );
+                    debug_assert!(
+                        ni2_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni2_i)).occupied()
+                    );
+                    debug_assert!(
+                        ni3_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni3_i)).occupied()
+                    );
+                    debug_assert!(
+                        ni4_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni4_i)).occupied()
+                    );
+                    debug_assert!(
+                        ni5_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni5_i)).occupied()
+                    );
+                    debug_assert!(
+                        ni6_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni6_i)).occupied()
+                    );
+                    debug_assert!(
+                        ni7_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni7_i)).occupied()
+                    );
+                    if !arena.active_test_and_set_unchecked(ni0_i) {
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni0));
+                    }
+                    if !arena.active_test_and_set_unchecked(ni1_i) {
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni1));
+                    }
+                    if !arena.active_test_and_set_unchecked(ni2_i) {
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni2));
+                    }
+                    if !arena.active_test_and_set_unchecked(ni3_i) {
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni3));
+                    }
+                    if !arena.active_test_and_set_unchecked(ni4_i) {
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni4));
+                    }
+                    if !arena.active_test_and_set_unchecked(ni5_i) {
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni5));
+                    }
+                    if !arena.active_test_and_set_unchecked(ni6_i) {
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni6));
+                    }
+                    if !arena.active_test_and_set_unchecked(ni7_i) {
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni7));
                     }
                 } else {
                     let dirs = &EXPAND_MASK_TABLE.dirs[influence_mask as usize];
@@ -513,7 +705,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                             ni_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni_i)).occupied()
                         );
                         if !arena.active_test_and_set_unchecked(ni_i) {
-                            arena.active_set.push(TileIdx(ni_raw));
+                            vec_push_fast(&mut arena.active_set, TileIdx(ni_raw));
                         }
                     }
                 }
