@@ -4,7 +4,7 @@
 //! Border extraction is fused into the main loop.
 //! Works with split cell buffers (separate current/next vecs).
 
-use super::tile::{BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, TILE_SIZE, TileMeta};
+use super::tile::{BorderData, CellBuf, GhostZone, TILE_SIZE, TileMeta};
 const _: [(); 1] = [(); (TILE_SIZE == 64) as usize];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1072,7 +1072,6 @@ unsafe fn advance_tile_fused_impl<
     const CORE_BACKEND: u8,
     const ASSUME_CHANGED: bool,
     const TRACK_NEIGHBOR_INFLUENCE: bool,
-    const SKIP_CLEAN_BORDER_WRITES: bool,
 >(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
@@ -1164,27 +1163,6 @@ unsafe fn advance_tile_fused_impl<
             }
         }
     } else {
-        if missing_mask == MISSING_ALL_NEIGHBORS {
-            debug_assert!(tile_is_empty(current));
-            unsafe {
-                if force_store {
-                    std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
-                }
-            }
-            if !SKIP_CLEAN_BORDER_WRITES || force_store {
-                unsafe {
-                    *next_borders_north_ptr.add(idx) = 0;
-                    *next_borders_south_ptr.add(idx) = 0;
-                    *next_borders_west_ptr.add(idx) = 0;
-                    *next_borders_east_ptr.add(idx) = 0;
-                    *next_live_masks_ptr.add(idx) = 0;
-                }
-            }
-            debug_assert!(force_store || tile_is_empty(next));
-            meta.update_after_step(false, false);
-            return TileAdvanceResult::new(false, false, missing_mask, 0, 0);
-        }
-
         let north_live = unsafe { *live_masks_read_ptr.add(north_i) };
         let south_live = unsafe { *live_masks_read_ptr.add(south_i) };
         let west_live = unsafe { *live_masks_read_ptr.add(west_i) };
@@ -1209,14 +1187,12 @@ unsafe fn advance_tile_fused_impl<
                     std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
                 }
             }
-            if !SKIP_CLEAN_BORDER_WRITES || force_store {
-                unsafe {
-                    *next_borders_north_ptr.add(idx) = 0;
-                    *next_borders_south_ptr.add(idx) = 0;
-                    *next_borders_west_ptr.add(idx) = 0;
-                    *next_borders_east_ptr.add(idx) = 0;
-                    *next_live_masks_ptr.add(idx) = 0;
-                }
+            unsafe {
+                *next_borders_north_ptr.add(idx) = 0;
+                *next_borders_south_ptr.add(idx) = 0;
+                *next_borders_west_ptr.add(idx) = 0;
+                *next_borders_east_ptr.add(idx) = 0;
+                *next_live_masks_ptr.add(idx) = 0;
             }
             debug_assert!(force_store || tile_is_empty(next));
             meta.update_after_step(false, false);
@@ -1234,18 +1210,16 @@ unsafe fn advance_tile_fused_impl<
             se: (se_live & LIVE_NW) != 0,
         };
         debug_assert!(tile_is_empty(current));
-        advance_core_empty_with_clear(next, &ghost, meta.alt_phase_dirty())
+        advance_core_empty_with_clear(next, &ghost, force_store)
     };
     let live_mask = border.live_mask();
 
-    if !SKIP_CLEAN_BORDER_WRITES || force_store || changed {
-        unsafe {
-            *next_borders_north_ptr.add(idx) = border.north;
-            *next_borders_south_ptr.add(idx) = border.south;
-            *next_borders_west_ptr.add(idx) = border.west;
-            *next_borders_east_ptr.add(idx) = border.east;
-            *next_live_masks_ptr.add(idx) = live_mask;
-        }
+    unsafe {
+        *next_borders_north_ptr.add(idx) = border.north;
+        *next_borders_south_ptr.add(idx) = border.south;
+        *next_borders_west_ptr.add(idx) = border.west;
+        *next_borders_east_ptr.add(idx) = border.east;
+        *next_live_masks_ptr.add(idx) = live_mask;
     }
 
     let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
@@ -1295,7 +1269,7 @@ pub unsafe fn advance_tile_fused_scalar_track(
     idx: usize,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_SCALAR }, false, true, false>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_SCALAR }, false, true>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1335,7 +1309,7 @@ pub unsafe fn advance_tile_fused_scalar_no_track(
     idx: usize,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_SCALAR }, false, false, false>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_SCALAR }, false, false>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1376,7 +1350,7 @@ pub unsafe fn advance_tile_fused_avx2_track(
     idx: usize,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_AVX2 }, false, true, false>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_AVX2 }, false, true>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1417,7 +1391,7 @@ pub unsafe fn advance_tile_fused_avx2_no_track(
     idx: usize,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_AVX2 }, false, false, false>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_AVX2 }, false, false>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1458,7 +1432,7 @@ pub unsafe fn advance_tile_fused_neon_track(
     idx: usize,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, false, true, false>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, false, true>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1500,7 +1474,7 @@ pub unsafe fn advance_tile_fused_neon_no_track(
     idx: usize,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, false, false, false>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, false, false>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1542,7 +1516,7 @@ pub unsafe fn advance_tile_fused_neon_assume_changed_no_track(
     idx: usize,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, true, false, false>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, true, false>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1583,7 +1557,7 @@ pub unsafe fn advance_tile_fused_neon_no_track_fast(
     idx: usize,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, false, false, true>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, false, false>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1624,7 +1598,7 @@ pub unsafe fn advance_tile_fused_neon_assume_changed_no_track_fast(
     idx: usize,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, true, false, true>(
+        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, true, false>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -2092,7 +2066,7 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn neon_fused_no_track_fast_skips_border_writes_when_alt_phase_is_clean() {
+    fn neon_fused_no_track_fast_writes_border_cache_when_alt_phase_is_clean() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
             return;
         }
@@ -2139,11 +2113,11 @@ mod tests {
         assert!(!result.changed);
         assert!(result.has_live);
         assert_eq!(result.live_mask, 0);
-        assert_eq!(next_borders_north[0], u64::MAX);
-        assert_eq!(next_borders_south[0], u64::MAX);
-        assert_eq!(next_borders_west[0], u64::MAX);
-        assert_eq!(next_borders_east[0], u64::MAX);
-        assert_eq!(next_live_masks[0], u8::MAX);
+        assert_eq!(next_borders_north[0], 0);
+        assert_eq!(next_borders_south[0], 0);
+        assert_eq!(next_borders_west[0], 0);
+        assert_eq!(next_borders_east[0], 0);
+        assert_eq!(next_live_masks[0], 0);
         assert_eq!(next[0].0, [u64::MAX; TILE_SIZE]);
         assert!(!meta[0].alt_phase_dirty());
     }
