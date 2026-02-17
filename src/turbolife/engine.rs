@@ -242,8 +242,174 @@ unsafe fn prefetch_neighbor_border_lines(
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn advance_tile_fused_backend<
-    const CORE_BACKEND: u8,
+unsafe fn advance_tile_fused_scalar_backend<const TRACK_NEIGHBOR_INFLUENCE: bool>(
+    current_ptr: *const tile::CellBuf,
+    next_ptr: *mut tile::CellBuf,
+    meta_ptr: *mut tile::TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+) -> super::kernel::TileAdvanceResult {
+    if TRACK_NEIGHBOR_INFLUENCE {
+        unsafe {
+            advance_tile_fused_scalar_track(
+                current_ptr,
+                next_ptr,
+                meta_ptr,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                neighbors_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+            )
+        }
+    } else {
+        unsafe {
+            advance_tile_fused_scalar_no_track(
+                current_ptr,
+                next_ptr,
+                meta_ptr,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                neighbors_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+            )
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn advance_tile_fused_avx2_backend<const TRACK_NEIGHBOR_INFLUENCE: bool>(
+    current_ptr: *const tile::CellBuf,
+    next_ptr: *mut tile::CellBuf,
+    meta_ptr: *mut tile::TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+) -> super::kernel::TileAdvanceResult {
+    if TRACK_NEIGHBOR_INFLUENCE {
+        unsafe {
+            advance_tile_fused_avx2_track(
+                current_ptr,
+                next_ptr,
+                meta_ptr,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                neighbors_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+            )
+        }
+    } else {
+        unsafe {
+            advance_tile_fused_avx2_no_track(
+                current_ptr,
+                next_ptr,
+                meta_ptr,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                neighbors_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+            )
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn advance_tile_fused_avx2_backend<const TRACK_NEIGHBOR_INFLUENCE: bool>(
+    current_ptr: *const tile::CellBuf,
+    next_ptr: *mut tile::CellBuf,
+    meta_ptr: *mut tile::TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+) -> super::kernel::TileAdvanceResult {
+    unsafe {
+        advance_tile_fused_scalar_backend::<TRACK_NEIGHBOR_INFLUENCE>(
+            current_ptr,
+            next_ptr,
+            meta_ptr,
+            next_borders_north_ptr,
+            next_borders_south_ptr,
+            next_borders_west_ptr,
+            next_borders_east_ptr,
+            borders_north_read_ptr,
+            borders_south_read_ptr,
+            borders_west_read_ptr,
+            borders_east_read_ptr,
+            neighbors_ptr,
+            live_masks_read_ptr,
+            next_live_masks_ptr,
+            idx,
+        )
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn advance_tile_fused_neon_backend<
     const TRACK_NEIGHBOR_INFLUENCE: bool,
     const ASSUME_CHANGED_NEON: bool,
 >(
@@ -264,268 +430,123 @@ unsafe fn advance_tile_fused_backend<
     idx: usize,
 ) -> super::kernel::TileAdvanceResult {
     debug_assert!(
-        !ASSUME_CHANGED_NEON || CORE_BACKEND == CORE_BACKEND_NEON,
-        "assume-changed mode is only valid for the NEON backend"
+        !ASSUME_CHANGED_NEON || !TRACK_NEIGHBOR_INFLUENCE,
+        "assume-changed mode does not emit neighbor influence"
     );
     if TRACK_NEIGHBOR_INFLUENCE {
-        if CORE_BACKEND == CORE_BACKEND_SCALAR {
-            return unsafe {
-                advance_tile_fused_scalar_track(
-                    current_ptr,
-                    next_ptr,
-                    meta_ptr,
-                    next_borders_north_ptr,
-                    next_borders_south_ptr,
-                    next_borders_west_ptr,
-                    next_borders_east_ptr,
-                    borders_north_read_ptr,
-                    borders_south_read_ptr,
-                    borders_west_read_ptr,
-                    borders_east_read_ptr,
-                    neighbors_ptr,
-                    live_masks_read_ptr,
-                    next_live_masks_ptr,
-                    idx,
-                )
-            };
+        unsafe {
+            advance_tile_fused_neon_track(
+                current_ptr,
+                next_ptr,
+                meta_ptr,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                neighbors_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+            )
         }
-        if CORE_BACKEND == CORE_BACKEND_AVX2 {
-            #[cfg(target_arch = "x86_64")]
-            {
-                return unsafe {
-                    advance_tile_fused_avx2_track(
-                        current_ptr,
-                        next_ptr,
-                        meta_ptr,
-                        next_borders_north_ptr,
-                        next_borders_south_ptr,
-                        next_borders_west_ptr,
-                        next_borders_east_ptr,
-                        borders_north_read_ptr,
-                        borders_south_read_ptr,
-                        borders_west_read_ptr,
-                        borders_east_read_ptr,
-                        neighbors_ptr,
-                        live_masks_read_ptr,
-                        next_live_masks_ptr,
-                        idx,
-                    )
-                };
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                return unsafe {
-                    advance_tile_fused_scalar_track(
-                        current_ptr,
-                        next_ptr,
-                        meta_ptr,
-                        next_borders_north_ptr,
-                        next_borders_south_ptr,
-                        next_borders_west_ptr,
-                        next_borders_east_ptr,
-                        borders_north_read_ptr,
-                        borders_south_read_ptr,
-                        borders_west_read_ptr,
-                        borders_east_read_ptr,
-                        neighbors_ptr,
-                        live_masks_read_ptr,
-                        next_live_masks_ptr,
-                        idx,
-                    )
-                };
-            }
-        }
-        if CORE_BACKEND == CORE_BACKEND_NEON {
-            #[cfg(target_arch = "aarch64")]
-            {
-                return unsafe {
-                    advance_tile_fused_neon_track(
-                        current_ptr,
-                        next_ptr,
-                        meta_ptr,
-                        next_borders_north_ptr,
-                        next_borders_south_ptr,
-                        next_borders_west_ptr,
-                        next_borders_east_ptr,
-                        borders_north_read_ptr,
-                        borders_south_read_ptr,
-                        borders_west_read_ptr,
-                        borders_east_read_ptr,
-                        neighbors_ptr,
-                        live_masks_read_ptr,
-                        next_live_masks_ptr,
-                        idx,
-                    )
-                };
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                return unsafe {
-                    advance_tile_fused_scalar_track(
-                        current_ptr,
-                        next_ptr,
-                        meta_ptr,
-                        next_borders_north_ptr,
-                        next_borders_south_ptr,
-                        next_borders_west_ptr,
-                        next_borders_east_ptr,
-                        borders_north_read_ptr,
-                        borders_south_read_ptr,
-                        borders_west_read_ptr,
-                        borders_east_read_ptr,
-                        neighbors_ptr,
-                        live_masks_read_ptr,
-                        next_live_masks_ptr,
-                        idx,
-                    )
-                };
-            }
+    } else if ASSUME_CHANGED_NEON {
+        unsafe {
+            advance_tile_fused_neon_assume_changed_no_track_fast(
+                current_ptr,
+                next_ptr,
+                meta_ptr,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                neighbors_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+            )
         }
     } else {
-        if CORE_BACKEND == CORE_BACKEND_SCALAR {
-            return unsafe {
-                advance_tile_fused_scalar_no_track(
-                    current_ptr,
-                    next_ptr,
-                    meta_ptr,
-                    next_borders_north_ptr,
-                    next_borders_south_ptr,
-                    next_borders_west_ptr,
-                    next_borders_east_ptr,
-                    borders_north_read_ptr,
-                    borders_south_read_ptr,
-                    borders_west_read_ptr,
-                    borders_east_read_ptr,
-                    neighbors_ptr,
-                    live_masks_read_ptr,
-                    next_live_masks_ptr,
-                    idx,
-                )
-            };
-        }
-        if CORE_BACKEND == CORE_BACKEND_AVX2 {
-            #[cfg(target_arch = "x86_64")]
-            {
-                return unsafe {
-                    advance_tile_fused_avx2_no_track(
-                        current_ptr,
-                        next_ptr,
-                        meta_ptr,
-                        next_borders_north_ptr,
-                        next_borders_south_ptr,
-                        next_borders_west_ptr,
-                        next_borders_east_ptr,
-                        borders_north_read_ptr,
-                        borders_south_read_ptr,
-                        borders_west_read_ptr,
-                        borders_east_read_ptr,
-                        neighbors_ptr,
-                        live_masks_read_ptr,
-                        next_live_masks_ptr,
-                        idx,
-                    )
-                };
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                return unsafe {
-                    advance_tile_fused_scalar_no_track(
-                        current_ptr,
-                        next_ptr,
-                        meta_ptr,
-                        next_borders_north_ptr,
-                        next_borders_south_ptr,
-                        next_borders_west_ptr,
-                        next_borders_east_ptr,
-                        borders_north_read_ptr,
-                        borders_south_read_ptr,
-                        borders_west_read_ptr,
-                        borders_east_read_ptr,
-                        neighbors_ptr,
-                        live_masks_read_ptr,
-                        next_live_masks_ptr,
-                        idx,
-                    )
-                };
-            }
-        }
-        if CORE_BACKEND == CORE_BACKEND_NEON {
-            #[cfg(target_arch = "aarch64")]
-            {
-                if ASSUME_CHANGED_NEON {
-                    return unsafe {
-                        advance_tile_fused_neon_assume_changed_no_track_fast(
-                            current_ptr,
-                            next_ptr,
-                            meta_ptr,
-                            next_borders_north_ptr,
-                            next_borders_south_ptr,
-                            next_borders_west_ptr,
-                            next_borders_east_ptr,
-                            borders_north_read_ptr,
-                            borders_south_read_ptr,
-                            borders_west_read_ptr,
-                            borders_east_read_ptr,
-                            neighbors_ptr,
-                            live_masks_read_ptr,
-                            next_live_masks_ptr,
-                            idx,
-                        )
-                    };
-                }
-                return unsafe {
-                    advance_tile_fused_neon_no_track_fast(
-                        current_ptr,
-                        next_ptr,
-                        meta_ptr,
-                        next_borders_north_ptr,
-                        next_borders_south_ptr,
-                        next_borders_west_ptr,
-                        next_borders_east_ptr,
-                        borders_north_read_ptr,
-                        borders_south_read_ptr,
-                        borders_west_read_ptr,
-                        borders_east_read_ptr,
-                        neighbors_ptr,
-                        live_masks_read_ptr,
-                        next_live_masks_ptr,
-                        idx,
-                    )
-                };
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                return unsafe {
-                    advance_tile_fused_scalar_no_track(
-                        current_ptr,
-                        next_ptr,
-                        meta_ptr,
-                        next_borders_north_ptr,
-                        next_borders_south_ptr,
-                        next_borders_west_ptr,
-                        next_borders_east_ptr,
-                        borders_north_read_ptr,
-                        borders_south_read_ptr,
-                        borders_west_read_ptr,
-                        borders_east_read_ptr,
-                        neighbors_ptr,
-                        live_masks_read_ptr,
-                        next_live_masks_ptr,
-                        idx,
-                    )
-                };
-            }
+        unsafe {
+            advance_tile_fused_neon_no_track_fast(
+                current_ptr,
+                next_ptr,
+                meta_ptr,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                neighbors_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+            )
         }
     }
-    unreachable!("invalid fused backend selector: {CORE_BACKEND}");
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn advance_tile_fused_neon_backend<
+    const TRACK_NEIGHBOR_INFLUENCE: bool,
+    const ASSUME_CHANGED_NEON: bool,
+>(
+    current_ptr: *const tile::CellBuf,
+    next_ptr: *mut tile::CellBuf,
+    meta_ptr: *mut tile::TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+) -> super::kernel::TileAdvanceResult {
+    debug_assert!(
+        !ASSUME_CHANGED_NEON || !TRACK_NEIGHBOR_INFLUENCE,
+        "assume-changed mode does not emit neighbor influence"
+    );
+    unsafe {
+        advance_tile_fused_scalar_backend::<TRACK_NEIGHBOR_INFLUENCE>(
+            current_ptr,
+            next_ptr,
+            meta_ptr,
+            next_borders_north_ptr,
+            next_borders_south_ptr,
+            next_borders_west_ptr,
+            next_borders_east_ptr,
+            borders_north_read_ptr,
+            borders_south_read_ptr,
+            borders_west_read_ptr,
+            borders_east_read_ptr,
+            neighbors_ptr,
+            live_masks_read_ptr,
+            next_live_masks_ptr,
+            idx,
+        )
+    }
 }
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn advance_tile_cached_backend<
-    const CORE_BACKEND: u8,
-    const TRACK_NEIGHBOR_INFLUENCE: bool,
->(
+unsafe fn advance_tile_cached_scalar_backend<const TRACK_NEIGHBOR_INFLUENCE: bool>(
     current_ptr: *const tile::CellBuf,
     next_ptr: *mut tile::CellBuf,
     meta_ptr: *mut tile::TileMeta,
@@ -544,32 +565,7 @@ unsafe fn advance_tile_cached_backend<
     cache: *mut TileCache,
 ) -> super::kernel::TileAdvanceResult {
     if TRACK_NEIGHBOR_INFLUENCE {
-        if CORE_BACKEND == CORE_BACKEND_AVX2 {
-            #[cfg(target_arch = "x86_64")]
-            {
-                return unsafe {
-                    advance_tile_cached_avx2_track(
-                        current_ptr,
-                        next_ptr,
-                        meta_ptr,
-                        next_borders_north_ptr,
-                        next_borders_south_ptr,
-                        next_borders_west_ptr,
-                        next_borders_east_ptr,
-                        borders_north_read_ptr,
-                        borders_south_read_ptr,
-                        borders_west_read_ptr,
-                        borders_east_read_ptr,
-                        neighbors_ptr,
-                        live_masks_read_ptr,
-                        next_live_masks_ptr,
-                        idx,
-                        cache,
-                    )
-                };
-            }
-        }
-        return unsafe {
+        unsafe {
             advance_tile_cached_scalar_track(
                 current_ptr,
                 next_ptr,
@@ -588,35 +584,120 @@ unsafe fn advance_tile_cached_backend<
                 idx,
                 cache,
             )
-        };
-    }
-    if CORE_BACKEND == CORE_BACKEND_AVX2 {
-        #[cfg(target_arch = "x86_64")]
-        {
-            return unsafe {
-                advance_tile_cached_avx2_no_track(
-                    current_ptr,
-                    next_ptr,
-                    meta_ptr,
-                    next_borders_north_ptr,
-                    next_borders_south_ptr,
-                    next_borders_west_ptr,
-                    next_borders_east_ptr,
-                    borders_north_read_ptr,
-                    borders_south_read_ptr,
-                    borders_west_read_ptr,
-                    borders_east_read_ptr,
-                    neighbors_ptr,
-                    live_masks_read_ptr,
-                    next_live_masks_ptr,
-                    idx,
-                    cache,
-                )
-            };
+        }
+    } else {
+        unsafe {
+            advance_tile_cached_scalar_no_track(
+                current_ptr,
+                next_ptr,
+                meta_ptr,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                neighbors_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+                cache,
+            )
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn advance_tile_cached_avx2_backend<const TRACK_NEIGHBOR_INFLUENCE: bool>(
+    current_ptr: *const tile::CellBuf,
+    next_ptr: *mut tile::CellBuf,
+    meta_ptr: *mut tile::TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+    cache: *mut TileCache,
+) -> super::kernel::TileAdvanceResult {
+    if TRACK_NEIGHBOR_INFLUENCE {
+        unsafe {
+            advance_tile_cached_avx2_track(
+                current_ptr,
+                next_ptr,
+                meta_ptr,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                neighbors_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+                cache,
+            )
+        }
+    } else {
+        unsafe {
+            advance_tile_cached_avx2_no_track(
+                current_ptr,
+                next_ptr,
+                meta_ptr,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                neighbors_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+                cache,
+            )
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn advance_tile_cached_avx2_backend<const TRACK_NEIGHBOR_INFLUENCE: bool>(
+    current_ptr: *const tile::CellBuf,
+    next_ptr: *mut tile::CellBuf,
+    meta_ptr: *mut tile::TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [u32; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+    cache: *mut TileCache,
+) -> super::kernel::TileAdvanceResult {
     unsafe {
-        advance_tile_cached_scalar_no_track(
+        advance_tile_cached_scalar_backend::<TRACK_NEIGHBOR_INFLUENCE>(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1664,6 +1745,11 @@ impl TurboLife {
 
     #[inline(always)]
     fn step_impl_backend<const CORE_BACKEND: u8, const ASSUME_CHANGED_MODE: bool>(&mut self) {
+        debug_assert!(
+            !ASSUME_CHANGED_MODE || CORE_BACKEND == CORE_BACKEND_NEON,
+            "assume-changed mode is only valid for the NEON backend"
+        );
+
         rebuild_active_set(&mut self.arena);
 
         if self.arena.active_set.is_empty() {
@@ -1731,6 +1817,35 @@ impl TurboLife {
                     } else {
                         $macro_name!($advance, $track, false, false);
                     }
+                }
+            }};
+        }
+
+        macro_rules! dispatch_fused_kernel_by_emit {
+            ($macro_name:ident) => {{
+                if CORE_BACKEND == CORE_BACKEND_SCALAR {
+                    dispatch_by_emit!(
+                        $macro_name,
+                        advance_tile_fused_scalar_backend::<TRACK_NEIGHBOR_INFLUENCE>,
+                        TRACK_NEIGHBOR_INFLUENCE
+                    );
+                } else if CORE_BACKEND == CORE_BACKEND_AVX2 {
+                    dispatch_by_emit!(
+                        $macro_name,
+                        advance_tile_fused_avx2_backend::<TRACK_NEIGHBOR_INFLUENCE>,
+                        TRACK_NEIGHBOR_INFLUENCE
+                    );
+                } else if CORE_BACKEND == CORE_BACKEND_NEON {
+                    dispatch_by_emit!(
+                        $macro_name,
+                        advance_tile_fused_neon_backend::<
+                            TRACK_NEIGHBOR_INFLUENCE,
+                            ASSUME_CHANGED_MODE,
+                        >,
+                        TRACK_NEIGHBOR_INFLUENCE
+                    );
+                } else {
+                    unreachable!("invalid fused backend selector: {CORE_BACKEND}");
                 }
             }};
         }
@@ -2027,21 +2142,21 @@ impl TurboLife {
             }
 
             if use_serial_cache {
-                dispatch_by_emit!(
-                    serial_loop_cached,
-                    advance_tile_cached_backend::<CORE_BACKEND, TRACK_NEIGHBOR_INFLUENCE>,
-                    TRACK_NEIGHBOR_INFLUENCE
-                );
+                if CORE_BACKEND == CORE_BACKEND_AVX2 {
+                    dispatch_by_emit!(
+                        serial_loop_cached,
+                        advance_tile_cached_avx2_backend::<TRACK_NEIGHBOR_INFLUENCE>,
+                        TRACK_NEIGHBOR_INFLUENCE
+                    );
+                } else {
+                    dispatch_by_emit!(
+                        serial_loop_cached,
+                        advance_tile_cached_scalar_backend::<TRACK_NEIGHBOR_INFLUENCE>,
+                        TRACK_NEIGHBOR_INFLUENCE
+                    );
+                }
             } else {
-                dispatch_by_emit!(
-                    serial_loop_fused,
-                    advance_tile_fused_backend::<
-                        CORE_BACKEND,
-                        TRACK_NEIGHBOR_INFLUENCE,
-                        ASSUME_CHANGED_MODE,
-                    >,
-                    TRACK_NEIGHBOR_INFLUENCE
-                );
+                dispatch_fused_kernel_by_emit!(serial_loop_fused);
             }
         } else {
             // Parallel kernel compute with a hybrid scheduler:
@@ -2246,15 +2361,7 @@ impl TurboLife {
             }
 
             if use_static_schedule {
-                dispatch_by_emit!(
-                    parallel_kernel_static,
-                    advance_tile_fused_backend::<
-                        CORE_BACKEND,
-                        TRACK_NEIGHBOR_INFLUENCE,
-                        ASSUME_CHANGED_MODE,
-                    >,
-                    TRACK_NEIGHBOR_INFLUENCE
-                );
+                dispatch_fused_kernel_by_emit!(parallel_kernel_static);
             } else {
                 let cursor = CacheAlignedAtomicUsize::new(0);
                 #[cfg(target_arch = "aarch64")]
@@ -2333,15 +2440,7 @@ impl TurboLife {
                     }};
                 }
 
-                dispatch_by_emit!(
-                    parallel_kernel_lockfree,
-                    advance_tile_fused_backend::<
-                        CORE_BACKEND,
-                        TRACK_NEIGHBOR_INFLUENCE,
-                        ASSUME_CHANGED_MODE,
-                    >,
-                    TRACK_NEIGHBOR_INFLUENCE
-                );
+                dispatch_fused_kernel_by_emit!(parallel_kernel_lockfree);
             }
 
             let mut total_expand = 0usize;
