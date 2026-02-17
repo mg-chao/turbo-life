@@ -472,6 +472,21 @@ fn calibrate_auto_backend() -> KernelBackend {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[inline]
+fn parse_env_bool(value: &str) -> Option<bool> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else if value == "1" || value.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if value == "0" || value.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 #[inline]
 fn physical_core_count() -> usize {
     *PHYSICAL_CORES.get_or_init(|| {
@@ -480,18 +495,8 @@ fn physical_core_count() -> usize {
         {
             let perf_only = std::env::var("TURBOLIFE_MACOS_PERF_ONLY")
                 .ok()
-                .and_then(|v| {
-                    let v = v.trim();
-                    if v.is_empty() {
-                        None
-                    } else if v == "1" || v.eq_ignore_ascii_case("true") {
-                        Some(true)
-                    } else if v == "0" || v.eq_ignore_ascii_case("false") {
-                        Some(false)
-                    } else {
-                        None
-                    }
-                })
+                .as_deref()
+                .and_then(parse_env_bool)
                 .unwrap_or(false);
             if perf_only && let Some(perf) = apple_perf_core_count() {
                 return perf.min(physical).max(1);
@@ -2400,7 +2405,7 @@ mod tests {
         KernelBackend, PARALLEL_KERNEL_MIN_ACTIVE, TILE_SIZE_I64, TurboLife, TurboLifeConfig,
         active_broadcast_workers, auto_pool_thread_count_for_physical, churn_at_most_percent,
         churn_below_percent, dynamic_parallel_chunk_size, dynamic_target_chunks_per_worker,
-        memory_parallel_cap, physical_core_count,
+        memory_parallel_cap, parse_env_bool, physical_core_count,
     };
 
     const PARALLEL_TEST_TILE_GRID: i64 = 12;
@@ -2474,6 +2479,27 @@ mod tests {
             );
             prev = capped;
         }
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_common_values() {
+        assert_eq!(parse_env_bool("1"), Some(true));
+        assert_eq!(parse_env_bool("true"), Some(true));
+        assert_eq!(parse_env_bool("TRUE"), Some(true));
+        assert_eq!(parse_env_bool("  true  "), Some(true));
+
+        assert_eq!(parse_env_bool("0"), Some(false));
+        assert_eq!(parse_env_bool("false"), Some(false));
+        assert_eq!(parse_env_bool("FALSE"), Some(false));
+        assert_eq!(parse_env_bool("  false  "), Some(false));
+    }
+
+    #[test]
+    fn parse_env_bool_rejects_invalid_values() {
+        assert_eq!(parse_env_bool(""), None);
+        assert_eq!(parse_env_bool("2"), None);
+        assert_eq!(parse_env_bool("yes"), None);
+        assert_eq!(parse_env_bool("off"), None);
     }
 
     #[test]
