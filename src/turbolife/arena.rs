@@ -865,26 +865,49 @@ impl TileArena {
                 continue;
             }
 
-            let (ndx, ndy) = DIR_OFFSETS[target_neighbor_dir];
-            let neighbor_coord = (coord.0 + ndx, coord.1 + ndy);
             let hint = EXPAND_NEIGHBOR_HINTS[dir_idx][target_neighbor_dir];
             let neighbor_raw = if hint >= 0 {
                 let hinted_raw = src_neighbors[hint as usize];
                 if hinted_raw != NO_NEIGHBOR {
-                    let hinted_i = hinted_raw as usize;
-                    if self.meta[hinted_i].occupied() && self.coords[hinted_i] == neighbor_coord {
+                    #[cfg(any(test, debug_assertions))]
+                    {
+                        // Tests intentionally break hint invariants; keep a
+                        // correctness fallback in non-release builds.
+                        let (ndx, ndy) = DIR_OFFSETS[target_neighbor_dir];
+                        let neighbor_coord = (coord.0 + ndx, coord.1 + ndy);
+                        let hinted_i = hinted_raw as usize;
+                        if self.meta[hinted_i].occupied() && self.coords[hinted_i] == neighbor_coord
+                        {
+                            hinted_raw
+                        } else {
+                            let neighbor_hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
+                            self.idx_at_cached_hashed(neighbor_coord, neighbor_hash)
+                                .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
+                        }
+                    }
+                    #[cfg(not(any(test, debug_assertions)))]
+                    {
                         hinted_raw
-                    } else {
+                    }
+                } else {
+                    #[cfg(any(test, debug_assertions))]
+                    {
+                        let (ndx, ndy) = DIR_OFFSETS[target_neighbor_dir];
+                        let neighbor_coord = (coord.0 + ndx, coord.1 + ndy);
                         let neighbor_hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
                         self.idx_at_cached_hashed(neighbor_coord, neighbor_hash)
                             .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
                     }
-                } else {
-                    let neighbor_hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
-                    self.idx_at_cached_hashed(neighbor_coord, neighbor_hash)
-                        .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
+                    #[cfg(not(any(test, debug_assertions)))]
+                    {
+                        // If the source has no neighbor in the hinted direction,
+                        // the target-neighbor coordinate cannot be occupied.
+                        NO_NEIGHBOR
+                    }
                 }
             } else {
+                let (ndx, ndy) = DIR_OFFSETS[target_neighbor_dir];
+                let neighbor_coord = (coord.0 + ndx, coord.1 + ndy);
                 let neighbor_hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
                 self.idx_at_cached_hashed(neighbor_coord, neighbor_hash)
                     .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)

@@ -75,13 +75,12 @@ const PARALLEL_KERNEL_TILES_PER_THREAD: usize = 16;
 const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
 const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
-// Tuned on the main.rs harness (Apple M4): switch to static slices earlier
-// only on Apple Silicon to cut dynamic scheduler overhead on medium-large
-// frontiers without regressing other AArch64 platforms.
+// Tuned on the main.rs harness (Apple M4): keep lock-free dynamic scheduling
+// on Apple Silicon to avoid static-slice tail effects on heterogeneous cores.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 2_048;
+const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = None;
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 8_192;
+const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = Some(8_192);
 // Dynamic scheduler chunking target per worker.
 // Lower target (vs 4) reduces atomic cursor traffic while preserving balance.
 const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 1;
@@ -110,10 +109,6 @@ const _: [(); 1] = [(); (PREFETCH_TILE_NEAR_AHEAD_AARCH64 >= 1) as usize];
 #[cfg(target_arch = "aarch64")]
 const _: [(); 1] =
     [(); (PREFETCH_TILE_FAR_AHEAD_AARCH64 > PREFETCH_TILE_NEAR_AHEAD_AARCH64) as usize];
-#[cfg(target_arch = "aarch64")]
-// Enable `assume_changed` once the active frontier is large enough to
-// amortize the extra follow-up bookkeeping in the engine.
-const ASSUME_CHANGED_NEON_MIN_ACTIVE: usize = 2_048;
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -1199,9 +1194,9 @@ impl TurboLife {
         // and use uniform neighbor activation to reduce kernel-side write churn.
         let track_neighbor_influence = false;
         #[cfg(target_arch = "aarch64")]
-        let assume_changed_neon = !track_neighbor_influence
-            && backend == KernelBackend::Neon
-            && active_len >= ASSUME_CHANGED_NEON_MIN_ACTIVE;
+        // `assume_changed` over-expands the frontier on the main harness and
+        // regresses wall clock by forcing unnecessary active rebuild work.
+        let assume_changed_neon = false;
         #[cfg(target_arch = "aarch64")]
         let assume_changed_mode = assume_changed_neon;
         #[cfg(not(target_arch = "aarch64"))]
@@ -1721,7 +1716,10 @@ impl TurboLife {
             let static_chunk_size = active_len.div_ceil(active_workers);
             // Keep dynamic scheduling whenever the frontier is not huge; it handles
             // heterogeneous cores much better than fixed contiguous slices.
-            let use_static_schedule = active_len >= PARALLEL_STATIC_SCHEDULE_THRESHOLD;
+            let use_static_schedule = matches!(
+                PARALLEL_STATIC_SCHEDULE_THRESHOLD,
+                Some(threshold) if active_len >= threshold
+            );
             self.prepare_worker_scratch(
                 worker_count,
                 active_len,
