@@ -80,7 +80,7 @@ const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
 const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 8_192;
 // Dynamic scheduler chunking target per worker.
 // Lower target (vs 4) reduces atomic cursor traffic while preserving balance.
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 2;
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 1;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 #[cfg(target_arch = "x86_64")]
@@ -605,6 +605,19 @@ fn active_broadcast_workers(worker_count: usize, broadcast_threads: usize) -> us
 #[inline(always)]
 fn should_queue_prune<const EMIT_CHANGED: bool>(has_live: bool, changed: bool) -> bool {
     !has_live && (!EMIT_CHANGED || !changed)
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn append_expand_candidates_cold(
+    expand: &mut Vec<u32>,
+    idx: TileIdx,
+    missing_mask: u8,
+    live_mask: u8,
+) {
+    unsafe {
+        append_expand_candidates_unchecked(expand, idx, missing_mask, live_mask);
+    }
 }
 
 #[inline(always)]
@@ -1364,7 +1377,7 @@ impl TurboLife {
                         let missing = result.missing_mask;
                         if missing != 0 {
                             unsafe {
-                                append_expand_candidates_unchecked(
+                                append_expand_candidates_cold(
                                     &mut self.arena.expand_buf,
                                     idx,
                                     missing,
@@ -1489,7 +1502,7 @@ impl TurboLife {
                         let missing = result.missing_mask;
                         if missing != 0 {
                             unsafe {
-                                append_expand_candidates_unchecked(
+                                append_expand_candidates_cold(
                                     &mut self.arena.expand_buf,
                                     idx,
                                     missing,
@@ -1830,7 +1843,7 @@ impl TurboLife {
                     let missing = result.missing_mask;
                     if missing != 0 {
                         unsafe {
-                            append_expand_candidates_unchecked(
+                            append_expand_candidates_cold(
                                 &mut ($scratch).expand,
                                 idx,
                                 missing,
@@ -1966,7 +1979,46 @@ impl TurboLife {
                 }
             } else {
                 let cursor = AtomicUsize::new(0);
+                #[cfg(target_arch = "aarch64")]
+                let lockfree_chunk_size =
+                    dynamic_parallel_chunk_size(active_len, changed_len, active_workers);
 
+                #[cfg(target_arch = "aarch64")]
+                macro_rules! parallel_kernel_lockfree {
+                    ($advance:path, $track:expr, $emit_changed:literal) => {{
+                        let cursor_ref = &cursor;
+                        let _ = rayon::broadcast(|ctx| {
+                            let worker_id = ctx.index();
+                            if worker_id >= active_workers {
+                                return;
+                            }
+                            let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
+                            loop {
+                                let start =
+                                    cursor_ref.fetch_add(lockfree_chunk_size, Ordering::Relaxed);
+                                if start >= active_len {
+                                    break;
+                                }
+                                let end = start.saturating_add(lockfree_chunk_size).min(active_len);
+                                scratch.reserve_for_additional_work::<$emit_changed, $track>(
+                                    end - start,
+                                );
+                                for i in start..end {
+                                    process_work_item!(
+                                        $advance,
+                                        scratch,
+                                        i,
+                                        end,
+                                        $track,
+                                        $emit_changed
+                                    );
+                                }
+                            }
+                        });
+                    }};
+                }
+
+                #[cfg(not(target_arch = "aarch64"))]
                 macro_rules! parallel_kernel_lockfree {
                     ($advance:path, $track:expr, $emit_changed:literal) => {{
                         let cursor_ref = &cursor;
@@ -2456,12 +2508,12 @@ mod tests {
 
     #[test]
     fn dynamic_chunk_targets_stay_flat_across_frontier_sizes() {
-        assert_eq!(dynamic_target_chunks_per_worker(1, 1), 2);
-        assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 2);
-        assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 2);
-        assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 2);
-        assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 2);
-        assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 2);
+        assert_eq!(dynamic_target_chunks_per_worker(1, 1), 1);
+        assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 1);
+        assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 1);
+        assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 1);
+        assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 1);
+        assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 1);
     }
 
     #[test]
@@ -2481,9 +2533,9 @@ mod tests {
         let medium_balanced = dynamic_parallel_chunk_size(4_096, 1_200, 4);
         let medium_high = dynamic_parallel_chunk_size(4_096, 3_000, 4);
         let large = dynamic_parallel_chunk_size(65_536, 50_000, 4);
-        assert_eq!(small, 100);
-        assert_eq!(medium_balanced, 512);
-        assert_eq!(medium_high, 512);
+        assert_eq!(small, 200);
+        assert_eq!(medium_balanced, 1_024);
+        assert_eq!(medium_high, 1_024);
         assert_eq!(large, 2_048);
     }
 
