@@ -864,6 +864,7 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
 }
 
 #[cfg(target_arch = "aarch64")]
+#[inline]
 #[target_feature(enable = "neon")]
 unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool, const FORCE_STORE: bool>(
     current: &[u64; TILE_SIZE],
@@ -887,6 +888,7 @@ unsafe fn advance_core_neon_impl<const TRACK_DIFF: bool, const FORCE_STORE: bool
 }
 
 #[cfg(target_arch = "aarch64")]
+#[inline]
 #[target_feature(enable = "neon")]
 pub unsafe fn advance_core_neon(
     current: &[u64; TILE_SIZE],
@@ -902,6 +904,7 @@ pub unsafe fn advance_core_neon(
 }
 
 #[cfg(target_arch = "aarch64")]
+#[inline]
 #[target_feature(enable = "neon")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn advance_core_neon_raw<const ASSUME_CHANGED: bool>(
@@ -967,6 +970,7 @@ unsafe fn advance_core_neon_raw<const ASSUME_CHANGED: bool>(
 }
 
 #[cfg(target_arch = "aarch64")]
+#[inline]
 #[target_feature(enable = "neon")]
 unsafe fn advance_core_neon_assume_changed(
     current: &[u64; TILE_SIZE],
