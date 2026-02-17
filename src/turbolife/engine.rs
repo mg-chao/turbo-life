@@ -85,8 +85,14 @@ const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = None;
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = Some(8_192);
 // Dynamic scheduler chunking target per worker.
-// Lower target (vs 4) reduces atomic cursor traffic while preserving balance.
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 1;
+// Keep one chunk per worker by default to minimize cursor traffic.
+// On Apple Silicon, medium/large frontiers benefit from splitting work into
+// two chunks per worker to reduce tail effects without over-fragmenting.
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 1;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE: usize = 2;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const PARALLEL_DYNAMIC_TWO_CHUNK_MIN_ACTIVE: usize = 2_048;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 #[cfg(target_arch = "x86_64")]
@@ -595,8 +601,14 @@ fn churn_below_percent(changed_len: usize, active_len: usize, churn_pct_threshol
 }
 
 #[inline]
-fn dynamic_target_chunks_per_worker(_active_len: usize, _changed_len: usize) -> usize {
-    PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER
+fn dynamic_target_chunks_per_worker(active_len: usize, _changed_len: usize) -> usize {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        if active_len >= PARALLEL_DYNAMIC_TWO_CHUNK_MIN_ACTIVE {
+            return PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE;
+        }
+    }
+    PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE
 }
 
 #[inline]
@@ -2566,13 +2578,23 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_chunk_targets_stay_flat_across_frontier_sizes() {
+    fn dynamic_chunk_targets_follow_platform_frontier_policy() {
         assert_eq!(dynamic_target_chunks_per_worker(1, 1), 1);
         assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 1);
-        assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 1);
-        assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 1);
-        assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 1);
-        assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 1);
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 2);
+            assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 2);
+            assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 2);
+            assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 2);
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+        {
+            assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 1);
+            assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 1);
+            assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 1);
+            assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 1);
+        }
     }
 
     #[test]
@@ -2593,8 +2615,16 @@ mod tests {
         let medium_high = dynamic_parallel_chunk_size(4_096, 3_000, 4);
         let large = dynamic_parallel_chunk_size(65_536, 50_000, 4);
         assert_eq!(small, 200);
-        assert_eq!(medium_balanced, 1_024);
-        assert_eq!(medium_high, 1_024);
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            assert_eq!(medium_balanced, 512);
+            assert_eq!(medium_high, 512);
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+        {
+            assert_eq!(medium_balanced, 1_024);
+            assert_eq!(medium_high, 1_024);
+        }
         assert_eq!(large, 2_048);
     }
 

@@ -16,7 +16,7 @@ const ACTIVE_SORT_RADIX_BUCKETS: usize = 1 << 16;
 const ACTIVE_BITMAP_REBUILD_MIN_OCCUPIED: usize = 2_048;
 const ACTIVE_BITMAP_REBUILD_MAX_OCCUPIED: usize = 8_192;
 const ACTIVE_BITMAP_REBUILD_MIN_CHANGED: usize = 1_024;
-const ACTIVE_BITMAP_REBUILD_DENSE_CHANGED_PCT: usize = 45;
+const ACTIVE_BITMAP_REBUILD_DENSE_CHANGED_PCT: usize = 30;
 const _: [(); 1] = [(); (ACTIVE_SORT_STD_MAX > 0) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_STD_MAX < ACTIVE_SORT_RADIX_MIN) as usize];
 const _: [(); 1] = [(); (ACTIVE_BITMAP_REBUILD_DENSE_CHANGED_PCT <= 100) as usize];
@@ -817,6 +817,8 @@ mod tests {
         assert!(!should_use_bitmap_active_rebuild(2_048, 1_023));
         assert!(should_use_bitmap_active_rebuild(2_048, 1_024));
         assert!(!should_use_bitmap_active_rebuild(8_193, 4_096));
+        assert!(!should_use_bitmap_active_rebuild(4_096, 1_228));
+        assert!(should_use_bitmap_active_rebuild(4_096, 1_229));
         assert!(!should_use_bitmap_active_rebuild(4_096, 1_000));
     }
 
