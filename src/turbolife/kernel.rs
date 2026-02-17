@@ -696,8 +696,8 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
     ghost_se: u64,
 ) -> (bool, BorderData, bool) {
     use std::arch::aarch64::{
-        vandq_u64, vbicq_u64, veorq_u64, vgetq_lane_u64, vld1q_u64, vorrq_u64, vshlq_n_u64,
-        vshrq_n_u64, vst1q_u64,
+        vandq_u64, vbicq_u64, veorq_u64, vget_high_u64, vget_lane_u64, vget_low_u64,
+        vgetq_lane_u64, vld1q_u64, vorr_u64, vorrq_u64, vshlq_n_u64, vshrq_n_u64, vst1q_u64,
     };
 
     let mut changed = !TRACK_DIFF;
@@ -762,7 +762,10 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
 
             if TRACK_DIFF {
                 let diff = veorq_u64(next_rows, $row_self);
-                let pair_changed = (vgetq_lane_u64(diff, 0) | vgetq_lane_u64(diff, 1)) != 0;
+                // Horizontal OR via 64-bit lane vectors avoids extracting both
+                // lanes as scalars before combining.
+                let pair_changed =
+                    vget_lane_u64(vorr_u64(vget_low_u64(diff), vget_high_u64(diff)), 0) != 0;
                 changed |= pair_changed;
                 if FORCE_STORE || pair_changed {
                     unsafe {

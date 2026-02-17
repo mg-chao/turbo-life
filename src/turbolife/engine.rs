@@ -75,9 +75,12 @@ const PARALLEL_KERNEL_TILES_PER_THREAD: usize = 16;
 const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
 const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
-const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 32_768;
+// Tuned on the main.rs harness (Apple M4): switch to static slices earlier
+// to cut dynamic scheduler overhead on medium-large frontiers.
+const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 8_192;
 // Dynamic scheduler chunking target per worker.
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 4;
+// Lower target (vs 4) reduces atomic cursor traffic while preserving balance.
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 2;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 #[cfg(target_arch = "x86_64")]
@@ -2453,12 +2456,12 @@ mod tests {
 
     #[test]
     fn dynamic_chunk_targets_stay_flat_across_frontier_sizes() {
-        assert_eq!(dynamic_target_chunks_per_worker(1, 1), 4);
-        assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 4);
-        assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 4);
-        assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 4);
-        assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 4);
-        assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 4);
+        assert_eq!(dynamic_target_chunks_per_worker(1, 1), 2);
+        assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 2);
+        assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 2);
+        assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 2);
+        assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 2);
+        assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 2);
     }
 
     #[test]
@@ -2478,9 +2481,9 @@ mod tests {
         let medium_balanced = dynamic_parallel_chunk_size(4_096, 1_200, 4);
         let medium_high = dynamic_parallel_chunk_size(4_096, 3_000, 4);
         let large = dynamic_parallel_chunk_size(65_536, 50_000, 4);
-        assert_eq!(small, 50);
-        assert_eq!(medium_balanced, 256);
-        assert_eq!(medium_high, 256);
+        assert_eq!(small, 100);
+        assert_eq!(medium_balanced, 512);
+        assert_eq!(medium_high, 512);
         assert_eq!(large, 2_048);
     }
 
