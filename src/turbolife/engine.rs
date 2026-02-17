@@ -538,6 +538,13 @@ fn memory_parallel_cap(thread_count: usize) -> usize {
 #[inline]
 fn auto_pool_thread_count_for_physical(physical: usize) -> usize {
     let physical = physical.max(1);
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if physical == 4 {
+        // Apple 4P-core systems (e.g. M4) run this stencil kernel slightly
+        // faster with three workers because memory traffic saturates before
+        // all four cores are fully utilized on the main.rs harness.
+        return 3;
+    }
     if physical <= 8 {
         physical
     } else {
@@ -2547,6 +2554,9 @@ mod tests {
     fn auto_pool_thread_count_targets_bandwidth_sweet_spot() {
         assert_eq!(auto_pool_thread_count_for_physical(0), 1);
         assert_eq!(auto_pool_thread_count_for_physical(1), 1);
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        assert_eq!(auto_pool_thread_count_for_physical(4), 3);
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         assert_eq!(auto_pool_thread_count_for_physical(4), 4);
         assert_eq!(auto_pool_thread_count_for_physical(8), 8);
         assert_eq!(auto_pool_thread_count_for_physical(9), 6);
