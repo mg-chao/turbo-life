@@ -77,8 +77,8 @@ const KERNEL_CHUNK_MIN: usize = 32;
 const SERIAL_CACHE_MAX_ACTIVE: usize = 128;
 const PARALLEL_STATIC_SCHEDULE_THRESHOLD: usize = 32_768;
 // Dynamic scheduler chunking target per worker.
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 3;
-const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 16;
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER: usize = 4;
+const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 #[cfg(target_arch = "x86_64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
@@ -593,6 +593,7 @@ fn dynamic_parallel_chunk_size(
     size.clamp(PARALLEL_DYNAMIC_CHUNK_MIN, PARALLEL_DYNAMIC_CHUNK_MAX)
 }
 
+#[cfg(test)]
 #[inline(always)]
 fn active_broadcast_workers(worker_count: usize, broadcast_threads: usize) -> usize {
     worker_count.min(broadcast_threads)
@@ -1688,6 +1689,8 @@ impl TurboLife {
             let live_masks_read_ptr = SendConstPtr::new(live_masks_read.as_ptr());
             let next_live_masks_ptr = SendPtr::new(next_live_masks_vec.as_mut_ptr());
             let worker_count = effective_threads.min(active_len);
+            let active_workers = worker_count;
+            let static_chunk_size = active_len.div_ceil(active_workers);
             // Keep dynamic scheduling whenever the frontier is not huge; it handles
             // heterogeneous cores much better than fixed contiguous slices.
             let use_static_schedule = active_len >= PARALLEL_STATIC_SCHEDULE_THRESHOLD;
@@ -1838,18 +1841,15 @@ impl TurboLife {
             macro_rules! parallel_kernel_static {
                 ($advance:path, $track:expr, $emit_changed:literal) => {{
                     let _ = rayon::broadcast(|ctx| {
-                        let active_workers =
-                            active_broadcast_workers(worker_count, ctx.num_threads());
                         let worker_id = ctx.index();
                         if worker_id >= active_workers {
                             return;
                         }
-                        let chunk_size = active_len.div_ceil(active_workers);
-                        let start = worker_id.saturating_mul(chunk_size);
+                        let start = worker_id.saturating_mul(static_chunk_size);
                         if start >= active_len {
                             return;
                         }
-                        let end = start.saturating_add(chunk_size).min(active_len);
+                        let end = start.saturating_add(static_chunk_size).min(active_len);
                         let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
                         scratch.reserve_for_additional_work::<$emit_changed, $track>(end - start);
                         for i in start..end {
@@ -1968,8 +1968,6 @@ impl TurboLife {
                     ($advance:path, $track:expr, $emit_changed:literal) => {{
                         let cursor_ref = &cursor;
                         let _ = rayon::broadcast(|ctx| {
-                            let active_workers =
-                                active_broadcast_workers(worker_count, ctx.num_threads());
                             let worker_id = ctx.index();
                             if worker_id >= active_workers {
                                 return;
@@ -2455,12 +2453,12 @@ mod tests {
 
     #[test]
     fn dynamic_chunk_targets_stay_flat_across_frontier_sizes() {
-        assert_eq!(dynamic_target_chunks_per_worker(1, 1), 3);
-        assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 3);
-        assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 3);
-        assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 3);
-        assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 3);
-        assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 3);
+        assert_eq!(dynamic_target_chunks_per_worker(1, 1), 4);
+        assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 4);
+        assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 4);
+        assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 4);
+        assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 4);
+        assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 4);
     }
 
     #[test]
@@ -2480,9 +2478,9 @@ mod tests {
         let medium_balanced = dynamic_parallel_chunk_size(4_096, 1_200, 4);
         let medium_high = dynamic_parallel_chunk_size(4_096, 3_000, 4);
         let large = dynamic_parallel_chunk_size(65_536, 50_000, 4);
-        assert_eq!(small, 67);
-        assert_eq!(medium_balanced, 342);
-        assert_eq!(medium_high, 342);
+        assert_eq!(small, 50);
+        assert_eq!(medium_balanced, 256);
+        assert_eq!(medium_high, 256);
         assert_eq!(large, 2_048);
     }
 
