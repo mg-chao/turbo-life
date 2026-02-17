@@ -94,9 +94,9 @@ impl Slot {
 
 // ── TileMap ─────────────────────────────────────────────────────────────
 
-/// Maximum load factor numerator / denominator: 2/3 ≈ 66.7%.
-const LOAD_NUM: usize = 2;
-const LOAD_DEN: usize = 3;
+/// Maximum load factor numerator / denominator: 1/2 = 50%.
+const LOAD_NUM: usize = 1;
+const LOAD_DEN: usize = 2;
 
 /// Open-addressed hashmap specialised for `(i64, i64) → TileIdx`.
 pub struct TileMap {

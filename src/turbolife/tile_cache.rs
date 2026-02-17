@@ -4,12 +4,12 @@ use super::kernel::{
 };
 use super::tile::{BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, TILE_SIZE};
 
-const CACHE_SIZE: usize = 1 << 13;
+const CACHE_SIZE: usize = 1 << 12;
 const CACHE_MASK: usize = CACHE_SIZE - 1;
-const ADAPT_WINDOW: u32 = 512;
+const ADAPT_WINDOW: u32 = 256;
 const MIN_HIT_RATE_PCT: u32 = 20;
-const DISABLE_THRESHOLD: u32 = 3;
-const REPROBE_INTERVAL: u32 = 8;
+const DISABLE_THRESHOLD: u32 = 1;
+const REPROBE_INTERVAL: u32 = 32;
 const LIVE_NW: u8 = 1 << 4;
 const LIVE_NE: u8 = 1 << 5;
 const LIVE_SW: u8 = 1 << 6;
