@@ -696,11 +696,12 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
     ghost_se: u64,
 ) -> (bool, BorderData, bool) {
     use std::arch::aarch64::{
-        vandq_u64, vbicq_u64, veorq_u64, vget_high_u64, vget_lane_u64, vget_low_u64,
+        vandq_u64, vbicq_u64, vdupq_n_u64, veorq_u64, vget_high_u64, vget_lane_u64, vget_low_u64,
         vgetq_lane_u64, vld1q_u64, vorr_u64, vorrq_u64, vshlq_n_u64, vshrq_n_u64, vst1q_u64,
     };
 
     let mut changed = !TRACK_DIFF;
+    let mut diff_acc = vdupq_n_u64(0);
     let mut has_live = false;
     let mut border_west = 0u64;
     let mut border_east = 0u64;
@@ -762,14 +763,21 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
 
             if TRACK_DIFF {
                 let diff = veorq_u64(next_rows, $row_self);
-                // Horizontal OR via 64-bit lane vectors avoids extracting both
-                // lanes as scalars before combining.
-                let pair_changed =
-                    vget_lane_u64(vorr_u64(vget_low_u64(diff), vget_high_u64(diff)), 0) != 0;
-                changed |= pair_changed;
-                if FORCE_STORE || pair_changed {
+                if FORCE_STORE {
+                    diff_acc = vorrq_u64(diff_acc, diff);
                     unsafe {
                         vst1q_u64(next_ptr.add($row_base), next_rows);
+                    }
+                } else {
+                    // Horizontal OR via 64-bit lane vectors avoids extracting both
+                    // lanes as scalars before combining.
+                    let pair_changed =
+                        vget_lane_u64(vorr_u64(vget_low_u64(diff), vget_high_u64(diff)), 0) != 0;
+                    changed |= pair_changed;
+                    if pair_changed {
+                        unsafe {
+                            vst1q_u64(next_ptr.add($row_base), next_rows);
+                        }
                     }
                 }
             } else {
@@ -846,6 +854,10 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
     let row_above_last = unsafe { neon_set_u64x2_lane_order(current[63], ghost_north) };
     let row_below_last = prev_above;
     let (_, border_north) = process_pair!(last_base, row_above_last, row_self_last, row_below_last);
+
+    if TRACK_DIFF && FORCE_STORE {
+        changed = vget_lane_u64(vorr_u64(vget_low_u64(diff_acc), vget_high_u64(diff_acc)), 0) != 0;
+    }
 
     let border = BorderData::from_edges(border_north, border_south, border_west, border_east);
     (changed, border, has_live)
