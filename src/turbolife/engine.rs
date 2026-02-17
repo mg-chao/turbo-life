@@ -69,6 +69,31 @@ impl<T> SendConstPtr<T> {
     }
 }
 
+#[repr(align(64))]
+struct CacheAlignedAtomicUsize {
+    inner: AtomicUsize,
+}
+
+impl CacheAlignedAtomicUsize {
+    #[inline(always)]
+    const fn new(value: usize) -> Self {
+        Self {
+            inner: AtomicUsize::new(value),
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    #[inline(always)]
+    fn load(&self, order: Ordering) -> usize {
+        self.inner.load(order)
+    }
+
+    #[inline(always)]
+    fn fetch_add(&self, value: usize, order: Ordering) -> usize {
+        self.inner.fetch_add(value, order)
+    }
+}
+
 const TILE_SIZE_I64: i64 = 64;
 const PARALLEL_KERNEL_MIN_ACTIVE: usize = 128;
 const PARALLEL_KERNEL_TILES_PER_THREAD: usize = 16;
@@ -87,10 +112,10 @@ const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = Some(8_192);
 // Dynamic scheduler chunking target per worker.
 // Keep one chunk per worker by default to minimize cursor traffic.
 // On Apple Silicon, medium/large frontiers benefit from splitting work into
-// three chunks per worker to reduce tail effects without over-fragmenting.
+// two chunks per worker to reduce tail effects without over-fragmenting.
 const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 1;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE: usize = 3;
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE: usize = 2;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const PARALLEL_DYNAMIC_APPLE_DENSE_CHUNK_MIN_ACTIVE: usize = 2_048;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
@@ -942,10 +967,9 @@ fn auto_pool_thread_count_for_physical(physical: usize) -> usize {
     let physical = physical.max(1);
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     if physical == 4 {
-        // Apple 4P-core systems (e.g. M4) run this stencil kernel slightly
-        // faster with three workers because memory traffic saturates before
-        // all four cores are fully utilized on the main.rs harness.
-        return 3;
+        // Apple 4P-core systems (e.g. M4) now sustain better wall-clock
+        // throughput on the primary main.rs harness at four workers.
+        return 4;
     }
     if physical <= 8 {
         physical
@@ -2214,7 +2238,7 @@ impl TurboLife {
                     TRACK_NEIGHBOR_INFLUENCE
                 );
             } else {
-                let cursor = AtomicUsize::new(0);
+                let cursor = CacheAlignedAtomicUsize::new(0);
                 #[cfg(target_arch = "aarch64")]
                 let lockfree_chunk_size =
                     dynamic_parallel_chunk_size(active_len, changed_len, active_workers);
@@ -2712,7 +2736,7 @@ mod tests {
         assert_eq!(auto_pool_thread_count_for_physical(0), 1);
         assert_eq!(auto_pool_thread_count_for_physical(1), 1);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-        assert_eq!(auto_pool_thread_count_for_physical(4), 3);
+        assert_eq!(auto_pool_thread_count_for_physical(4), 4);
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         assert_eq!(auto_pool_thread_count_for_physical(4), 4);
         assert_eq!(auto_pool_thread_count_for_physical(8), 8);
@@ -2728,10 +2752,10 @@ mod tests {
         assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 1);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 3);
-            assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 3);
-            assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 3);
-            assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 3);
+            assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 2);
+            assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 2);
+            assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 2);
+            assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 2);
         }
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         {
@@ -2762,8 +2786,8 @@ mod tests {
         assert_eq!(small, 200);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            assert_eq!(medium_balanced, 342);
-            assert_eq!(medium_high, 342);
+            assert_eq!(medium_balanced, 512);
+            assert_eq!(medium_high, 512);
         }
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         {
