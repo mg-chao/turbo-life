@@ -4,7 +4,7 @@
 //! Border extraction is fused into the main loop.
 //! Works with split cell buffers (separate current/next vecs).
 
-use super::tile::{BorderData, CellBuf, GhostZone, TILE_SIZE, TileMeta};
+use super::tile::{BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, TILE_SIZE, TileMeta};
 const _: [(); 1] = [(); (TILE_SIZE == 64) as usize];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +21,7 @@ pub struct TileAdvanceResult {
     pub missing_mask: u8,
     pub live_mask: u8,
     pub neighbor_influence_mask: u8,
+    pub prune_ready: bool,
 }
 
 impl TileAdvanceResult {
@@ -31,6 +32,7 @@ impl TileAdvanceResult {
         missing_mask: u8,
         live_mask: u8,
         neighbor_influence_mask: u8,
+        prune_ready: bool,
     ) -> Self {
         Self {
             changed,
@@ -38,6 +40,7 @@ impl TileAdvanceResult {
             missing_mask,
             live_mask,
             neighbor_influence_mask,
+            prune_ready,
         }
     }
 }
@@ -1093,6 +1096,17 @@ unsafe fn advance_tile_fused_impl<
     next_live_masks_ptr: *mut u8,
     idx: usize,
 ) -> TileAdvanceResult {
+    #[inline(always)]
+    fn no_track_hint(changed: bool, prune_ready: bool) -> u8 {
+        if changed {
+            u8::MAX
+        } else if prune_ready {
+            1
+        } else {
+            0
+        }
+    }
+
     let nb = unsafe { &*neighbors_ptr.add(idx) };
     let current = unsafe { &(*current_ptr.add(idx)).0 };
     let next = unsafe { &mut (*next_ptr.add(idx)).0 };
@@ -1109,7 +1123,7 @@ unsafe fn advance_tile_fused_impl<
     let sw_i = nb[6] as usize;
     let se_i = nb[7] as usize;
 
-    let (changed, border, has_live) = if tile_has_live {
+    let (changed, border, has_live, prune_ready) = if tile_has_live {
         let ghost_north = unsafe { *borders_south_read_ptr.add(north_i) };
         let ghost_south = unsafe { *borders_north_read_ptr.add(south_i) };
         let ghost_west = unsafe { *borders_east_read_ptr.add(west_i) };
@@ -1126,7 +1140,7 @@ unsafe fn advance_tile_fused_impl<
         if CORE_BACKEND == CORE_BACKEND_NEON {
             #[cfg(target_arch = "aarch64")]
             {
-                unsafe {
+                let (changed, border, has_live) = unsafe {
                     advance_core_neon_raw::<ASSUME_CHANGED>(
                         current,
                         next,
@@ -1140,7 +1154,8 @@ unsafe fn advance_tile_fused_impl<
                         ghost_se as u64,
                         force_store,
                     )
-                }
+                };
+                (changed, border, has_live, false)
             }
             #[cfg(not(target_arch = "aarch64"))]
             {
@@ -1157,16 +1172,46 @@ unsafe fn advance_tile_fused_impl<
                 sw: ghost_sw,
                 se: ghost_se,
             };
-            unsafe {
+            let (changed, border, has_live) = unsafe {
                 advance_core_const::<CORE_BACKEND, ASSUME_CHANGED>(
                     current,
                     next,
                     &ghost,
                     force_store,
                 )
-            }
+            };
+            (changed, border, has_live, false)
         }
     } else {
+        if missing_mask == MISSING_ALL_NEIGHBORS {
+            debug_assert!(tile_is_empty(current));
+            unsafe {
+                if force_store {
+                    std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+                }
+                *next_borders_north_ptr.add(idx) = 0;
+                *next_borders_south_ptr.add(idx) = 0;
+                *next_borders_west_ptr.add(idx) = 0;
+                *next_borders_east_ptr.add(idx) = 0;
+                *next_live_masks_ptr.add(idx) = 0;
+            }
+            debug_assert!(force_store || tile_is_empty(next));
+            meta.update_after_step(false, false);
+            let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
+                0
+            } else {
+                no_track_hint(false, true)
+            };
+            return TileAdvanceResult::new(
+                false,
+                false,
+                missing_mask,
+                0,
+                neighbor_influence_mask,
+                true,
+            );
+        }
+
         let north_live = unsafe { *live_masks_read_ptr.add(north_i) };
         let south_live = unsafe { *live_masks_read_ptr.add(south_i) };
         let west_live = unsafe { *live_masks_read_ptr.add(west_i) };
@@ -1200,7 +1245,19 @@ unsafe fn advance_tile_fused_impl<
             }
             debug_assert!(force_store || tile_is_empty(next));
             meta.update_after_step(false, false);
-            return TileAdvanceResult::new(false, false, missing_mask, 0, 0);
+            let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
+                0
+            } else {
+                no_track_hint(false, false)
+            };
+            return TileAdvanceResult::new(
+                false,
+                false,
+                missing_mask,
+                0,
+                neighbor_influence_mask,
+                false,
+            );
         }
 
         let ghost = GhostZone {
@@ -1214,7 +1271,8 @@ unsafe fn advance_tile_fused_impl<
             se: (se_live & LIVE_NW) != 0,
         };
         debug_assert!(tile_is_empty(current));
-        advance_core_empty_with_clear(next, &ghost, force_store)
+        let (changed, border, has_live) = advance_core_empty_with_clear(next, &ghost, force_store);
+        (changed, border, has_live, false)
     };
     let live_mask = border.live_mask();
 
@@ -1239,7 +1297,7 @@ unsafe fn advance_tile_fused_impl<
             0
         }
     } else {
-        (changed as u8).wrapping_neg()
+        no_track_hint(changed, prune_ready)
     };
 
     meta.update_after_step(changed, has_live);
@@ -1250,6 +1308,7 @@ unsafe fn advance_tile_fused_impl<
         missing_mask,
         live_mask,
         neighbor_influence_mask,
+        prune_ready,
     )
 }
 

@@ -765,6 +765,18 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
     if prune_len == 0 {
         arena.expand_buf.clear();
         arena.prune_buf.clear();
+        arena.prune_candidates_verified = false;
+        return;
+    }
+
+    if arena.prune_candidates_verified {
+        for i in 0..prune_len {
+            let idx = arena.prune_buf[i];
+            arena.release(idx);
+        }
+        arena.expand_buf.clear();
+        arena.prune_buf.clear();
+        arena.prune_candidates_verified = false;
         return;
     }
 
@@ -849,6 +861,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
         }
         arena.expand_buf.clear();
         arena.prune_buf.clear();
+        arena.prune_candidates_verified = false;
         return;
     }
 
@@ -874,6 +887,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
 
     arena.expand_buf.clear();
     arena.prune_buf.clear();
+    arena.prune_candidates_verified = false;
 }
 
 #[cfg(test)]

@@ -217,6 +217,7 @@ pub struct TileArena {
     /// Pending directional frontier-expansion candidates.
     /// Packed as `((src_idx as u32) << 3) | dir`.
     pub expand_buf: Vec<u32>,
+    pub prune_candidates_verified: bool,
     pub prune_buf: Vec<TileIdx>,
     pub prune_marks: Vec<u8>,
     pub prune_marks_words: Vec<u64>,
@@ -280,6 +281,7 @@ impl TileArena {
             active_sort_scratch: Vec::new(),
             active_sort_counts: vec![0u32; ACTIVE_SORT_RADIX_BUCKETS],
             expand_buf: Vec::new(),
+            prune_candidates_verified: false,
             prune_buf: Vec::new(),
             prune_marks: Vec::new(),
             prune_marks_words: Vec::new(),

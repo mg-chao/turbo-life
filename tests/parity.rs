@@ -67,3 +67,38 @@ fn parity_multiple_seeds() {
         run_parity_case(72, 72, 0.35, 7, seed);
     }
 }
+
+#[test]
+fn parity_keeps_frontier_when_dead_tile_has_future_border_births() {
+    let mut quick = QuickLife::new();
+    let mut turbo = TurboLife::new();
+
+    // West edge births on generation 1, but generation 0 has no west-border
+    // activity. Materializing and clearing a western tile ensures TurboLife has
+    // an occupied dead slot that could be (incorrectly) pruned too early.
+    let seed = [
+        (65, -2),
+        (65, -1),
+        (65, 0),
+        (65, 1),
+        (65, 2),
+        (66, -3),
+        (66, -2),
+        (66, -1),
+        (66, 1),
+        (67, -3),
+        (67, 2),
+    ];
+    for (x, y) in seed {
+        quick.set_cell(x, y, true);
+        turbo.set_cell(x as i64, y as i64, true);
+    }
+    turbo.set_cell(0, 0, true);
+    turbo.set_cell(0, 0, false);
+
+    quick.step(2);
+    turbo.step_n(2);
+
+    assert_eq!(quick.population(), turbo.population());
+    assert_eq!(collect_quick(&quick), collect_turbo(&turbo));
+}

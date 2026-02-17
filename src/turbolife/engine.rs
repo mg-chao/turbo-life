@@ -497,7 +497,10 @@ unsafe fn advance_tile_fused_backend<
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn advance_tile_cached_backend<const CORE_BACKEND: u8, const TRACK_NEIGHBOR_INFLUENCE: bool>(
+unsafe fn advance_tile_cached_backend<
+    const CORE_BACKEND: u8,
+    const TRACK_NEIGHBOR_INFLUENCE: bool,
+>(
     current_ptr: *const tile::CellBuf,
     next_ptr: *mut tile::CellBuf,
     meta_ptr: *mut tile::TileMeta,
@@ -1633,6 +1636,7 @@ impl TurboLife {
         let run_parallel = effective_threads > 1;
         const TRACK_NEIGHBOR_INFLUENCE: bool = false;
         let emit_changed = !ASSUME_CHANGED_MODE;
+        self.arena.prune_candidates_verified = emit_changed && !run_parallel;
 
         let (cb_lo, cb_hi) = self.arena.cell_bufs.split_at_mut(1);
         let (current_vec, next_vec) = if cp == 0 {
@@ -1821,6 +1825,9 @@ impl TurboLife {
                             unsafe {
                                 vec_push_unchecked(&mut self.arena.prune_buf, idx);
                             }
+                            if $emit_changed && !result.prune_ready {
+                                self.arena.prune_candidates_verified = false;
+                            }
                         }
 
                         let missing = result.missing_mask;
@@ -1947,6 +1954,9 @@ impl TurboLife {
                         if should_queue_prune::<$emit_changed>(has_live, changed) {
                             unsafe {
                                 vec_push_unchecked(&mut self.arena.prune_buf, idx);
+                            }
+                            if $emit_changed && !result.prune_ready {
+                                self.arena.prune_candidates_verified = false;
                             }
                         }
 

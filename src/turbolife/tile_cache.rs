@@ -15,6 +15,17 @@ const LIVE_NE: u8 = 1 << 5;
 const LIVE_SW: u8 = 1 << 6;
 const LIVE_SE: u8 = 1 << 7;
 
+#[inline(always)]
+fn no_track_hint(changed: bool, prune_ready: bool) -> u8 {
+    if changed {
+        u8::MAX
+    } else if prune_ready {
+        1
+    } else {
+        0
+    }
+}
+
 #[repr(C, align(64))]
 #[derive(Clone)]
 struct CacheEntry {
@@ -283,7 +294,19 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_IN
                 *next_live_masks_ptr.add(idx) = 0;
             }
             meta.update_after_step(false, false);
-            return TileAdvanceResult::new(false, false, missing_mask, 0, 0);
+            let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
+                0
+            } else {
+                no_track_hint(false, true)
+            };
+            return TileAdvanceResult::new(
+                false,
+                false,
+                missing_mask,
+                0,
+                neighbor_influence_mask,
+                true,
+            );
         }
 
         // Ultra-fast path: metadata says current tile is empty and halo has no
@@ -305,7 +328,19 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_IN
                 *next_live_masks_ptr.add(idx) = 0;
             }
             meta.update_after_step(false, false);
-            return TileAdvanceResult::new(false, false, missing_mask, 0, 0);
+            let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
+                0
+            } else {
+                no_track_hint(false, false)
+            };
+            return TileAdvanceResult::new(
+                false,
+                false,
+                missing_mask,
+                0,
+                neighbor_influence_mask,
+                false,
+            );
         }
     }
 
@@ -357,7 +392,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_IN
                 0
             }
         } else {
-            (changed as u8).wrapping_neg()
+            no_track_hint(changed, false)
         };
         meta.update_after_step(changed, has_live);
         return TileAdvanceResult::new(
@@ -366,6 +401,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_IN
             missing_mask,
             live_mask,
             neighbor_influence_mask,
+            false,
         );
     }
 
@@ -402,7 +438,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_IN
                     0
                 }
             } else {
-                (changed as u8).wrapping_neg()
+                no_track_hint(changed, false)
             };
             meta.update_after_step(changed, has_live);
             cr.record_hit();
@@ -412,6 +448,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_IN
                 missing_mask,
                 live_mask,
                 neighbor_influence_mask,
+                false,
             );
         }
         let (changed, border, has_live) =
@@ -440,7 +477,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_IN
                 0
             }
         } else {
-            (changed as u8).wrapping_neg()
+            no_track_hint(changed, false)
         };
         meta.update_after_step(changed, has_live);
         let em = unsafe { cr.entries.get_unchecked_mut(slot) };
@@ -465,6 +502,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_IN
             missing_mask,
             live_mask,
             neighbor_influence_mask,
+            false,
         );
     }
 
@@ -495,7 +533,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_IN
             0
         }
     } else {
-        (changed as u8).wrapping_neg()
+        no_track_hint(changed, false)
     };
     meta.update_after_step(changed, has_live);
     TileAdvanceResult::new(
@@ -504,6 +542,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_IN
         missing_mask,
         live_mask,
         neighbor_influence_mask,
+        false,
     )
 }
 
