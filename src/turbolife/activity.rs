@@ -49,6 +49,8 @@ impl<T> SendConstPtr<T> {
 
 #[inline(always)]
 fn vec_push_fast<T>(buf: &mut Vec<T>, value: T) {
+    // Keep a safe fallback when capacity is exhausted so upstream
+    // mis-estimation cannot turn into UB in release builds.
     if buf.len() == buf.capacity() {
         buf.push(value);
         return;
@@ -883,6 +885,7 @@ mod tests {
     use super::{
         PARALLEL_PRUNE_BITMAP_MIN, PARALLEL_PRUNE_CANDIDATES_MIN, TileArena, active_set_is_sorted,
         finalize_prune_and_expand, rebuild_active_set, should_use_bitmap_active_rebuild,
+        vec_push_fast,
     };
     use crate::turbolife::tile::{MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
 
@@ -893,6 +896,16 @@ mod tests {
         rebuild_active_set(&mut arena);
 
         assert!(arena.active_set.is_empty());
+    }
+
+    #[test]
+    fn vec_push_fast_grows_when_capacity_is_exhausted() {
+        let mut values = Vec::with_capacity(1);
+        values.push(1u32);
+
+        vec_push_fast(&mut values, 2);
+
+        assert_eq!(values, vec![1, 2]);
     }
 
     #[test]
