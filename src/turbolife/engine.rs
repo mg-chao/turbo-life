@@ -83,7 +83,6 @@ impl CacheAlignedAtomicUsize {
         }
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
     #[inline(always)]
     fn load(&self, order: Ordering) -> usize {
         self.inner.load(order)
@@ -2491,43 +2490,6 @@ impl TurboLife {
                 dispatch_fused_kernel_by_emit!(parallel_kernel_static);
             } else {
                 let cursor = CacheAlignedAtomicUsize::new(0);
-                #[cfg(target_arch = "aarch64")]
-                let lockfree_chunk_size =
-                    dynamic_parallel_chunk_size(active_len, changed_len, active_workers);
-
-                #[cfg(target_arch = "aarch64")]
-                macro_rules! parallel_kernel_lockfree {
-                    ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
-                        let cursor_ref = &cursor;
-                        run_parallel_workers(active_workers, &|worker_id| {
-                            let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
-                            loop {
-                                let start =
-                                    cursor_ref.fetch_add(lockfree_chunk_size, Ordering::Relaxed);
-                                if start >= active_len {
-                                    break;
-                                }
-                                let end = start.saturating_add(lockfree_chunk_size).min(active_len);
-                                scratch.reserve_for_additional_work::<$emit_changed, $track>(
-                                    end - start,
-                                );
-                                for i in start..end {
-                                    process_work_item!(
-                                        $advance,
-                                        scratch,
-                                        i,
-                                        end,
-                                        $track,
-                                        $emit_changed,
-                                        $dense
-                                    );
-                                }
-                            }
-                        });
-                    }};
-                }
-
-                #[cfg(not(target_arch = "aarch64"))]
                 macro_rules! parallel_kernel_lockfree {
                     ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
                         let cursor_ref = &cursor;
