@@ -637,6 +637,11 @@ impl TileArena {
     }
 
     #[inline(always)]
+    pub(crate) fn clear_all_changed_marks(&mut self) {
+        self.changed_bits.fill(0);
+    }
+
+    #[inline(always)]
     fn ensure_active_tag_capacity(&mut self, idx: usize) {
         if idx >= self.active_tags.len() {
             self.active_tags.resize(idx + 1, 0);

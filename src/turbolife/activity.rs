@@ -17,9 +17,16 @@ const ACTIVE_BITMAP_REBUILD_MIN_OCCUPIED: usize = 2_048;
 const ACTIVE_BITMAP_REBUILD_MAX_OCCUPIED: usize = 8_192;
 const ACTIVE_BITMAP_REBUILD_MIN_CHANGED: usize = 1_024;
 const ACTIVE_BITMAP_REBUILD_DENSE_CHANGED_PCT: usize = 30;
+const DENSE_REBUILD_CHANGED_PCT: usize = 90;
+const CHANGED_BITMAP_FULL_CLEAR_THRESHOLD_WORD_FACTOR: usize = 8;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const ACTIVE_BITMAP_REBUILD_BYPASS_OCCUPIED_MIN: usize = 4_096;
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+const ACTIVE_BITMAP_REBUILD_BYPASS_OCCUPIED_MIN: usize = usize::MAX;
 const _: [(); 1] = [(); (ACTIVE_SORT_STD_MAX > 0) as usize];
 const _: [(); 1] = [(); (ACTIVE_SORT_STD_MAX < ACTIVE_SORT_RADIX_MIN) as usize];
 const _: [(); 1] = [(); (ACTIVE_BITMAP_REBUILD_DENSE_CHANGED_PCT <= 100) as usize];
+const _: [(); 1] = [(); (DENSE_REBUILD_CHANGED_PCT <= 100) as usize];
 const _: [(); 1] = [(); (ACTIVE_BITMAP_REBUILD_MIN_CHANGED > 0) as usize];
 const _: [(); 1] =
     [(); (ACTIVE_BITMAP_REBUILD_MIN_OCCUPIED <= ACTIVE_BITMAP_REBUILD_MAX_OCCUPIED) as usize];
@@ -353,17 +360,27 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         arena.active_set_dense_contiguous = false;
         return;
     }
+    let meta_len = arena.meta.len();
     if had_synced_changed_bits {
-        for i in 0..changed_count {
-            let idx = arena.changed_scratch[i];
-            arena.clear_changed_mark(idx.index());
+        let bitmap_words = meta_len.div_ceil(64);
+        if changed_count
+            >= bitmap_words.saturating_mul(CHANGED_BITMAP_FULL_CLEAR_THRESHOLD_WORD_FACTOR)
+        {
+            arena.clear_all_changed_marks();
+        } else {
+            for i in 0..changed_count {
+                let idx = arena.changed_scratch[i];
+                arena.clear_changed_mark(idx.index());
+            }
         }
     }
-    let meta_len = arena.meta.len();
     arena.begin_active_rebuild_with_capacity(meta_len);
 
     let dense_rebuild = arena.occupied_count >= 4096
-        && changed_count.saturating_mul(100) >= arena.occupied_count.saturating_mul(90);
+        && changed_count.saturating_mul(100)
+            >= arena
+                .occupied_count
+                .saturating_mul(DENSE_REBUILD_CHANGED_PCT);
     if dense_rebuild {
         let can_reuse_full_contiguous_active = arena.free_list.is_empty()
             && arena.occupied_count + 1 == arena.meta.len()
@@ -413,7 +430,9 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     arena.active_set_dense_contiguous = false;
 
     let bitmap_rebuild = should_use_bitmap_active_rebuild(arena.occupied_count, changed_count);
-    if bitmap_rebuild {
+    let use_bitmap_rebuild = bitmap_rebuild
+        && arena.occupied_count < ACTIVE_BITMAP_REBUILD_BYPASS_OCCUPIED_MIN;
+    if use_bitmap_rebuild {
         let word_len = meta_len.div_ceil(64);
         if arena.active_marks_words.len() < word_len {
             arena.active_marks_words.resize(word_len, 0);
