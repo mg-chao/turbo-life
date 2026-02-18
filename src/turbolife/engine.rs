@@ -1316,12 +1316,17 @@ fn reserve_additional_capacity<T>(buf: &mut Vec<T>, additional: usize) {
 }
 
 #[inline(always)]
-unsafe fn vec_push_unchecked<T>(buf: &mut Vec<T>, value: T) {
-    debug_assert!(buf.len() < buf.capacity());
+unsafe fn vec_push_if_unchecked<T: Copy>(buf: &mut Vec<T>, value: T, cond: bool) {
+    if buf.len() == buf.capacity() {
+        if cond {
+            buf.push(value);
+        }
+        return;
+    }
     let len = buf.len();
     unsafe {
         std::ptr::write(buf.as_mut_ptr().add(len), value);
-        buf.set_len(len + 1);
+        buf.set_len(len + cond as usize);
     }
 }
 
@@ -2096,26 +2101,27 @@ impl TurboLife {
 
                         let changed = result.changed;
                         let has_live = result.has_live;
-                        if changed && $emit_changed {
+                        if $emit_changed {
                             unsafe {
-                                vec_push_unchecked(&mut self.arena.changed_list, idx);
+                                vec_push_if_unchecked(&mut self.arena.changed_list, idx, changed);
                             }
                             if $track {
                                 unsafe {
-                                    vec_push_unchecked(
+                                    vec_push_if_unchecked(
                                         &mut self.arena.changed_influence,
                                         result.neighbor_influence_mask,
+                                        changed,
                                     );
                                 }
                             }
                         }
-                        if unlikely(should_queue_prune::<$emit_changed>(has_live, changed)) {
-                            unsafe {
-                                vec_push_unchecked(&mut self.arena.prune_buf, idx);
-                            }
-                            if $emit_changed && !result.prune_ready {
-                                self.arena.prune_candidates_verified = false;
-                            }
+                        let queue_prune =
+                            unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
+                        unsafe {
+                            vec_push_if_unchecked(&mut self.arena.prune_buf, idx, queue_prune);
+                        }
+                        if queue_prune && $emit_changed && !result.prune_ready {
+                            self.arena.prune_candidates_verified = false;
                         }
 
                         let missing = result.missing_mask;
@@ -2226,26 +2232,27 @@ impl TurboLife {
 
                         let changed = result.changed;
                         let has_live = result.has_live;
-                        if changed && $emit_changed {
+                        if $emit_changed {
                             unsafe {
-                                vec_push_unchecked(&mut self.arena.changed_list, idx);
+                                vec_push_if_unchecked(&mut self.arena.changed_list, idx, changed);
                             }
                             if $track {
                                 unsafe {
-                                    vec_push_unchecked(
+                                    vec_push_if_unchecked(
                                         &mut self.arena.changed_influence,
                                         result.neighbor_influence_mask,
+                                        changed,
                                     );
                                 }
                             }
                         }
-                        if unlikely(should_queue_prune::<$emit_changed>(has_live, changed)) {
-                            unsafe {
-                                vec_push_unchecked(&mut self.arena.prune_buf, idx);
-                            }
-                            if $emit_changed && !result.prune_ready {
-                                self.arena.prune_candidates_verified = false;
-                            }
+                        let queue_prune =
+                            unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
+                        unsafe {
+                            vec_push_if_unchecked(&mut self.arena.prune_buf, idx, queue_prune);
+                        }
+                        if queue_prune && $emit_changed && !result.prune_ready {
+                            self.arena.prune_candidates_verified = false;
                         }
 
                         let missing = result.missing_mask;
@@ -2425,26 +2432,27 @@ impl TurboLife {
 
                     let changed = result.changed;
                     let has_live = result.has_live;
-                    if changed && $emit_changed {
+                    if $emit_changed {
                         unsafe {
-                            vec_push_unchecked(&mut ($scratch).changed, idx);
+                            vec_push_if_unchecked(&mut ($scratch).changed, idx, changed);
                         }
                         if $track {
                             unsafe {
-                                vec_push_unchecked(
+                                vec_push_if_unchecked(
                                     &mut ($scratch).changed_influence,
                                     result.neighbor_influence_mask,
+                                    changed,
                                 );
                             }
                         }
                     }
-                    if unlikely(should_queue_prune::<$emit_changed>(has_live, changed)) {
-                        unsafe {
-                            vec_push_unchecked(&mut ($scratch).prune, idx);
-                        }
-                        if $emit_changed && !result.prune_ready {
-                            ($scratch).prune_candidates_verified = false;
-                        }
+                    let queue_prune =
+                        unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
+                    unsafe {
+                        vec_push_if_unchecked(&mut ($scratch).prune, idx, queue_prune);
+                    }
+                    if queue_prune && $emit_changed && !result.prune_ready {
+                        ($scratch).prune_candidates_verified = false;
                     }
 
                     let missing = result.missing_mask;
@@ -2820,10 +2828,11 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     use super::auto_pool_thread_count_for_apple_hybrid;
     use super::{
-        KernelBackend, PARALLEL_KERNEL_MIN_ACTIVE, TILE_SIZE_I64, TurboLife, TurboLifeConfig,
-        auto_pool_thread_count, auto_pool_thread_count_for_physical, churn_at_most_percent,
-        churn_below_percent, dynamic_parallel_chunk_size, dynamic_target_chunks_per_worker,
-        macos_perf_only_enabled, memory_parallel_cap, parse_env_bool, run_parallel_workers,
+        KernelBackend, PARALLEL_KERNEL_MIN_ACTIVE, TILE_SIZE_I64, TileIdx, TurboLife,
+        TurboLifeConfig, auto_pool_thread_count, auto_pool_thread_count_for_physical,
+        churn_at_most_percent, churn_below_percent, dynamic_parallel_chunk_size,
+        dynamic_target_chunks_per_worker, macos_perf_only_enabled, memory_parallel_cap,
+        parse_env_bool, run_parallel_workers,
     };
 
     const PARALLEL_TEST_TILE_GRID: i64 = 12;
@@ -3072,6 +3081,19 @@ mod tests {
         assert!(!super::should_queue_prune::<true>(false, true));
         assert!(super::should_queue_prune::<false>(false, false));
         assert!(super::should_queue_prune::<false>(false, true));
+    }
+
+    #[test]
+    fn vec_push_if_unchecked_handles_exhausted_capacity() {
+        let mut values = Vec::with_capacity(1);
+        values.push(TileIdx(1));
+
+        unsafe {
+            super::vec_push_if_unchecked(&mut values, TileIdx(2), false);
+            super::vec_push_if_unchecked(&mut values, TileIdx(3), true);
+        }
+
+        assert_eq!(values, vec![TileIdx(1), TileIdx(3)]);
     }
 
     #[test]

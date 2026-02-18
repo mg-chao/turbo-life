@@ -95,6 +95,21 @@ unsafe fn vec_push_unchecked<T>(buf: &mut Vec<T>, value: T) {
     }
 }
 
+#[inline(always)]
+unsafe fn vec_push_if_branchless_unchecked<T: Copy>(buf: &mut Vec<T>, value: T, cond: bool) {
+    if buf.len() == buf.capacity() {
+        if cond {
+            vec_push_cold(buf, value);
+        }
+        return;
+    }
+    let len = buf.len();
+    unsafe {
+        std::ptr::write(buf.as_mut_ptr().add(len), value);
+        buf.set_len(len + cond as usize);
+    }
+}
+
 #[inline]
 fn rebuild_active_set_from_occupied_bits(arena: &mut TileArena) {
     let target_len = arena.occupied_count;
@@ -602,9 +617,12 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         return;
     }
 
-    arena
-        .active_set
-        .reserve(changed_count.saturating_mul(9).min(arena.occupied_count));
+    arena.active_set.reserve(
+        changed_count
+            .saturating_mul(9)
+            .min(arena.occupied_count)
+            .saturating_add(1),
+    );
     let neighbors_ptr = arena.neighbors.as_ptr();
     let meta_ptr = arena.meta.as_ptr();
     let changed_ptr = arena.changed_scratch.as_ptr();
@@ -614,10 +632,9 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
             let i = idx.index();
             debug_assert!(i < meta_len);
             debug_assert!(unsafe { (*meta_ptr.add(i)).occupied() });
-            if unsafe { !arena.active_test_and_set_unchecked(i) } {
-                unsafe {
-                    vec_push_unchecked(&mut arena.active_set, idx);
-                }
+            let insert_idx = unsafe { !arena.active_test_and_set_unchecked(i) };
+            unsafe {
+                vec_push_if_branchless_unchecked(&mut arena.active_set, idx, insert_idx);
             }
 
             unsafe {
@@ -654,30 +671,54 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                 debug_assert!(ni5_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni5_i)).occupied());
                 debug_assert!(ni6_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni6_i)).occupied());
                 debug_assert!(ni7_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni7_i)).occupied());
-                if !arena.active_test_and_set_unchecked(ni0_i) {
-                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni0 as u32));
-                }
-                if !arena.active_test_and_set_unchecked(ni1_i) {
-                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni1 as u32));
-                }
-                if !arena.active_test_and_set_unchecked(ni2_i) {
-                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni2 as u32));
-                }
-                if !arena.active_test_and_set_unchecked(ni3_i) {
-                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni3 as u32));
-                }
-                if !arena.active_test_and_set_unchecked(ni4_i) {
-                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni4 as u32));
-                }
-                if !arena.active_test_and_set_unchecked(ni5_i) {
-                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni5 as u32));
-                }
-                if !arena.active_test_and_set_unchecked(ni6_i) {
-                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni6 as u32));
-                }
-                if !arena.active_test_and_set_unchecked(ni7_i) {
-                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni7 as u32));
-                }
+                let insert_ni0 = !arena.active_test_and_set_unchecked(ni0_i);
+                vec_push_if_branchless_unchecked(
+                    &mut arena.active_set,
+                    TileIdx(ni0 as u32),
+                    insert_ni0,
+                );
+                let insert_ni1 = !arena.active_test_and_set_unchecked(ni1_i);
+                vec_push_if_branchless_unchecked(
+                    &mut arena.active_set,
+                    TileIdx(ni1 as u32),
+                    insert_ni1,
+                );
+                let insert_ni2 = !arena.active_test_and_set_unchecked(ni2_i);
+                vec_push_if_branchless_unchecked(
+                    &mut arena.active_set,
+                    TileIdx(ni2 as u32),
+                    insert_ni2,
+                );
+                let insert_ni3 = !arena.active_test_and_set_unchecked(ni3_i);
+                vec_push_if_branchless_unchecked(
+                    &mut arena.active_set,
+                    TileIdx(ni3 as u32),
+                    insert_ni3,
+                );
+                let insert_ni4 = !arena.active_test_and_set_unchecked(ni4_i);
+                vec_push_if_branchless_unchecked(
+                    &mut arena.active_set,
+                    TileIdx(ni4 as u32),
+                    insert_ni4,
+                );
+                let insert_ni5 = !arena.active_test_and_set_unchecked(ni5_i);
+                vec_push_if_branchless_unchecked(
+                    &mut arena.active_set,
+                    TileIdx(ni5 as u32),
+                    insert_ni5,
+                );
+                let insert_ni6 = !arena.active_test_and_set_unchecked(ni6_i);
+                vec_push_if_branchless_unchecked(
+                    &mut arena.active_set,
+                    TileIdx(ni6 as u32),
+                    insert_ni6,
+                );
+                let insert_ni7 = !arena.active_test_and_set_unchecked(ni7_i);
+                vec_push_if_branchless_unchecked(
+                    &mut arena.active_set,
+                    TileIdx(ni7 as u32),
+                    insert_ni7,
+                );
             }
         }
     } else {
@@ -688,10 +729,9 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
             let i = idx.index();
             debug_assert!(i < meta_len);
             debug_assert!(unsafe { (*meta_ptr.add(i)).occupied() });
-            if unsafe { !arena.active_test_and_set_unchecked(i) } {
-                unsafe {
-                    vec_push_unchecked(&mut arena.active_set, idx);
-                }
+            let insert_idx = unsafe { !arena.active_test_and_set_unchecked(i) };
+            unsafe {
+                vec_push_if_branchless_unchecked(&mut arena.active_set, idx, insert_idx);
             }
             if influence_mask == 0 {
                 continue;
@@ -750,30 +790,54 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                     debug_assert!(
                         ni7_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni7_i)).occupied()
                     );
-                    if !arena.active_test_and_set_unchecked(ni0_i) {
-                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni0 as u32));
-                    }
-                    if !arena.active_test_and_set_unchecked(ni1_i) {
-                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni1 as u32));
-                    }
-                    if !arena.active_test_and_set_unchecked(ni2_i) {
-                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni2 as u32));
-                    }
-                    if !arena.active_test_and_set_unchecked(ni3_i) {
-                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni3 as u32));
-                    }
-                    if !arena.active_test_and_set_unchecked(ni4_i) {
-                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni4 as u32));
-                    }
-                    if !arena.active_test_and_set_unchecked(ni5_i) {
-                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni5 as u32));
-                    }
-                    if !arena.active_test_and_set_unchecked(ni6_i) {
-                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni6 as u32));
-                    }
-                    if !arena.active_test_and_set_unchecked(ni7_i) {
-                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni7 as u32));
-                    }
+                    let insert_ni0 = !arena.active_test_and_set_unchecked(ni0_i);
+                    vec_push_if_branchless_unchecked(
+                        &mut arena.active_set,
+                        TileIdx(ni0 as u32),
+                        insert_ni0,
+                    );
+                    let insert_ni1 = !arena.active_test_and_set_unchecked(ni1_i);
+                    vec_push_if_branchless_unchecked(
+                        &mut arena.active_set,
+                        TileIdx(ni1 as u32),
+                        insert_ni1,
+                    );
+                    let insert_ni2 = !arena.active_test_and_set_unchecked(ni2_i);
+                    vec_push_if_branchless_unchecked(
+                        &mut arena.active_set,
+                        TileIdx(ni2 as u32),
+                        insert_ni2,
+                    );
+                    let insert_ni3 = !arena.active_test_and_set_unchecked(ni3_i);
+                    vec_push_if_branchless_unchecked(
+                        &mut arena.active_set,
+                        TileIdx(ni3 as u32),
+                        insert_ni3,
+                    );
+                    let insert_ni4 = !arena.active_test_and_set_unchecked(ni4_i);
+                    vec_push_if_branchless_unchecked(
+                        &mut arena.active_set,
+                        TileIdx(ni4 as u32),
+                        insert_ni4,
+                    );
+                    let insert_ni5 = !arena.active_test_and_set_unchecked(ni5_i);
+                    vec_push_if_branchless_unchecked(
+                        &mut arena.active_set,
+                        TileIdx(ni5 as u32),
+                        insert_ni5,
+                    );
+                    let insert_ni6 = !arena.active_test_and_set_unchecked(ni6_i);
+                    vec_push_if_branchless_unchecked(
+                        &mut arena.active_set,
+                        TileIdx(ni6 as u32),
+                        insert_ni6,
+                    );
+                    let insert_ni7 = !arena.active_test_and_set_unchecked(ni7_i);
+                    vec_push_if_branchless_unchecked(
+                        &mut arena.active_set,
+                        TileIdx(ni7 as u32),
+                        insert_ni7,
+                    );
                 } else {
                     let dirs = &EXPAND_MASK_TABLE.dirs[influence_mask as usize];
                     let count = EXPAND_MASK_TABLE.len[influence_mask as usize] as usize;
@@ -784,9 +848,12 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                         debug_assert!(
                             ni_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni_i)).occupied()
                         );
-                        if !arena.active_test_and_set_unchecked(ni_i) {
-                            vec_push_unchecked(&mut arena.active_set, TileIdx(ni_raw as u32));
-                        }
+                        let insert_neighbor = !arena.active_test_and_set_unchecked(ni_i);
+                        vec_push_if_branchless_unchecked(
+                            &mut arena.active_set,
+                            TileIdx(ni_raw as u32),
+                            insert_neighbor,
+                        );
                     }
                 }
             }
@@ -963,7 +1030,7 @@ mod tests {
     use super::{
         DENSE_REBUILD_CHANGED_PCT, PARALLEL_PRUNE_BITMAP_MIN, PARALLEL_PRUNE_CANDIDATES_MIN,
         TileArena, active_set_is_sorted, finalize_prune_and_expand, rebuild_active_set,
-        should_use_bitmap_active_rebuild, vec_push_fast,
+        should_use_bitmap_active_rebuild, vec_push_fast, vec_push_if_branchless_unchecked,
     };
     use crate::turbolife::tile::{MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
 
@@ -984,6 +1051,19 @@ mod tests {
         vec_push_fast(&mut values, 2);
 
         assert_eq!(values, vec![1, 2]);
+    }
+
+    #[test]
+    fn vec_push_if_branchless_handles_exhausted_capacity() {
+        let mut values = Vec::with_capacity(1);
+        values.push(1u32);
+
+        unsafe {
+            vec_push_if_branchless_unchecked(&mut values, 2, false);
+            vec_push_if_branchless_unchecked(&mut values, 3, true);
+        }
+
+        assert_eq!(values, vec![1, 3]);
     }
 
     #[test]
