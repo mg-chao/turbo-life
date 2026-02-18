@@ -732,33 +732,37 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
     let mut east_below_bits = (ghost_east << 1) | ghost_se;
 
     macro_rules! process_pair {
-        ($row_base:expr, $row_above:expr, $row_self:expr, $row_below:expr) => {{
-            let ghost_w_self = west_self_bits & 0b11;
-            let ghost_e_self = east_self_bits & 0b11;
-            let ghost_w_above = west_above_bits & 0b11;
-            let ghost_e_above = east_above_bits & 0b11;
-            let ghost_w_below = west_below_bits & 0b11;
-            let ghost_e_below = east_below_bits & 0b11;
-
+        (
+            $row_base:expr,
+            $row_above:expr,
+            $row_self:expr,
+            $row_below:expr,
+            $ghost_w_above:expr,
+            $ghost_e_above:expr,
+            $ghost_w_self:expr,
+            $ghost_e_self:expr,
+            $ghost_w_below:expr,
+            $ghost_e_below:expr
+        ) => {{
             let nw = vorrq_u64(vshlq_n_u64($row_above, 1), unsafe {
-                neon_carry_mask_lo(ghost_w_above)
+                neon_carry_mask_lo($ghost_w_above)
             });
             let n = $row_above;
             let ne = vorrq_u64(vshrq_n_u64($row_above, 1), unsafe {
-                neon_carry_mask_hi(ghost_e_above)
+                neon_carry_mask_hi($ghost_e_above)
             });
             let w = vorrq_u64(vshlq_n_u64($row_self, 1), unsafe {
-                neon_carry_mask_lo(ghost_w_self)
+                neon_carry_mask_lo($ghost_w_self)
             });
             let e = vorrq_u64(vshrq_n_u64($row_self, 1), unsafe {
-                neon_carry_mask_hi(ghost_e_self)
+                neon_carry_mask_hi($ghost_e_self)
             });
             let sw = vorrq_u64(vshlq_n_u64($row_below, 1), unsafe {
-                neon_carry_mask_lo(ghost_w_below)
+                neon_carry_mask_lo($ghost_w_below)
             });
             let s = $row_below;
             let se = vorrq_u64(vshrq_n_u64($row_below, 1), unsafe {
-                neon_carry_mask_hi(ghost_e_below)
+                neon_carry_mask_hi($ghost_e_below)
             });
 
             let (a0, a1) = unsafe { neon_full_add(nw, n, ne) };
@@ -810,7 +814,18 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
     let row_self_0 = unsafe { vld1q_u64(current_ptr) };
     let row_above_0 = unsafe { vld1q_u64(current_ptr.add(1)) };
     let row_below_0 = unsafe { neon_set_u64x2_lane_order(ghost_south, current[0]) };
-    let (border_south, _) = process_pair!(0, row_above_0, row_self_0, row_below_0);
+    let (border_south, _) = process_pair!(
+        0,
+        row_above_0,
+        row_self_0,
+        row_below_0,
+        west_above_bits & 0b11,
+        east_above_bits & 0b11,
+        west_self_bits & 0b11,
+        east_self_bits & 0b11,
+        west_below_bits & 0b11,
+        east_below_bits & 0b11
+    );
     west_self_bits >>= 2;
     east_self_bits >>= 2;
     west_above_bits >>= 2;
@@ -821,28 +836,51 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
     let mut prev_above = row_above_0;
     let mut row_base = 2usize;
     while row_base < TILE_SIZE - 4 {
+        let nib_w_self = west_self_bits & 0b1111;
+        let nib_e_self = east_self_bits & 0b1111;
+        let nib_w_above = west_above_bits & 0b1111;
+        let nib_e_above = east_above_bits & 0b1111;
+        let nib_w_below = west_below_bits & 0b1111;
+        let nib_e_below = east_below_bits & 0b1111;
+
         let row_below_0 = prev_above;
         let row_self_0 = unsafe { vld1q_u64(current_ptr.add(row_base)) };
         let row_above_0 = unsafe { vld1q_u64(current_ptr.add(row_base + 1)) };
-        let _ = process_pair!(row_base, row_above_0, row_self_0, row_below_0);
-        west_self_bits >>= 2;
-        east_self_bits >>= 2;
-        west_above_bits >>= 2;
-        east_above_bits >>= 2;
-        west_below_bits >>= 2;
-        east_below_bits >>= 2;
+        let _ = process_pair!(
+            row_base,
+            row_above_0,
+            row_self_0,
+            row_below_0,
+            nib_w_above & 0b11,
+            nib_e_above & 0b11,
+            nib_w_self & 0b11,
+            nib_e_self & 0b11,
+            nib_w_below & 0b11,
+            nib_e_below & 0b11
+        );
 
         let row_below_1 = row_above_0;
         let row_self_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 2)) };
         let row_above_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 3)) };
-        let _ = process_pair!(row_base + 2, row_above_1, row_self_1, row_below_1);
+        let _ = process_pair!(
+            row_base + 2,
+            row_above_1,
+            row_self_1,
+            row_below_1,
+            (nib_w_above >> 2) & 0b11,
+            (nib_e_above >> 2) & 0b11,
+            (nib_w_self >> 2) & 0b11,
+            (nib_e_self >> 2) & 0b11,
+            (nib_w_below >> 2) & 0b11,
+            (nib_e_below >> 2) & 0b11
+        );
         prev_above = row_above_1;
-        west_self_bits >>= 2;
-        east_self_bits >>= 2;
-        west_above_bits >>= 2;
-        east_above_bits >>= 2;
-        west_below_bits >>= 2;
-        east_below_bits >>= 2;
+        west_self_bits >>= 4;
+        east_self_bits >>= 4;
+        west_above_bits >>= 4;
+        east_above_bits >>= 4;
+        west_below_bits >>= 4;
+        east_below_bits >>= 4;
         row_base += 4;
     }
 
@@ -850,7 +888,18 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
         let row_below = prev_above;
         let row_self = unsafe { vld1q_u64(current_ptr.add(row_base)) };
         let row_above = unsafe { vld1q_u64(current_ptr.add(row_base + 1)) };
-        let _ = process_pair!(row_base, row_above, row_self, row_below);
+        let _ = process_pair!(
+            row_base,
+            row_above,
+            row_self,
+            row_below,
+            west_above_bits & 0b11,
+            east_above_bits & 0b11,
+            west_self_bits & 0b11,
+            east_self_bits & 0b11,
+            west_below_bits & 0b11,
+            east_below_bits & 0b11
+        );
         prev_above = row_above;
         west_self_bits >>= 2;
         east_self_bits >>= 2;
@@ -862,9 +911,20 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
 
     let last_base = TILE_SIZE - 2;
     let row_self_last = unsafe { vld1q_u64(current_ptr.add(last_base)) };
-    let row_above_last = unsafe { neon_set_u64x2_lane_order(current[63], ghost_north) };
+    let row_above_last = unsafe { neon_set_u64x2_lane_order(current[TILE_SIZE - 1], ghost_north) };
     let row_below_last = prev_above;
-    let (_, border_north) = process_pair!(last_base, row_above_last, row_self_last, row_below_last);
+    let (_, border_north) = process_pair!(
+        last_base,
+        row_above_last,
+        row_self_last,
+        row_below_last,
+        west_above_bits & 0b11,
+        east_above_bits & 0b11,
+        west_self_bits & 0b11,
+        east_self_bits & 0b11,
+        west_below_bits & 0b11,
+        east_below_bits & 0b11
+    );
 
     if TRACK_DIFF && FORCE_STORE {
         changed = vget_lane_u64(vorr_u64(vget_low_u64(diff_acc), vget_high_u64(diff_acc)), 0) != 0;
