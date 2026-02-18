@@ -9,15 +9,16 @@ use super::activity::{
 use super::arena::TileArena;
 #[cfg(target_arch = "x86_64")]
 use super::kernel::advance_core;
-#[cfg(target_arch = "aarch64")]
-use super::kernel::advance_tile_fused_neon_assume_changed_no_track_fast;
 use super::kernel::{
     KernelBackend, advance_tile_fused_scalar_no_track, advance_tile_fused_scalar_track,
 };
 #[cfg(target_arch = "x86_64")]
 use super::kernel::{advance_tile_fused_avx2_no_track, advance_tile_fused_avx2_track};
 #[cfg(target_arch = "aarch64")]
-use super::kernel::{advance_tile_fused_neon_no_track_fast, advance_tile_fused_neon_track};
+use super::kernel::{
+    advance_tile_fused_neon_assume_changed_no_track_fast, advance_tile_fused_neon_no_track_fast,
+    advance_tile_fused_neon_track,
+};
 use super::tile::{self, Direction, NO_NEIGHBOR, NeighborIdx, TileIdx};
 use super::tile_cache::{
     TileCache, advance_tile_cached_scalar_no_track, advance_tile_cached_scalar_track,
@@ -411,6 +412,69 @@ unsafe fn advance_tile_fused_avx2_backend<const TRACK_NEIGHBOR_INFLUENCE: bool>(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
+unsafe fn advance_tile_fused_neon_no_track_backend<const ASSUME_CHANGED_NEON: bool>(
+    current_ptr: *const tile::CellBuf,
+    next_ptr: *mut tile::CellBuf,
+    meta_ptr: *mut tile::TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [NeighborIdx; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+) -> super::kernel::TileAdvanceResult {
+    if ASSUME_CHANGED_NEON {
+        unsafe {
+            advance_tile_fused_neon_assume_changed_no_track_fast(
+                current_ptr,
+                next_ptr,
+                meta_ptr,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                neighbors_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+            )
+        }
+    } else {
+        unsafe {
+            advance_tile_fused_neon_no_track_fast(
+                current_ptr,
+                next_ptr,
+                meta_ptr,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                neighbors_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+            )
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn advance_tile_fused_neon_backend<
     const TRACK_NEIGHBOR_INFLUENCE: bool,
     const ASSUME_CHANGED_NEON: bool,
@@ -455,29 +519,9 @@ unsafe fn advance_tile_fused_neon_backend<
                 idx,
             )
         }
-    } else if ASSUME_CHANGED_NEON {
-        unsafe {
-            advance_tile_fused_neon_assume_changed_no_track_fast(
-                current_ptr,
-                next_ptr,
-                meta_ptr,
-                next_borders_north_ptr,
-                next_borders_south_ptr,
-                next_borders_west_ptr,
-                next_borders_east_ptr,
-                borders_north_read_ptr,
-                borders_south_read_ptr,
-                borders_west_read_ptr,
-                borders_east_read_ptr,
-                neighbors_ptr,
-                live_masks_read_ptr,
-                next_live_masks_ptr,
-                idx,
-            )
-        }
     } else {
         unsafe {
-            advance_tile_fused_neon_no_track_fast(
+            advance_tile_fused_neon_no_track_backend::<ASSUME_CHANGED_NEON>(
                 current_ptr,
                 next_ptr,
                 meta_ptr,
