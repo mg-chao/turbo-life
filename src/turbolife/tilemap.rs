@@ -85,11 +85,6 @@ impl Slot {
         );
         self.ctrl = (self.ctrl & !DIST_MASK) | ((distance as u32) << DIST_SHIFT);
     }
-
-    #[inline(always)]
-    fn match_ctrl(self) -> u32 {
-        self.ctrl & MATCH_MASK
-    }
 }
 
 // ── TileMap ─────────────────────────────────────────────────────────────
@@ -165,18 +160,21 @@ impl TileMap {
         // SAFETY: `pos` is always `& self.mask` which is < self.slots.len()
         // (capacity is a power of two, mask = capacity - 1).
         loop {
-            let slot = unsafe { *slots_ptr.add(pos) };
-            if slot.is_empty() {
+            let slot_ptr = unsafe { slots_ptr.add(pos) };
+            let ctrl = unsafe { (*slot_ptr).ctrl };
+            if ctrl == EMPTY {
                 return None;
             }
             // Robin Hood early exit: if this occupied slot is closer to its
             // home than we are to ours, our key was never inserted here.
-            let their_dist = slot.distance();
+            let their_dist = distance_from_ctrl(ctrl);
             if our_dist > their_dist {
                 return None;
             }
-            if slot.match_ctrl() == target_ctrl && slot.key_x == x && slot.key_y == y {
-                return Some(TileIdx(slot.value));
+            if (ctrl & MATCH_MASK) == target_ctrl
+                && unsafe { (*slot_ptr).key_x == x && (*slot_ptr).key_y == y }
+            {
+                return Some(TileIdx(unsafe { (*slot_ptr).value }));
             }
             pos = (pos + 1) & mask;
             our_dist += 1;
@@ -215,70 +213,112 @@ impl TileMap {
         let mask = self.mask;
         let mut pos = hash as usize & mask;
         let slots_ptr = self.slots.as_mut_ptr();
-
-        let mut ins = Slot {
-            key_x: x,
-            key_y: y,
-            value: value.0,
-            ctrl: occupied_ctrl(fingerprint_of(hash), 0),
-        };
+        let mut ins_key_x = x;
+        let mut ins_key_y = y;
+        let mut ins_value = value.0;
+        let mut ins_fp = fingerprint_of(hash);
+        let mut ins_dist = 0usize;
 
         loop {
             // SAFETY: pos is always & mask which is < slots.len().
             let slot = unsafe { &mut *slots_ptr.add(pos) };
+            let ctrl = slot.ctrl;
 
-            if slot.is_empty() {
-                *slot = ins;
+            if ctrl == EMPTY {
+                debug_assert!(ins_dist <= MAX_DIST);
+                *slot = Slot {
+                    key_x: ins_key_x,
+                    key_y: ins_key_y,
+                    value: ins_value,
+                    ctrl: occupied_ctrl(ins_fp, ins_dist),
+                };
                 self.len += 1;
                 return None;
             }
 
             // Exact match — update in place.
-            if slot.match_ctrl() == target_ctrl && slot.key_x == x && slot.key_y == y {
+            if (ctrl & MATCH_MASK) == target_ctrl && slot.key_x == x && slot.key_y == y {
                 let old = TileIdx(slot.value);
                 slot.value = value.0;
                 return Some(old);
             }
 
             // Robin Hood: if the existing entry is closer to home, steal its spot.
-            let ins_dist = ins.distance();
-            let existing_dist = slot.distance();
+            let existing_dist = distance_from_ctrl(ctrl);
             if ins_dist > existing_dist {
-                std::mem::swap(&mut *slot, &mut ins);
+                let displaced_fp = ctrl & FP_MASK;
+                let displaced_key_x = slot.key_x;
+                let displaced_key_y = slot.key_y;
+                let displaced_value = slot.value;
+
+                debug_assert!(ins_dist <= MAX_DIST);
+                slot.key_x = ins_key_x;
+                slot.key_y = ins_key_y;
+                slot.value = ins_value;
+                slot.ctrl = occupied_ctrl(ins_fp, ins_dist);
+
+                ins_key_x = displaced_key_x;
+                ins_key_y = displaced_key_y;
+                ins_value = displaced_value;
+                ins_fp = displaced_fp;
+                ins_dist = existing_dist;
             }
 
-            ins.set_distance(ins.distance() + 1);
+            ins_dist += 1;
             pos = (pos + 1) & mask;
         }
     }
 
     /// Insert during resize — recomputes home position, skips duplicate check.
     #[inline]
-    fn insert_rehash(&mut self, mut slot_in: Slot) {
+    fn insert_rehash(&mut self, slot_in: Slot) {
         let mask = self.mask;
         let slots_ptr = self.slots.as_mut_ptr();
         let hash = tile_hash(slot_in.key_x, slot_in.key_y);
         let mut pos = hash as usize & mask;
-        slot_in.set_distance(0);
-        let mut ins = slot_in;
+        let mut ins_key_x = slot_in.key_x;
+        let mut ins_key_y = slot_in.key_y;
+        let mut ins_value = slot_in.value;
+        let mut ins_fp = slot_in.ctrl & FP_MASK;
+        let mut ins_dist = 0usize;
 
         loop {
             // SAFETY: pos is always & mask which is < slots.len().
             let slot = unsafe { &mut *slots_ptr.add(pos) };
-
-            if slot.is_empty() {
-                *slot = ins;
+            let ctrl = slot.ctrl;
+            if ctrl == EMPTY {
+                debug_assert!(ins_dist <= MAX_DIST);
+                *slot = Slot {
+                    key_x: ins_key_x,
+                    key_y: ins_key_y,
+                    value: ins_value,
+                    ctrl: occupied_ctrl(ins_fp, ins_dist),
+                };
                 self.len += 1;
                 return;
             }
 
-            let ins_dist = ins.distance();
-            let existing_dist = slot.distance();
+            let existing_dist = distance_from_ctrl(ctrl);
             if ins_dist > existing_dist {
-                std::mem::swap(&mut *slot, &mut ins);
+                let displaced_fp = ctrl & FP_MASK;
+                let displaced_key_x = slot.key_x;
+                let displaced_key_y = slot.key_y;
+                let displaced_value = slot.value;
+
+                debug_assert!(ins_dist <= MAX_DIST);
+                slot.key_x = ins_key_x;
+                slot.key_y = ins_key_y;
+                slot.value = ins_value;
+                slot.ctrl = occupied_ctrl(ins_fp, ins_dist);
+
+                ins_key_x = displaced_key_x;
+                ins_key_y = displaced_key_y;
+                ins_value = displaced_value;
+                ins_fp = displaced_fp;
+                ins_dist = existing_dist;
             }
 
-            ins.set_distance(ins.distance() + 1);
+            ins_dist += 1;
             pos = (pos + 1) & mask;
         }
     }
@@ -299,21 +339,25 @@ impl TileMap {
         let target_ctrl = match_ctrl_of(hash);
         let mask = self.mask;
         let mut pos = hash as usize & mask;
+        let slots_ptr = self.slots.as_mut_ptr();
         let mut our_dist = 0usize;
 
         loop {
             // SAFETY: pos is always & mask which is < slots.len().
-            let slot = unsafe { *self.slots.get_unchecked(pos) };
-            if slot.is_empty() {
+            let slot_ptr = unsafe { slots_ptr.add(pos) };
+            let ctrl = unsafe { (*slot_ptr).ctrl };
+            if ctrl == EMPTY {
                 return None;
             }
             // Robin Hood early exit on miss.
-            let their_dist = slot.distance();
+            let their_dist = distance_from_ctrl(ctrl);
             if our_dist > their_dist {
                 return None;
             }
-            if slot.match_ctrl() == target_ctrl && slot.key_x == x && slot.key_y == y {
-                let old = TileIdx(slot.value);
+            if (ctrl & MATCH_MASK) == target_ctrl
+                && unsafe { (*slot_ptr).key_x == x && (*slot_ptr).key_y == y }
+            {
+                let old = TileIdx(unsafe { (*slot_ptr).value });
                 self.backward_shift_delete(pos);
                 self.len -= 1;
                 return Some(old);
@@ -412,12 +456,21 @@ fn fingerprint_of(hash: u64) -> u32 {
 
 #[inline(always)]
 fn occupied_ctrl(fp: u32, distance: usize) -> u32 {
+    assert!(
+        distance <= MAX_DIST,
+        "TileMap probe distance overflow (distance={distance}, max={MAX_DIST})"
+    );
     OCCUPIED_BIT | ((distance as u32) << DIST_SHIFT) | fp
 }
 
 #[inline(always)]
 fn match_ctrl_of(hash: u64) -> u32 {
     OCCUPIED_BIT | fingerprint_of(hash)
+}
+
+#[inline(always)]
+fn distance_from_ctrl(ctrl: u32) -> usize {
+    ((ctrl & DIST_MASK) >> DIST_SHIFT) as usize
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
