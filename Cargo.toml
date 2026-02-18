@@ -6,6 +6,8 @@ license = "GPL-3.0-or-later"
 description = "A high-performance Conway's Game of Life (B3/S23) engine in Rust."
 
 [features]
+# Keep defaults dependency-light for downstream consumers; enable performance
+# allocator tuning explicitly for this package's binaries/benchmarks.
 default = []
 # Opt-in global allocator for this package's binaries/benchmarks.
 mimalloc-global = ["dep:mimalloc"]
