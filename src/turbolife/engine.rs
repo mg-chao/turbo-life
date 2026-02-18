@@ -1152,6 +1152,18 @@ fn should_queue_prune<const EMIT_CHANGED: bool>(has_live: bool, changed: bool) -
     !has_live && (!EMIT_CHANGED || !changed)
 }
 
+#[cold]
+#[inline(never)]
+fn branch_hint_cold() {}
+
+#[inline(always)]
+fn unlikely(cond: bool) -> bool {
+    if cond {
+        branch_hint_cold();
+    }
+    cond
+}
+
 #[inline(always)]
 fn run_parallel_workers<F>(worker_count: usize, worker_fn: &F)
 where
@@ -1177,7 +1189,36 @@ where
         );
     }
 
-    recurse(0, worker_count, worker_fn);
+    match worker_count {
+        0 => {}
+        1 => worker_fn(0),
+        2 => {
+            rayon::join(|| worker_fn(0), || worker_fn(1));
+        }
+        4 => {
+            rayon::join(
+                || rayon::join(|| worker_fn(0), || worker_fn(1)),
+                || rayon::join(|| worker_fn(2), || worker_fn(3)),
+            );
+        }
+        8 => {
+            rayon::join(
+                || {
+                    rayon::join(
+                        || rayon::join(|| worker_fn(0), || worker_fn(1)),
+                        || rayon::join(|| worker_fn(2), || worker_fn(3)),
+                    );
+                },
+                || {
+                    rayon::join(
+                        || rayon::join(|| worker_fn(4), || worker_fn(5)),
+                        || rayon::join(|| worker_fn(6), || worker_fn(7)),
+                    );
+                },
+            );
+        }
+        _ => recurse(0, worker_count, worker_fn),
+    }
 }
 
 #[cold]
@@ -2000,7 +2041,7 @@ impl TurboLife {
                                 }
                             }
                         }
-                        if should_queue_prune::<$emit_changed>(has_live, changed) {
+                        if unlikely(should_queue_prune::<$emit_changed>(has_live, changed)) {
                             unsafe {
                                 vec_push_unchecked(&mut self.arena.prune_buf, idx);
                             }
@@ -2010,7 +2051,7 @@ impl TurboLife {
                         }
 
                         let missing = result.missing_mask;
-                        if missing != 0 {
+                        if unlikely(missing != 0) {
                             unsafe {
                                 append_expand_candidates_cold(
                                     &mut self.arena.expand_buf,
@@ -2130,7 +2171,7 @@ impl TurboLife {
                                 }
                             }
                         }
-                        if should_queue_prune::<$emit_changed>(has_live, changed) {
+                        if unlikely(should_queue_prune::<$emit_changed>(has_live, changed)) {
                             unsafe {
                                 vec_push_unchecked(&mut self.arena.prune_buf, idx);
                             }
@@ -2140,7 +2181,7 @@ impl TurboLife {
                         }
 
                         let missing = result.missing_mask;
-                        if missing != 0 {
+                        if unlikely(missing != 0) {
                             unsafe {
                                 append_expand_candidates_cold(
                                     &mut self.arena.expand_buf,
@@ -2329,7 +2370,7 @@ impl TurboLife {
                             }
                         }
                     }
-                    if should_queue_prune::<$emit_changed>(has_live, changed) {
+                    if unlikely(should_queue_prune::<$emit_changed>(has_live, changed)) {
                         unsafe {
                             vec_push_unchecked(&mut ($scratch).prune, idx);
                         }
@@ -2339,7 +2380,7 @@ impl TurboLife {
                     }
 
                     let missing = result.missing_mask;
-                    if missing != 0 {
+                    if unlikely(missing != 0) {
                         unsafe {
                             append_expand_candidates_cold(
                                 &mut ($scratch).expand,
@@ -2560,19 +2601,48 @@ impl TurboLife {
     }
 
     #[inline(always)]
-    fn step_impl(&mut self) {
+    fn step_n_impl_backend<const CORE_BACKEND: u8, const ASSUME_CHANGED_MODE: bool>(
+        &mut self,
+        mut remaining: u64,
+    ) {
+        while remaining >= 8 {
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            remaining -= 8;
+        }
+        while remaining >= 4 {
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            remaining -= 4;
+        }
+        while remaining != 0 {
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            remaining -= 1;
+        }
+    }
+
+    #[inline(always)]
+    fn step_n_impl_dispatch(&mut self, n: u64) {
         match self.backend {
             KernelBackend::Scalar => {
-                self.step_impl_backend::<{ CORE_BACKEND_SCALAR }, false>();
+                self.step_n_impl_backend::<{ CORE_BACKEND_SCALAR }, false>(n);
             }
             KernelBackend::Avx2 => {
                 #[cfg(target_arch = "x86_64")]
                 {
-                    self.step_impl_backend::<{ CORE_BACKEND_AVX2 }, false>();
+                    self.step_n_impl_backend::<{ CORE_BACKEND_AVX2 }, false>(n);
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 {
-                    self.step_impl_backend::<{ CORE_BACKEND_SCALAR }, false>();
+                    self.step_n_impl_backend::<{ CORE_BACKEND_SCALAR }, false>(n);
                 }
             }
             KernelBackend::Neon => {
@@ -2580,7 +2650,7 @@ impl TurboLife {
                 {
                     // Opt-in specialization: skip changed-list emission on high-churn
                     // workloads and rebuild from active-prune delta instead.
-                    self.step_impl_backend::<{ CORE_BACKEND_NEON }, true>();
+                    self.step_n_impl_backend::<{ CORE_BACKEND_NEON }, true>(n);
                 }
                 #[cfg(all(
                     target_arch = "aarch64",
@@ -2588,11 +2658,11 @@ impl TurboLife {
                 ))]
                 {
                     // Default policy for the primary main.rs harness.
-                    self.step_impl_backend::<{ CORE_BACKEND_NEON }, false>();
+                    self.step_n_impl_backend::<{ CORE_BACKEND_NEON }, false>(n);
                 }
                 #[cfg(not(target_arch = "aarch64"))]
                 {
-                    self.step_impl_backend::<{ CORE_BACKEND_SCALAR }, false>();
+                    self.step_n_impl_backend::<{ CORE_BACKEND_SCALAR }, false>(n);
                 }
             }
         }
@@ -2601,10 +2671,10 @@ impl TurboLife {
     pub fn step(&mut self) {
         // Split borrow: take a shared ref to the pool before mutably borrowing self.
         let pool = &self.pool as *const rayon::ThreadPool;
-        // SAFETY: `pool` is not modified during `install`, and `step_impl` only
+        // SAFETY: `pool` is not modified during `install`, and step logic only
         // mutates arena/generation/population_cache - never the pool itself.
         unsafe { &*pool }.install(|| {
-            self.step_impl();
+            self.step_n_impl_dispatch(1);
         });
     }
 
@@ -2615,21 +2685,10 @@ impl TurboLife {
 
         // Split borrow: take a shared ref to the pool before mutably borrowing self.
         let pool = &self.pool as *const rayon::ThreadPool;
-        // SAFETY: `pool` is not modified during `install`, and `step_impl` only
+        // SAFETY: `pool` is not modified during `install`, and step logic only
         // mutates arena/generation/population_cache - never the pool itself.
         unsafe { &*pool }.install(|| {
-            let mut remaining = n;
-            while remaining >= 4 {
-                self.step_impl();
-                self.step_impl();
-                self.step_impl();
-                self.step_impl();
-                remaining -= 4;
-            }
-            while remaining != 0 {
-                self.step_impl();
-                remaining -= 1;
-            }
+            self.step_n_impl_dispatch(n);
         });
     }
 
@@ -2860,17 +2919,27 @@ mod tests {
             .build()
             .expect("thread pool");
 
-        let visit_count = AtomicUsize::new(0);
-        let visited_mask = AtomicUsize::new(0);
-        pool.install(|| {
-            run_parallel_workers(8, &|worker_id| {
-                visit_count.fetch_add(1, Ordering::Relaxed);
-                visited_mask.fetch_or(1usize << worker_id, Ordering::Relaxed);
+        for worker_count in [1usize, 2, 3, 4, 5, 8, 9] {
+            let visit_count = AtomicUsize::new(0);
+            let visited_mask = AtomicUsize::new(0);
+            pool.install(|| {
+                run_parallel_workers(worker_count, &|worker_id| {
+                    visit_count.fetch_add(1, Ordering::Relaxed);
+                    visited_mask.fetch_or(1usize << worker_id, Ordering::Relaxed);
+                });
             });
-        });
 
-        assert_eq!(visit_count.load(Ordering::Relaxed), 8);
-        assert_eq!(visited_mask.load(Ordering::Relaxed), (1usize << 8) - 1);
+            assert_eq!(
+                visit_count.load(Ordering::Relaxed),
+                worker_count,
+                "worker count mismatch for {worker_count}",
+            );
+            assert_eq!(
+                visited_mask.load(Ordering::Relaxed),
+                (1usize << worker_count) - 1,
+                "visited mask mismatch for {worker_count}",
+            );
+        }
     }
 
     #[test]
