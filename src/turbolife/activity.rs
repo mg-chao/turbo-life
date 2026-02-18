@@ -55,11 +55,35 @@ impl<T> SendConstPtr<T> {
 }
 
 #[inline(always)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn vec_push_fast<T>(buf: &mut Vec<T>, value: T) {
     // Keep a safe fallback when capacity is exhausted so upstream
     // mis-estimation cannot turn into UB in release builds.
     if buf.len() == buf.capacity() {
         buf.push(value);
+        return;
+    }
+    let len = buf.len();
+    unsafe {
+        std::ptr::write(buf.as_mut_ptr().add(len), value);
+        buf.set_len(len + 1);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn vec_push_cold<T>(buf: &mut Vec<T>, value: T) {
+    buf.push(value);
+}
+
+/// # Safety
+/// Callers should reserve enough capacity for `buf` before entering hot loops.
+/// This helper keeps a cold fallback when that assumption is violated, so
+/// release builds remain memory-safe under accidental under-reservation.
+#[inline(always)]
+unsafe fn vec_push_unchecked<T>(buf: &mut Vec<T>, value: T) {
+    if buf.len() == buf.capacity() {
+        vec_push_cold(buf, value);
         return;
     }
     let len = buf.len();
@@ -275,58 +299,59 @@ pub(crate) unsafe fn append_expand_candidates_unchecked(
     debug_assert!(len.saturating_add(count) <= expand.capacity());
     unsafe {
         let write_ptr = expand.as_mut_ptr().add(len);
+        let dirs_ptr = dirs.as_ptr();
         match count {
             1 => {
-                write_ptr.add(0).write(base | dirs[0] as u32);
+                write_ptr.add(0).write(base | *dirs_ptr.add(0) as u32);
             }
             2 => {
-                write_ptr.add(0).write(base | dirs[0] as u32);
-                write_ptr.add(1).write(base | dirs[1] as u32);
+                write_ptr.add(0).write(base | *dirs_ptr.add(0) as u32);
+                write_ptr.add(1).write(base | *dirs_ptr.add(1) as u32);
             }
             3 => {
-                write_ptr.add(0).write(base | dirs[0] as u32);
-                write_ptr.add(1).write(base | dirs[1] as u32);
-                write_ptr.add(2).write(base | dirs[2] as u32);
+                write_ptr.add(0).write(base | *dirs_ptr.add(0) as u32);
+                write_ptr.add(1).write(base | *dirs_ptr.add(1) as u32);
+                write_ptr.add(2).write(base | *dirs_ptr.add(2) as u32);
             }
             4 => {
-                write_ptr.add(0).write(base | dirs[0] as u32);
-                write_ptr.add(1).write(base | dirs[1] as u32);
-                write_ptr.add(2).write(base | dirs[2] as u32);
-                write_ptr.add(3).write(base | dirs[3] as u32);
+                write_ptr.add(0).write(base | *dirs_ptr.add(0) as u32);
+                write_ptr.add(1).write(base | *dirs_ptr.add(1) as u32);
+                write_ptr.add(2).write(base | *dirs_ptr.add(2) as u32);
+                write_ptr.add(3).write(base | *dirs_ptr.add(3) as u32);
             }
             5 => {
-                write_ptr.add(0).write(base | dirs[0] as u32);
-                write_ptr.add(1).write(base | dirs[1] as u32);
-                write_ptr.add(2).write(base | dirs[2] as u32);
-                write_ptr.add(3).write(base | dirs[3] as u32);
-                write_ptr.add(4).write(base | dirs[4] as u32);
+                write_ptr.add(0).write(base | *dirs_ptr.add(0) as u32);
+                write_ptr.add(1).write(base | *dirs_ptr.add(1) as u32);
+                write_ptr.add(2).write(base | *dirs_ptr.add(2) as u32);
+                write_ptr.add(3).write(base | *dirs_ptr.add(3) as u32);
+                write_ptr.add(4).write(base | *dirs_ptr.add(4) as u32);
             }
             6 => {
-                write_ptr.add(0).write(base | dirs[0] as u32);
-                write_ptr.add(1).write(base | dirs[1] as u32);
-                write_ptr.add(2).write(base | dirs[2] as u32);
-                write_ptr.add(3).write(base | dirs[3] as u32);
-                write_ptr.add(4).write(base | dirs[4] as u32);
-                write_ptr.add(5).write(base | dirs[5] as u32);
+                write_ptr.add(0).write(base | *dirs_ptr.add(0) as u32);
+                write_ptr.add(1).write(base | *dirs_ptr.add(1) as u32);
+                write_ptr.add(2).write(base | *dirs_ptr.add(2) as u32);
+                write_ptr.add(3).write(base | *dirs_ptr.add(3) as u32);
+                write_ptr.add(4).write(base | *dirs_ptr.add(4) as u32);
+                write_ptr.add(5).write(base | *dirs_ptr.add(5) as u32);
             }
             7 => {
-                write_ptr.add(0).write(base | dirs[0] as u32);
-                write_ptr.add(1).write(base | dirs[1] as u32);
-                write_ptr.add(2).write(base | dirs[2] as u32);
-                write_ptr.add(3).write(base | dirs[3] as u32);
-                write_ptr.add(4).write(base | dirs[4] as u32);
-                write_ptr.add(5).write(base | dirs[5] as u32);
-                write_ptr.add(6).write(base | dirs[6] as u32);
+                write_ptr.add(0).write(base | *dirs_ptr.add(0) as u32);
+                write_ptr.add(1).write(base | *dirs_ptr.add(1) as u32);
+                write_ptr.add(2).write(base | *dirs_ptr.add(2) as u32);
+                write_ptr.add(3).write(base | *dirs_ptr.add(3) as u32);
+                write_ptr.add(4).write(base | *dirs_ptr.add(4) as u32);
+                write_ptr.add(5).write(base | *dirs_ptr.add(5) as u32);
+                write_ptr.add(6).write(base | *dirs_ptr.add(6) as u32);
             }
             8 => {
-                write_ptr.add(0).write(base | dirs[0] as u32);
-                write_ptr.add(1).write(base | dirs[1] as u32);
-                write_ptr.add(2).write(base | dirs[2] as u32);
-                write_ptr.add(3).write(base | dirs[3] as u32);
-                write_ptr.add(4).write(base | dirs[4] as u32);
-                write_ptr.add(5).write(base | dirs[5] as u32);
-                write_ptr.add(6).write(base | dirs[6] as u32);
-                write_ptr.add(7).write(base | dirs[7] as u32);
+                write_ptr.add(0).write(base | *dirs_ptr.add(0) as u32);
+                write_ptr.add(1).write(base | *dirs_ptr.add(1) as u32);
+                write_ptr.add(2).write(base | *dirs_ptr.add(2) as u32);
+                write_ptr.add(3).write(base | *dirs_ptr.add(3) as u32);
+                write_ptr.add(4).write(base | *dirs_ptr.add(4) as u32);
+                write_ptr.add(5).write(base | *dirs_ptr.add(5) as u32);
+                write_ptr.add(6).write(base | *dirs_ptr.add(6) as u32);
+                write_ptr.add(7).write(base | *dirs_ptr.add(7) as u32);
             }
             _ => unreachable!(),
         }
@@ -417,7 +442,9 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                         bits &= bits - 1;
                         continue;
                     }
-                    vec_push_fast(&mut arena.active_set, TileIdx(i as u32));
+                    unsafe {
+                        vec_push_unchecked(&mut arena.active_set, TileIdx(i as u32));
+                    }
                     bits &= bits - 1;
                 }
             }
@@ -430,8 +457,8 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
     arena.active_set_dense_contiguous = false;
 
     let bitmap_rebuild = should_use_bitmap_active_rebuild(arena.occupied_count, changed_count);
-    let use_bitmap_rebuild = bitmap_rebuild
-        && arena.occupied_count < ACTIVE_BITMAP_REBUILD_BYPASS_OCCUPIED_MIN;
+    let use_bitmap_rebuild =
+        bitmap_rebuild && arena.occupied_count < ACTIVE_BITMAP_REBUILD_BYPASS_OCCUPIED_MIN;
     if use_bitmap_rebuild {
         let word_len = meta_len.div_ceil(64);
         if arena.active_marks_words.len() < word_len {
@@ -532,7 +559,9 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                 let i = (word_idx << 6) + bit;
                 debug_assert!(i < meta_len);
                 debug_assert!(arena.meta[i].occupied());
-                vec_push_fast(&mut arena.active_set, TileIdx(i as u32));
+                unsafe {
+                    vec_push_unchecked(&mut arena.active_set, TileIdx(i as u32));
+                }
                 bits &= bits - 1;
             }
         }
@@ -560,7 +589,9 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
             debug_assert!(i < meta_len);
             debug_assert!(unsafe { (*meta_ptr.add(i)).occupied() });
             if unsafe { !arena.active_test_and_set_unchecked(i) } {
-                vec_push_fast(&mut arena.active_set, idx);
+                unsafe {
+                    vec_push_unchecked(&mut arena.active_set, idx);
+                }
             }
 
             unsafe {
@@ -598,28 +629,28 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                 debug_assert!(ni6_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni6_i)).occupied());
                 debug_assert!(ni7_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni7_i)).occupied());
                 if !arena.active_test_and_set_unchecked(ni0_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni0 as u32));
+                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni0 as u32));
                 }
                 if !arena.active_test_and_set_unchecked(ni1_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni1 as u32));
+                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni1 as u32));
                 }
                 if !arena.active_test_and_set_unchecked(ni2_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni2 as u32));
+                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni2 as u32));
                 }
                 if !arena.active_test_and_set_unchecked(ni3_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni3 as u32));
+                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni3 as u32));
                 }
                 if !arena.active_test_and_set_unchecked(ni4_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni4 as u32));
+                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni4 as u32));
                 }
                 if !arena.active_test_and_set_unchecked(ni5_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni5 as u32));
+                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni5 as u32));
                 }
                 if !arena.active_test_and_set_unchecked(ni6_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni6 as u32));
+                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni6 as u32));
                 }
                 if !arena.active_test_and_set_unchecked(ni7_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni7 as u32));
+                    vec_push_unchecked(&mut arena.active_set, TileIdx(ni7 as u32));
                 }
             }
         }
@@ -632,7 +663,9 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
             debug_assert!(i < meta_len);
             debug_assert!(unsafe { (*meta_ptr.add(i)).occupied() });
             if unsafe { !arena.active_test_and_set_unchecked(i) } {
-                vec_push_fast(&mut arena.active_set, idx);
+                unsafe {
+                    vec_push_unchecked(&mut arena.active_set, idx);
+                }
             }
             if influence_mask == 0 {
                 continue;
@@ -692,28 +725,28 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                         ni7_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni7_i)).occupied()
                     );
                     if !arena.active_test_and_set_unchecked(ni0_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni0 as u32));
+                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni0 as u32));
                     }
                     if !arena.active_test_and_set_unchecked(ni1_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni1 as u32));
+                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni1 as u32));
                     }
                     if !arena.active_test_and_set_unchecked(ni2_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni2 as u32));
+                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni2 as u32));
                     }
                     if !arena.active_test_and_set_unchecked(ni3_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni3 as u32));
+                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni3 as u32));
                     }
                     if !arena.active_test_and_set_unchecked(ni4_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni4 as u32));
+                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni4 as u32));
                     }
                     if !arena.active_test_and_set_unchecked(ni5_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni5 as u32));
+                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni5 as u32));
                     }
                     if !arena.active_test_and_set_unchecked(ni6_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni6 as u32));
+                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni6 as u32));
                     }
                     if !arena.active_test_and_set_unchecked(ni7_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni7 as u32));
+                        vec_push_unchecked(&mut arena.active_set, TileIdx(ni7 as u32));
                     }
                 } else {
                     let dirs = &EXPAND_MASK_TABLE.dirs[influence_mask as usize];
@@ -726,7 +759,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                             ni_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni_i)).occupied()
                         );
                         if !arena.active_test_and_set_unchecked(ni_i) {
-                            vec_push_fast(&mut arena.active_set, TileIdx(ni_raw as u32));
+                            vec_push_unchecked(&mut arena.active_set, TileIdx(ni_raw as u32));
                         }
                     }
                 }
