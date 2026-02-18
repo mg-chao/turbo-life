@@ -96,6 +96,44 @@ unsafe fn vec_push_unchecked<T>(buf: &mut Vec<T>, value: T) {
 }
 
 #[inline]
+fn rebuild_active_set_from_occupied_bits(arena: &mut TileArena) {
+    let target_len = arena.occupied_count;
+    if target_len == 0 {
+        arena.active_set.clear();
+        return;
+    }
+    debug_assert_eq!(arena.active_set.len(), 0);
+    debug_assert!(arena.active_set.capacity() >= target_len);
+
+    let meta_len = arena.meta.len();
+    let word_len = meta_len.div_ceil(64);
+    let mut word_idx = 0usize;
+    while word_idx < word_len {
+        let mut bits = arena.occupied_bits[word_idx];
+        if word_idx == 0 {
+            bits &= !1u64;
+        }
+        if word_idx + 1 == word_len {
+            let tail_bits = meta_len & 63;
+            if tail_bits != 0 {
+                bits &= (1u64 << tail_bits) - 1;
+            }
+        }
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            let idx = (word_idx << 6) + bit;
+            unsafe {
+                vec_push_unchecked(&mut arena.active_set, TileIdx(idx as u32));
+            }
+            bits &= bits - 1;
+        }
+        word_idx += 1;
+    }
+
+    debug_assert_eq!(arena.active_set.len(), target_len);
+}
+
+#[inline]
 fn prune_filter_chunk_size(candidate_len: usize, threads: usize) -> usize {
     let target_chunks = threads.saturating_mul(4).max(1);
     let size = candidate_len.div_ceil(target_chunks);
@@ -435,21 +473,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
             }
             arena.active_set_dense_contiguous = true;
         } else {
-            for (word_idx, &word) in arena.occupied_bits.iter().enumerate() {
-                let mut bits = word;
-                while bits != 0 {
-                    let bit = bits.trailing_zeros() as usize;
-                    let i = (word_idx << 6) + bit;
-                    if i == 0 || i >= arena.meta.len() {
-                        bits &= bits - 1;
-                        continue;
-                    }
-                    unsafe {
-                        vec_push_unchecked(&mut arena.active_set, TileIdx(i as u32));
-                    }
-                    bits &= bits - 1;
-                }
-            }
+            rebuild_active_set_from_occupied_bits(arena);
             arena.active_set_dense_contiguous = false;
         }
         return;
