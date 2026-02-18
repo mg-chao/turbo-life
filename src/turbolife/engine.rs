@@ -1118,17 +1118,23 @@ fn auto_pool_thread_count_for_physical(physical: usize) -> usize {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(any(all(target_arch = "aarch64", target_os = "macos"), test))]
 #[inline]
 fn auto_pool_thread_count_for_apple_hybrid(physical: usize, logical: usize) -> usize {
     let physical = physical.max(1);
     let logical = logical.max(1);
     if logical > physical {
-        // Keep one logical CPU for foreground/system work, then let the
-        // step-time scheduler clamp effective workers by frontier size and
-        // memory bandwidth. This gives higher-throughput pools on Apple
-        // hybrid chips for dense frontiers.
-        logical.saturating_sub(1).max(physical)
+        // Apple hybrid systems can regress when the pool is oversized: the
+        // extra idle workers amplify merge pressure and scratch churn without
+        // increasing useful parallelism for memory-bound frontiers.
+        // Use a modest E-core contribution (~1 worker per 3 extra logicals)
+        // and keep one logical CPU available for the system.
+        let efficiency_cores = logical.saturating_sub(physical);
+        let ecore_bonus = efficiency_cores.div_ceil(3);
+        physical
+            .saturating_add(ecore_bonus)
+            .min(logical.saturating_sub(1))
+            .max(physical)
     } else {
         auto_pool_thread_count_for_physical(physical)
     }
@@ -3008,15 +3014,18 @@ mod tests {
         assert_eq!(auto_pool_thread_count_for_physical(24), 12);
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
-    fn apple_hybrid_auto_pool_reserves_one_logical_cpu() {
+    fn apple_hybrid_auto_pool_limits_ecore_oversubscription() {
         assert_eq!(auto_pool_thread_count_for_apple_hybrid(0, 0), 1);
-        assert_eq!(auto_pool_thread_count_for_apple_hybrid(4, 8), 7);
-        assert_eq!(auto_pool_thread_count_for_apple_hybrid(4, 10), 9);
-        assert_eq!(auto_pool_thread_count_for_apple_hybrid(6, 10), 9);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(4, 5), 4);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(4, 6), 5);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(4, 7), 5);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(4, 8), 6);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(4, 10), 6);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(4, 12), 7);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(6, 10), 8);
         assert_eq!(auto_pool_thread_count_for_apple_hybrid(10, 10), 6);
-        assert_eq!(auto_pool_thread_count_for_apple_hybrid(12, 16), 15);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(12, 16), 14);
     }
 
     #[test]
