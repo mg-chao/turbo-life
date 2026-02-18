@@ -866,7 +866,6 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
             if !was_allocated {
                 continue;
             }
-            arena.meta[idx.index()].population = 0;
             arena.mark_changed_new_unique(idx);
         }
     }

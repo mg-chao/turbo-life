@@ -7,7 +7,6 @@
 //! - `BorderData`: four edge bit-planes (corner activity is derived from edge rows)
 
 pub const TILE_SIZE: usize = 64;
-pub const POPULATION_UNKNOWN: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TileIdx(pub u32);
@@ -246,7 +245,6 @@ pub const MISSING_ALL_NEIGHBORS: u8 = 0xFF;
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct TileMeta {
-    pub population: u16,
     /// Bit i = 1 means neighbor direction i is currently missing.
     /// Direction layout matches `Neighbors` / `Direction` indices.
     pub missing_mask: u8,
@@ -289,18 +287,10 @@ impl TileMeta {
     pub fn update_after_step(&mut self, changed: bool, has_live: bool) {
         self.set_has_live(has_live);
         self.set_alt_phase_dirty(changed);
-        if changed {
-            if self.population != POPULATION_UNKNOWN {
-                self.population = POPULATION_UNKNOWN;
-            }
-        } else if !has_live && self.population != 0 {
-            self.population = 0;
-        }
     }
 
     pub fn empty() -> Self {
         Self {
-            population: 0,
             missing_mask: MISSING_ALL_NEIGHBORS,
             flags: FLAG_OCCUPIED,
         }
@@ -308,7 +298,6 @@ impl TileMeta {
 
     pub fn released() -> Self {
         Self {
-            population: 0,
             missing_mask: MISSING_ALL_NEIGHBORS,
             flags: 0,
         }
@@ -392,7 +381,7 @@ mod tests {
 
     #[test]
     fn tile_meta_is_compact() {
-        assert_eq!(std::mem::size_of::<TileMeta>(), 4);
+        assert_eq!(std::mem::size_of::<TileMeta>(), 2);
     }
 
     #[test]

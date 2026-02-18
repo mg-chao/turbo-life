@@ -905,7 +905,7 @@ pub unsafe fn advance_core_neon(
 #[inline]
 #[target_feature(enable = "neon")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn advance_core_neon_raw<const ASSUME_CHANGED: bool>(
+unsafe fn advance_core_neon_raw<const ASSUME_CHANGED: bool, const FORCE_STORE: bool>(
     current: &[u64; TILE_SIZE],
     next: &mut [u64; TILE_SIZE],
     ghost_north: u64,
@@ -916,7 +916,6 @@ unsafe fn advance_core_neon_raw<const ASSUME_CHANGED: bool>(
     ghost_ne: u64,
     ghost_sw: u64,
     ghost_se: u64,
-    force_store: bool,
 ) -> (bool, BorderData, bool) {
     if ASSUME_CHANGED {
         return unsafe {
@@ -934,7 +933,7 @@ unsafe fn advance_core_neon_raw<const ASSUME_CHANGED: bool>(
             )
         };
     }
-    if force_store {
+    if FORCE_STORE {
         unsafe {
             advance_core_neon_impl_raw::<true, true>(
                 current,
@@ -1108,7 +1107,11 @@ unsafe fn advance_tile_fused_impl<
     let meta = unsafe { &mut *meta_ptr.add(idx) };
     let missing_mask = meta.missing_mask;
     let tile_has_live = meta.has_live();
-    let force_store = meta.alt_phase_dirty();
+    let force_store = if CORE_BACKEND == CORE_BACKEND_NEON {
+        true
+    } else {
+        meta.alt_phase_dirty()
+    };
     let north_i = nb[0] as usize;
     let south_i = nb[1] as usize;
     let west_i = nb[2] as usize;
@@ -1136,7 +1139,7 @@ unsafe fn advance_tile_fused_impl<
             #[cfg(target_arch = "aarch64")]
             {
                 let (changed, border, has_live) = unsafe {
-                    advance_core_neon_raw::<ASSUME_CHANGED>(
+                    advance_core_neon_raw::<ASSUME_CHANGED, true>(
                         current,
                         next,
                         ghost_north,
@@ -1147,7 +1150,6 @@ unsafe fn advance_tile_fused_impl<
                         ghost_ne as u64,
                         ghost_sw as u64,
                         ghost_se as u64,
-                        force_store,
                     )
                 };
                 (changed, border, has_live, false)
@@ -2008,7 +2010,7 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn neon_fused_no_track_skips_writes_when_alt_phase_is_clean() {
+    fn neon_fused_no_track_writes_when_alt_phase_is_clean() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
             return;
         }
@@ -2060,7 +2062,7 @@ mod tests {
         assert_eq!(next_borders_west[0], 0);
         assert_eq!(next_borders_east[0], 0);
         assert_eq!(next_live_masks[0], 0);
-        assert_eq!(next[0].0, [u64::MAX; TILE_SIZE]);
+        assert_eq!(next[0].0, current[0].0);
         assert!(!meta[0].alt_phase_dirty());
     }
 
@@ -2176,7 +2178,7 @@ mod tests {
         assert_eq!(next_borders_west[0], 0);
         assert_eq!(next_borders_east[0], 0);
         assert_eq!(next_live_masks[0], 0);
-        assert_eq!(next[0].0, [u64::MAX; TILE_SIZE]);
+        assert_eq!(next[0].0, current[0].0);
         assert!(!meta[0].alt_phase_dirty());
     }
 

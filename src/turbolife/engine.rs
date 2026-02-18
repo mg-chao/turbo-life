@@ -18,7 +18,7 @@ use super::kernel::{
 use super::kernel::{advance_tile_fused_avx2_no_track, advance_tile_fused_avx2_track};
 #[cfg(target_arch = "aarch64")]
 use super::kernel::{advance_tile_fused_neon_no_track_fast, advance_tile_fused_neon_track};
-use super::tile::{self, Direction, NO_NEIGHBOR, POPULATION_UNKNOWN, TileIdx};
+use super::tile::{self, Direction, NO_NEIGHBOR, TileIdx};
 use super::tile_cache::{
     TileCache, advance_tile_cached_scalar_no_track, advance_tile_cached_scalar_track,
 };
@@ -112,10 +112,10 @@ const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = Some(8_192);
 // Dynamic scheduler chunking target per worker.
 // Keep one chunk per worker by default to minimize cursor traffic.
 // On Apple Silicon, medium/large frontiers benefit from splitting work into
-// two chunks per worker to reduce tail effects without over-fragmenting.
+// three chunks per worker to reduce tail effects without over-fragmenting.
 const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 1;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE: usize = 2;
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE: usize = 3;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const PARALLEL_DYNAMIC_APPLE_DENSE_CHUNK_MIN_ACTIVE: usize = 2_048;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
@@ -1593,7 +1593,6 @@ impl TurboLife {
         {
             let meta = self.arena.meta_mut(idx);
             let was_dirty = meta.alt_phase_dirty();
-            meta.population = POPULATION_UNKNOWN;
             meta.set_has_live(true);
             meta.set_alt_phase_dirty(true);
             should_mark_changed = !was_dirty;
@@ -1645,7 +1644,6 @@ impl TurboLife {
         {
             let meta = self.arena.meta_mut(idx);
             let was_dirty = meta.alt_phase_dirty();
-            meta.population = POPULATION_UNKNOWN;
             meta.set_has_live(has_live_after_clear);
             meta.set_alt_phase_dirty(true);
             should_mark_changed = !was_dirty;
@@ -1721,7 +1719,6 @@ impl TurboLife {
             self.arena.set_current_border(*idx, border);
             {
                 let meta = self.arena.meta_mut(*idx);
-                meta.population = POPULATION_UNKNOWN;
                 meta.set_has_live(has_live);
                 meta.set_alt_phase_dirty(true);
             }
@@ -2644,7 +2641,7 @@ impl TurboLife {
         let mut total = 0u64;
         let occupied_bits = &self.arena.occupied_bits;
         let cell_vec = &self.arena.cell_bufs[cp];
-        let meta_vec = &mut self.arena.meta;
+        let meta_vec = &self.arena.meta;
         for (word_idx, &word) in occupied_bits.iter().enumerate() {
             let mut bits = word;
             while bits != 0 {
@@ -2654,18 +2651,8 @@ impl TurboLife {
                     bits &= bits - 1;
                     continue;
                 }
-                let meta = &mut meta_vec[i];
-                if !meta.has_live() {
-                    meta.population = 0;
-                } else {
-                    let pop = if meta.population != POPULATION_UNKNOWN {
-                        meta.population
-                    } else {
-                        let computed = tile::compute_population(&cell_vec[i].0);
-                        meta.population = computed;
-                        computed
-                    };
-                    total += pop as u64;
+                if meta_vec[i].has_live() {
+                    total += tile::compute_population(&cell_vec[i].0) as u64;
                 }
                 bits &= bits - 1;
             }
@@ -2915,10 +2902,10 @@ mod tests {
         assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 1);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 2);
-            assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 2);
-            assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 2);
-            assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 2);
+            assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 3);
+            assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 3);
+            assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 3);
+            assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 3);
         }
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         {
@@ -2949,8 +2936,8 @@ mod tests {
         assert_eq!(small, 200);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            assert_eq!(medium_balanced, 512);
-            assert_eq!(medium_high, 512);
+            assert_eq!(medium_balanced, 342);
+            assert_eq!(medium_high, 342);
         }
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         {
