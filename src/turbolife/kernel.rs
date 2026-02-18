@@ -154,6 +154,17 @@ fn neighbor_influence_mask_from_borders(
 }
 
 #[inline(always)]
+fn no_track_hint(changed: bool, prune_ready: bool) -> u8 {
+    if changed {
+        u8::MAX
+    } else if prune_ready {
+        1
+    } else {
+        0
+    }
+}
+
+#[inline(always)]
 pub(crate) fn tile_is_empty(current: &[u64; TILE_SIZE]) -> bool {
     let mut i = 0;
     while i < TILE_SIZE {
@@ -906,71 +917,6 @@ pub unsafe fn advance_core_neon(
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
-#[allow(clippy::too_many_arguments)]
-unsafe fn advance_core_neon_raw<const ASSUME_CHANGED: bool, const FORCE_STORE: bool>(
-    current: &[u64; TILE_SIZE],
-    next: &mut [u64; TILE_SIZE],
-    ghost_north: u64,
-    ghost_south: u64,
-    ghost_west: u64,
-    ghost_east: u64,
-    ghost_nw: u64,
-    ghost_ne: u64,
-    ghost_sw: u64,
-    ghost_se: u64,
-) -> (bool, BorderData, bool) {
-    if ASSUME_CHANGED {
-        return unsafe {
-            advance_core_neon_impl_raw::<false, true>(
-                current,
-                next,
-                ghost_north,
-                ghost_south,
-                ghost_west,
-                ghost_east,
-                ghost_nw,
-                ghost_ne,
-                ghost_sw,
-                ghost_se,
-            )
-        };
-    }
-    if FORCE_STORE {
-        unsafe {
-            advance_core_neon_impl_raw::<true, true>(
-                current,
-                next,
-                ghost_north,
-                ghost_south,
-                ghost_west,
-                ghost_east,
-                ghost_nw,
-                ghost_ne,
-                ghost_sw,
-                ghost_se,
-            )
-        }
-    } else {
-        unsafe {
-            advance_core_neon_impl_raw::<true, false>(
-                current,
-                next,
-                ghost_north,
-                ghost_south,
-                ghost_west,
-                ghost_east,
-                ghost_nw,
-                ghost_ne,
-                ghost_sw,
-                ghost_se,
-            )
-        }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "neon")]
 unsafe fn advance_core_neon_assume_changed(
     current: &[u64; TILE_SIZE],
     next: &mut [u64; TILE_SIZE],
@@ -1059,6 +1005,167 @@ unsafe fn advance_core_const<const CORE_BACKEND: u8, const ASSUME_CHANGED: bool>
     advance_core_scalar(current, next, ghost)
 }
 
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn advance_tile_fused_empty_tile<const TRACK_NEIGHBOR_INFLUENCE: bool>(
+    current: &[u64; TILE_SIZE],
+    next: &mut [u64; TILE_SIZE],
+    meta_slot: *mut TileMeta,
+    missing_mask: u8,
+    force_store: bool,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+    north_i: usize,
+    south_i: usize,
+    west_i: usize,
+    east_i: usize,
+    nw_i: usize,
+    ne_i: usize,
+    sw_i: usize,
+    se_i: usize,
+) -> TileAdvanceResult {
+    if missing_mask == MISSING_ALL_NEIGHBORS {
+        debug_assert!(tile_is_empty(current));
+        if force_store {
+            unsafe {
+                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+            }
+        }
+        unsafe {
+            *next_borders_north_ptr.add(idx) = 0;
+            *next_borders_south_ptr.add(idx) = 0;
+            *next_borders_west_ptr.add(idx) = 0;
+            *next_borders_east_ptr.add(idx) = 0;
+            *next_live_masks_ptr.add(idx) = 0;
+            (*meta_slot).update_after_step(false, false);
+        }
+        debug_assert!(force_store || tile_is_empty(next));
+        let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
+            0
+        } else {
+            no_track_hint(false, true)
+        };
+        return TileAdvanceResult::new(
+            false,
+            false,
+            missing_mask,
+            0,
+            neighbor_influence_mask,
+            true,
+        );
+    }
+
+    let north_live = unsafe { *live_masks_read_ptr.add(north_i) };
+    let south_live = unsafe { *live_masks_read_ptr.add(south_i) };
+    let west_live = unsafe { *live_masks_read_ptr.add(west_i) };
+    let east_live = unsafe { *live_masks_read_ptr.add(east_i) };
+    let nw_live = unsafe { *live_masks_read_ptr.add(nw_i) };
+    let ne_live = unsafe { *live_masks_read_ptr.add(ne_i) };
+    let sw_live = unsafe { *live_masks_read_ptr.add(sw_i) };
+    let se_live = unsafe { *live_masks_read_ptr.add(se_i) };
+    let ghost_empty = ((north_live & LIVE_S)
+        | (south_live & LIVE_N)
+        | (west_live & LIVE_E)
+        | (east_live & LIVE_W)
+        | (nw_live & LIVE_SE)
+        | (ne_live & LIVE_SW)
+        | (sw_live & LIVE_NE)
+        | (se_live & LIVE_NW))
+        == 0;
+
+    if ghost_empty {
+        debug_assert!(tile_is_empty(current));
+        if force_store {
+            unsafe {
+                std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
+            }
+        }
+        unsafe {
+            *next_borders_north_ptr.add(idx) = 0;
+            *next_borders_south_ptr.add(idx) = 0;
+            *next_borders_west_ptr.add(idx) = 0;
+            *next_borders_east_ptr.add(idx) = 0;
+            *next_live_masks_ptr.add(idx) = 0;
+            (*meta_slot).update_after_step(false, false);
+        }
+        debug_assert!(force_store || tile_is_empty(next));
+        let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
+            0
+        } else {
+            no_track_hint(false, false)
+        };
+        return TileAdvanceResult::new(
+            false,
+            false,
+            missing_mask,
+            0,
+            neighbor_influence_mask,
+            false,
+        );
+    }
+
+    let ghost = GhostZone {
+        north: unsafe { *borders_south_read_ptr.add(north_i) },
+        south: unsafe { *borders_north_read_ptr.add(south_i) },
+        west: unsafe { *borders_east_read_ptr.add(west_i) },
+        east: unsafe { *borders_west_read_ptr.add(east_i) },
+        nw: (nw_live & LIVE_SE) != 0,
+        ne: (ne_live & LIVE_SW) != 0,
+        sw: (sw_live & LIVE_NE) != 0,
+        se: (se_live & LIVE_NW) != 0,
+    };
+    debug_assert!(tile_is_empty(current));
+    let (changed, border, has_live) = advance_core_empty_with_clear(next, &ghost, force_store);
+    let live_mask = border.live_mask();
+
+    unsafe {
+        *next_borders_north_ptr.add(idx) = border.north;
+        *next_borders_south_ptr.add(idx) = border.south;
+        *next_borders_west_ptr.add(idx) = border.west;
+        *next_borders_east_ptr.add(idx) = border.east;
+        *next_live_masks_ptr.add(idx) = live_mask;
+    }
+
+    let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
+        if changed {
+            let prev_north = unsafe { *borders_north_read_ptr.add(idx) };
+            let prev_south = unsafe { *borders_south_read_ptr.add(idx) };
+            let prev_west = unsafe { *borders_west_read_ptr.add(idx) };
+            let prev_east = unsafe { *borders_east_read_ptr.add(idx) };
+            neighbor_influence_mask_from_borders(
+                prev_north, prev_south, prev_west, prev_east, &border,
+            )
+        } else {
+            0
+        }
+    } else {
+        no_track_hint(changed, false)
+    };
+
+    unsafe {
+        (*meta_slot).update_after_step(changed, has_live);
+    }
+
+    TileAdvanceResult::new(
+        changed,
+        has_live,
+        missing_mask,
+        live_mask,
+        neighbor_influence_mask,
+        false,
+    )
+}
+
 /// Fused ghost-gather + kernel advance using raw pointers.
 ///
 /// Eliminates the intermediate GhostZone struct by inlining the gather
@@ -1092,17 +1199,6 @@ unsafe fn advance_tile_fused_impl<
     next_live_masks_ptr: *mut u8,
     idx: usize,
 ) -> TileAdvanceResult {
-    #[inline(always)]
-    fn no_track_hint(changed: bool, prune_ready: bool) -> u8 {
-        if changed {
-            u8::MAX
-        } else if prune_ready {
-            1
-        } else {
-            0
-        }
-    }
-
     let nb = unsafe { *neighbors_ptr.add(idx) };
     let current = unsafe { &(*current_ptr.add(idx)).0 };
     let next = unsafe { &mut (*next_ptr.add(idx)).0 };
@@ -1124,7 +1220,38 @@ unsafe fn advance_tile_fused_impl<
     let sw_i = nb[6] as usize;
     let se_i = nb[7] as usize;
 
-    let (changed, border, has_live, prune_ready) = if tile_has_live {
+    if !tile_has_live {
+        return unsafe {
+            advance_tile_fused_empty_tile::<TRACK_NEIGHBOR_INFLUENCE>(
+                current,
+                next,
+                meta_slot,
+                missing_mask,
+                force_store,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+                north_i,
+                south_i,
+                west_i,
+                east_i,
+                nw_i,
+                ne_i,
+                sw_i,
+                se_i,
+            )
+        };
+    }
+
+    let (changed, border, has_live) = {
         let ghost_north = unsafe { *borders_south_read_ptr.add(north_i) };
         let ghost_south = unsafe { *borders_north_read_ptr.add(south_i) };
         let ghost_west = unsafe { *borders_east_read_ptr.add(west_i) };
@@ -1141,21 +1268,38 @@ unsafe fn advance_tile_fused_impl<
         if CORE_BACKEND == CORE_BACKEND_NEON {
             #[cfg(target_arch = "aarch64")]
             {
-                let (changed, border, has_live) = unsafe {
-                    advance_core_neon_raw::<ASSUME_CHANGED, true>(
-                        current,
-                        next,
-                        ghost_north,
-                        ghost_south,
-                        ghost_west,
-                        ghost_east,
-                        ghost_nw as u64,
-                        ghost_ne as u64,
-                        ghost_sw as u64,
-                        ghost_se as u64,
-                    )
+                let (changed, border, has_live) = if ASSUME_CHANGED {
+                    unsafe {
+                        advance_core_neon_impl_raw::<false, true>(
+                            current,
+                            next,
+                            ghost_north,
+                            ghost_south,
+                            ghost_west,
+                            ghost_east,
+                            ghost_nw as u64,
+                            ghost_ne as u64,
+                            ghost_sw as u64,
+                            ghost_se as u64,
+                        )
+                    }
+                } else {
+                    unsafe {
+                        advance_core_neon_impl_raw::<true, true>(
+                            current,
+                            next,
+                            ghost_north,
+                            ghost_south,
+                            ghost_west,
+                            ghost_east,
+                            ghost_nw as u64,
+                            ghost_ne as u64,
+                            ghost_sw as u64,
+                            ghost_se as u64,
+                        )
+                    }
                 };
-                (changed, border, has_live, false)
+                (changed, border, has_live)
             }
             #[cfg(not(target_arch = "aarch64"))]
             {
@@ -1180,104 +1324,10 @@ unsafe fn advance_tile_fused_impl<
                     force_store,
                 )
             };
-            (changed, border, has_live, false)
+            (changed, border, has_live)
         }
-    } else {
-        if missing_mask == MISSING_ALL_NEIGHBORS {
-            debug_assert!(tile_is_empty(current));
-            unsafe {
-                if force_store {
-                    std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
-                }
-                *next_borders_north_ptr.add(idx) = 0;
-                *next_borders_south_ptr.add(idx) = 0;
-                *next_borders_west_ptr.add(idx) = 0;
-                *next_borders_east_ptr.add(idx) = 0;
-                *next_live_masks_ptr.add(idx) = 0;
-            }
-            debug_assert!(force_store || tile_is_empty(next));
-            unsafe {
-                (*meta_slot).update_after_step(false, false);
-            }
-            let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
-                0
-            } else {
-                no_track_hint(false, true)
-            };
-            return TileAdvanceResult::new(
-                false,
-                false,
-                missing_mask,
-                0,
-                neighbor_influence_mask,
-                true,
-            );
-        }
-
-        let north_live = unsafe { *live_masks_read_ptr.add(north_i) };
-        let south_live = unsafe { *live_masks_read_ptr.add(south_i) };
-        let west_live = unsafe { *live_masks_read_ptr.add(west_i) };
-        let east_live = unsafe { *live_masks_read_ptr.add(east_i) };
-        let nw_live = unsafe { *live_masks_read_ptr.add(nw_i) };
-        let ne_live = unsafe { *live_masks_read_ptr.add(ne_i) };
-        let sw_live = unsafe { *live_masks_read_ptr.add(sw_i) };
-        let se_live = unsafe { *live_masks_read_ptr.add(se_i) };
-        let ghost_empty = ((north_live & LIVE_S)
-            | (south_live & LIVE_N)
-            | (west_live & LIVE_E)
-            | (east_live & LIVE_W)
-            | (nw_live & LIVE_SE)
-            | (ne_live & LIVE_SW)
-            | (sw_live & LIVE_NE)
-            | (se_live & LIVE_NW))
-            == 0;
-        if ghost_empty {
-            debug_assert!(tile_is_empty(current));
-            unsafe {
-                if force_store {
-                    std::ptr::write_bytes(next.as_mut_ptr(), 0, TILE_SIZE);
-                }
-            }
-            unsafe {
-                *next_borders_north_ptr.add(idx) = 0;
-                *next_borders_south_ptr.add(idx) = 0;
-                *next_borders_west_ptr.add(idx) = 0;
-                *next_borders_east_ptr.add(idx) = 0;
-                *next_live_masks_ptr.add(idx) = 0;
-            }
-            debug_assert!(force_store || tile_is_empty(next));
-            unsafe {
-                (*meta_slot).update_after_step(false, false);
-            }
-            let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
-                0
-            } else {
-                no_track_hint(false, false)
-            };
-            return TileAdvanceResult::new(
-                false,
-                false,
-                missing_mask,
-                0,
-                neighbor_influence_mask,
-                false,
-            );
-        }
-
-        let ghost = GhostZone {
-            north: unsafe { *borders_south_read_ptr.add(north_i) },
-            south: unsafe { *borders_north_read_ptr.add(south_i) },
-            west: unsafe { *borders_east_read_ptr.add(west_i) },
-            east: unsafe { *borders_west_read_ptr.add(east_i) },
-            nw: (nw_live & LIVE_SE) != 0,
-            ne: (ne_live & LIVE_SW) != 0,
-            sw: (sw_live & LIVE_NE) != 0,
-            se: (se_live & LIVE_NW) != 0,
-        };
-        debug_assert!(tile_is_empty(current));
-        let (changed, border, has_live) = advance_core_empty_with_clear(next, &ghost, force_store);
-        (changed, border, has_live, false)
     };
+    let prune_ready = false;
     let live_mask = border.live_mask();
 
     unsafe {
