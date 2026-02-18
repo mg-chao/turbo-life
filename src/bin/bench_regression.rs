@@ -3,6 +3,10 @@
 //! Runs multiple scenarios and reports timing. Use with `--release` for meaningful results.
 //! Compare output across commits to detect regressions.
 
+#[cfg(feature = "mimalloc-global")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use rand::RngCore;
 use rand::SeedableRng;
 use std::time::Instant;

@@ -1,3 +1,7 @@
+#[cfg(feature = "mimalloc-global")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use rand::RngCore;
 use rand::SeedableRng;
 use std::env;

@@ -1,6 +1,10 @@
 //! Micro-benchmark for TileMap operations: insert, get (hit/miss), remove, and resize.
 //! Run with: cargo run --release --bin bench_tilemap
 
+#[cfg(feature = "mimalloc-global")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::time::Instant;
 
 // We need to access the tilemap module. It's pub(crate), so we use a helper
