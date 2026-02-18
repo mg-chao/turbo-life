@@ -2691,19 +2691,11 @@ impl TurboLife {
                 }
             }
             KernelBackend::Neon => {
-                #[cfg(all(target_arch = "aarch64", feature = "aggressive-neon-assume-changed"))]
+                #[cfg(target_arch = "aarch64")]
                 {
-                    // Opt-in specialization: skip changed-list emission on high-churn
-                    // workloads and rebuild from active-prune delta instead.
+                    // AArch64 NEON defaults to assume-changed mode; rebuild the changed
+                    // set from active-prune deltas instead of emitting it directly.
                     self.step_n_impl_backend::<{ CORE_BACKEND_NEON }, true>(n);
-                }
-                #[cfg(all(
-                    target_arch = "aarch64",
-                    not(feature = "aggressive-neon-assume-changed")
-                ))]
-                {
-                    // Default policy for the primary main.rs harness.
-                    self.step_n_impl_backend::<{ CORE_BACKEND_NEON }, false>(n);
                 }
                 #[cfg(not(target_arch = "aarch64"))]
                 {

@@ -15,11 +15,6 @@ mimalloc-global = ["dep:mimalloc"]
 # Useful for machine-specific auto-tuning; disabled by default because it can
 # regress on some CPUs/workloads.
 aggressive-prefetch-aarch64 = []
-# AArch64-only: switches NEON stepping to assume-changed mode
-# (no changed-list emission; rebuild changed from active-prune delta).
-# Can improve high-churn workloads on some systems, but is not universally
-# faster, so it remains opt-in for auto-tuning.
-aggressive-neon-assume-changed = []
 
 [dependencies]
 mimalloc = { version = "0.1.43", optional = true }

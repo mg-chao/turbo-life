@@ -175,8 +175,6 @@ run_candidate "llvm-inline275" "-Ctarget-cpu=native -Cllvm-args=-inline-threshol
 
 if [[ "$HOST_TRIPLE" == aarch64-* || "$HOST_TRIPLE" == arm64-* ]]; then
     run_candidate "feat-prefetch" "" "" "aggressive-prefetch-aarch64"
-    run_candidate "feat-assume84" "" "" "aggressive-neon-assume-changed"
-    run_candidate "feat-prefetch-assume84" "" "" "aggressive-prefetch-aarch64,aggressive-neon-assume-changed"
 fi
 
 # Optional PGO over the current best non-PGO config.
