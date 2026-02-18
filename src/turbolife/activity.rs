@@ -454,8 +454,6 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
             }
         }
     }
-    arena.begin_active_rebuild_with_capacity(meta_len);
-
     let dense_rebuild = arena.occupied_count >= 4096
         && changed_count.saturating_mul(100)
             >= arena
@@ -494,6 +492,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
         return;
     }
 
+    arena.begin_active_rebuild_with_capacity(meta_len);
     arena.active_set.clear();
     arena.active_set_dense_contiguous = false;
 

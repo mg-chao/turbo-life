@@ -1557,9 +1557,39 @@ impl TurboLife {
         self.touched_bitmap[word] &= !bit;
     }
 
+    #[inline(always)]
+    fn clone_active_into_changed_fast(&mut self) {
+        let len = self.arena.active_set.len();
+        self.arena.changed_list.clear();
+        reserve_additional_capacity(&mut self.arena.changed_list, len);
+        unsafe {
+            // SAFETY:
+            // - `changed_list` has at least `len` spare capacity from reserve above.
+            // - `active_set` and `changed_list` are distinct Vec allocations, so the
+            //   copy regions do not overlap.
+            // - We immediately set_len(len) after fully initializing the destination.
+            std::ptr::copy_nonoverlapping(
+                self.arena.active_set.as_ptr(),
+                self.arena.changed_list.as_mut_ptr(),
+                len,
+            );
+            self.arena.changed_list.set_len(len);
+        }
+    }
+
     #[inline]
     fn derive_changed_from_active_minus_prune(&mut self) {
         self.arena.changed_influence.clear();
+        if self.arena.prune_buf.is_empty()
+            && self.arena.active_set_dense_contiguous
+            && self.arena.free_list.is_empty()
+            && self.arena.active_set.len() == self.arena.occupied_count
+            && self.arena.occupied_count + 1 == self.arena.meta.len()
+        {
+            self.clone_active_into_changed_fast();
+            return;
+        }
+
         std::mem::swap(&mut self.arena.changed_list, &mut self.arena.active_set);
         self.arena.active_set.clear();
         self.arena.active_set_dense_contiguous = false;
@@ -3159,6 +3189,24 @@ mod tests {
         engine.arena.prune_buf.clear();
         engine.derive_changed_from_active_minus_prune();
         assert_eq!(engine.arena.changed_list, vec![drop_b]);
+    }
+
+    #[test]
+    fn derive_changed_from_active_minus_prune_keeps_dense_active_cache_when_unpruned() {
+        let mut engine = TurboLife::new();
+        let a = engine.arena.allocate((0, 0));
+        let b = engine.arena.allocate((1, 0));
+        let c = engine.arena.allocate((2, 0));
+
+        engine.arena.active_set = vec![a, b, c];
+        engine.arena.active_set_dense_contiguous = true;
+        engine.arena.prune_buf.clear();
+
+        engine.derive_changed_from_active_minus_prune();
+
+        assert_eq!(engine.arena.changed_list, vec![a, b, c]);
+        assert_eq!(engine.arena.active_set, vec![a, b, c]);
+        assert!(engine.arena.active_set_dense_contiguous);
     }
 
     #[test]
