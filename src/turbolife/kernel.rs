@@ -4,7 +4,9 @@
 //! Border extraction is fused into the main loop.
 //! Works with split cell buffers (separate current/next vecs).
 
-use super::tile::{BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, TILE_SIZE, TileMeta};
+use super::tile::{
+    BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, NeighborIdx, TILE_SIZE, TileMeta,
+};
 const _: [(); 1] = [(); (TILE_SIZE == 64) as usize];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,7 +112,7 @@ pub(crate) fn ghost_is_empty_from_live_masks(neighbor_live_masks: [u8; 8]) -> bo
 #[inline(always)]
 pub(crate) unsafe fn ghost_is_empty_from_live_masks_ptr(
     live_masks_ptr: *const u8,
-    neighbors: &[u32; 8],
+    neighbors: &[NeighborIdx; 8],
 ) -> bool {
     // SAFETY: callers guarantee `live_masks_ptr` points to a live-mask array
     // indexed by every value in `neighbors` (including sentinel slot 0).
@@ -1085,7 +1087,7 @@ unsafe fn advance_tile_fused_impl<
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -1101,10 +1103,11 @@ unsafe fn advance_tile_fused_impl<
         }
     }
 
-    let nb = unsafe { &*neighbors_ptr.add(idx) };
+    let nb = unsafe { *neighbors_ptr.add(idx) };
     let current = unsafe { &(*current_ptr.add(idx)).0 };
     let next = unsafe { &mut (*next_ptr.add(idx)).0 };
-    let meta = unsafe { &mut *meta_ptr.add(idx) };
+    let meta_slot = unsafe { meta_ptr.add(idx) };
+    let meta = unsafe { *meta_slot };
     let missing_mask = meta.missing_mask;
     let tile_has_live = meta.has_live();
     let force_store = if CORE_BACKEND == CORE_BACKEND_NEON {
@@ -1193,7 +1196,9 @@ unsafe fn advance_tile_fused_impl<
                 *next_live_masks_ptr.add(idx) = 0;
             }
             debug_assert!(force_store || tile_is_empty(next));
-            meta.update_after_step(false, false);
+            unsafe {
+                (*meta_slot).update_after_step(false, false);
+            }
             let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
                 0
             } else {
@@ -1241,7 +1246,9 @@ unsafe fn advance_tile_fused_impl<
                 *next_live_masks_ptr.add(idx) = 0;
             }
             debug_assert!(force_store || tile_is_empty(next));
-            meta.update_after_step(false, false);
+            unsafe {
+                (*meta_slot).update_after_step(false, false);
+            }
             let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
                 0
             } else {
@@ -1297,7 +1304,9 @@ unsafe fn advance_tile_fused_impl<
         no_track_hint(changed, prune_ready)
     };
 
-    meta.update_after_step(changed, has_live);
+    unsafe {
+        (*meta_slot).update_after_step(changed, has_live);
+    }
 
     TileAdvanceResult::new(
         changed,
@@ -1323,7 +1332,7 @@ pub unsafe fn advance_tile_fused_scalar_track(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -1363,7 +1372,7 @@ pub unsafe fn advance_tile_fused_scalar_no_track(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -1404,7 +1413,7 @@ pub unsafe fn advance_tile_fused_avx2_track(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -1445,7 +1454,7 @@ pub unsafe fn advance_tile_fused_avx2_no_track(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -1486,7 +1495,7 @@ pub unsafe fn advance_tile_fused_neon_track(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -1528,7 +1537,7 @@ pub unsafe fn advance_tile_fused_neon_no_track(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -1570,7 +1579,7 @@ pub unsafe fn advance_tile_fused_neon_assume_changed_no_track(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -1611,7 +1620,7 @@ pub unsafe fn advance_tile_fused_neon_no_track_fast(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -1652,7 +1661,7 @@ pub unsafe fn advance_tile_fused_neon_assume_changed_no_track_fast(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -1722,6 +1731,7 @@ mod tests {
         advance_core_scalar, ghost_bit, ghost_is_empty, ghost_is_empty_from_live_masks,
         ghost_is_empty_from_live_masks_ptr, tile_is_empty,
     };
+    use crate::turbolife::tile::NeighborIdx;
 
     #[cfg(target_arch = "x86_64")]
     use super::advance_core_avx2;
@@ -1896,9 +1906,9 @@ mod tests {
             // Index 0 is the NO_NEIGHBOR sentinel and must stay empty.
             live_masks[0] = 0;
 
-            let mut neighbors = [0u32; 8];
+            let mut neighbors = [0 as NeighborIdx; 8];
             for ni in neighbors.iter_mut() {
-                *ni = (rng.next_u64() as usize % live_masks.len()) as u32;
+                *ni = (rng.next_u64() as usize % live_masks.len()) as NeighborIdx;
             }
 
             let from_array = ghost_is_empty_from_live_masks([
@@ -2030,7 +2040,7 @@ mod tests {
         let borders_south_read = [0u64];
         let borders_west_read = [0u64];
         let borders_east_read = [0u64];
-        let neighbors = [[0u32; 8]];
+        let neighbors = [[0 as NeighborIdx; 8]];
         let live_masks_read = [0u8];
         let mut next_live_masks = [u8::MAX];
 
@@ -2088,7 +2098,7 @@ mod tests {
         let borders_south_read = [0u64];
         let borders_west_read = [0u64];
         let borders_east_read = [0u64];
-        let neighbors = [[0u32; 8]];
+        let neighbors = [[0 as NeighborIdx; 8]];
         let live_masks_read = [0u8];
         let mut next_live_masks = [u8::MAX];
 
@@ -2146,7 +2156,7 @@ mod tests {
         let borders_south_read = [0u64];
         let borders_west_read = [0u64];
         let borders_east_read = [0u64];
-        let neighbors = [[0u32; 8]];
+        let neighbors = [[0 as NeighborIdx; 8]];
         let live_masks_read = [0u8];
         let mut next_live_masks = [u8::MAX];
 
@@ -2204,7 +2214,7 @@ mod tests {
         let borders_south_read = [0u64];
         let borders_west_read = [0u64];
         let borders_east_read = [0u64];
-        let neighbors = [[0u32; 8]];
+        let neighbors = [[0 as NeighborIdx; 8]];
         let live_masks_read = [0u8];
         let mut next_live_masks = [u8::MAX];
 
@@ -2261,7 +2271,7 @@ mod tests {
         let borders_south_read = [1u64 << 40];
         let borders_west_read = [0u64];
         let borders_east_read = [0u64];
-        let neighbors = [[0u32; 8]];
+        let neighbors = [[0 as NeighborIdx; 8]];
         let live_masks_read = [0u8];
         let mut next_live_masks_ref = [u8::MAX];
 
@@ -2358,7 +2368,7 @@ mod tests {
         let borders_south_read = [0u64];
         let borders_west_read = [0u64];
         let borders_east_read = [0u64];
-        let neighbors = [[0u32; 8]];
+        let neighbors = [[0 as NeighborIdx; 8]];
         let live_masks_read = [0u8];
         let mut next_live_masks_ref = [u8::MAX];
 

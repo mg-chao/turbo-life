@@ -7,6 +7,8 @@
 //! - `BorderData`: four edge bit-planes (corner activity is derived from edge rows)
 
 pub const TILE_SIZE: usize = 64;
+pub type NeighborIdx = u16;
+pub const MAX_NEIGHBOR_INDEX: usize = NeighborIdx::MAX as usize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TileIdx(pub u32);
@@ -85,18 +87,21 @@ impl Direction {
 ///
 /// Index 0 is reserved for the arena sentinel tile, so missing neighbors map
 /// directly to slot 0 without remapping in the hot kernel path.
-pub const NO_NEIGHBOR: u32 = 0;
+pub const NO_NEIGHBOR: NeighborIdx = 0;
 const _: [(); 1] = [(); (NO_NEIGHBOR == 0) as usize];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C, align(32))]
+#[repr(C, align(16))]
 pub struct Neighbors {
-    lanes: [u32; 8],
+    lanes: [NeighborIdx; 8],
 }
+const _: [(); std::mem::size_of::<Neighbors>()] = [(); std::mem::size_of::<[NeighborIdx; 8]>()];
+const _: [(); 1] =
+    [(); (std::mem::align_of::<Neighbors>() >= std::mem::align_of::<[NeighborIdx; 8]>()) as usize];
 
 impl Neighbors {
     #[inline(always)]
-    pub const fn new(lanes: [u32; 8]) -> Self {
+    pub const fn new(lanes: [NeighborIdx; 8]) -> Self {
         Self { lanes }
     }
 }
@@ -108,15 +113,15 @@ impl Default for Neighbors {
     }
 }
 
-impl From<[u32; 8]> for Neighbors {
+impl From<[NeighborIdx; 8]> for Neighbors {
     #[inline(always)]
-    fn from(value: [u32; 8]) -> Self {
+    fn from(value: [NeighborIdx; 8]) -> Self {
         Self::new(value)
     }
 }
 
 impl std::ops::Index<usize> for Neighbors {
-    type Output = u32;
+    type Output = NeighborIdx;
 
     #[inline(always)]
     fn index(&self, index: usize) -> &Self::Output {
@@ -132,7 +137,7 @@ impl std::ops::IndexMut<usize> for Neighbors {
 }
 
 impl std::ops::Deref for Neighbors {
-    type Target = [u32; 8];
+    type Target = [NeighborIdx; 8];
 
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
@@ -285,8 +290,8 @@ impl TileMeta {
     }
     #[inline(always)]
     pub fn update_after_step(&mut self, changed: bool, has_live: bool) {
-        self.set_has_live(has_live);
-        self.set_alt_phase_dirty(changed);
+        let step_mask = FLAG_HAS_LIVE | FLAG_ALT_PHASE_DIRTY;
+        self.flags = (self.flags & !step_mask) | ((has_live as u8) << 1) | ((changed as u8) << 2);
     }
 
     pub fn empty() -> Self {

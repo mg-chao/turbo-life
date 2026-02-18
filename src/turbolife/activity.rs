@@ -4,7 +4,7 @@ use rayon::prelude::*;
 
 use super::arena::TileArena;
 use super::kernel::ghost_is_empty_from_live_masks_ptr;
-use super::tile::{MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx, TileMeta};
+use super::tile::{MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, NeighborIdx, TileIdx, TileMeta};
 
 const PARALLEL_PRUNE_CANDIDATES_MIN: usize = 512;
 const PRUNE_FILTER_CHUNK_MIN: usize = 64;
@@ -70,7 +70,7 @@ fn prune_filter_chunk_size(candidate_len: usize, threads: usize) -> usize {
 #[inline(always)]
 unsafe fn should_prune_candidate(
     meta_ptr: *const TileMeta,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_ptr: *const u8,
     idx: usize,
 ) -> bool {
@@ -577,28 +577,28 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                 debug_assert!(ni6_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni6_i)).occupied());
                 debug_assert!(ni7_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni7_i)).occupied());
                 if !arena.active_test_and_set_unchecked(ni0_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni0));
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni0 as u32));
                 }
                 if !arena.active_test_and_set_unchecked(ni1_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni1));
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni1 as u32));
                 }
                 if !arena.active_test_and_set_unchecked(ni2_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni2));
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni2 as u32));
                 }
                 if !arena.active_test_and_set_unchecked(ni3_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni3));
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni3 as u32));
                 }
                 if !arena.active_test_and_set_unchecked(ni4_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni4));
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni4 as u32));
                 }
                 if !arena.active_test_and_set_unchecked(ni5_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni5));
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni5 as u32));
                 }
                 if !arena.active_test_and_set_unchecked(ni6_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni6));
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni6 as u32));
                 }
                 if !arena.active_test_and_set_unchecked(ni7_i) {
-                    vec_push_fast(&mut arena.active_set, TileIdx(ni7));
+                    vec_push_fast(&mut arena.active_set, TileIdx(ni7 as u32));
                 }
             }
         }
@@ -671,28 +671,28 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                         ni7_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni7_i)).occupied()
                     );
                     if !arena.active_test_and_set_unchecked(ni0_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni0));
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni0 as u32));
                     }
                     if !arena.active_test_and_set_unchecked(ni1_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni1));
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni1 as u32));
                     }
                     if !arena.active_test_and_set_unchecked(ni2_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni2));
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni2 as u32));
                     }
                     if !arena.active_test_and_set_unchecked(ni3_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni3));
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni3 as u32));
                     }
                     if !arena.active_test_and_set_unchecked(ni4_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni4));
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni4 as u32));
                     }
                     if !arena.active_test_and_set_unchecked(ni5_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni5));
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni5 as u32));
                     }
                     if !arena.active_test_and_set_unchecked(ni6_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni6));
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni6 as u32));
                     }
                     if !arena.active_test_and_set_unchecked(ni7_i) {
-                        vec_push_fast(&mut arena.active_set, TileIdx(ni7));
+                        vec_push_fast(&mut arena.active_set, TileIdx(ni7 as u32));
                     }
                 } else {
                     let dirs = &EXPAND_MASK_TABLE.dirs[influence_mask as usize];
@@ -705,7 +705,7 @@ pub fn rebuild_active_set(arena: &mut TileArena) {
                             ni_i == NO_NEIGHBOR as usize || (*meta_ptr.add(ni_i)).occupied()
                         );
                         if !arena.active_test_and_set_unchecked(ni_i) {
-                            vec_push_fast(&mut arena.active_set, TileIdx(ni_raw));
+                            vec_push_fast(&mut arena.active_set, TileIdx(ni_raw as u32));
                         }
                     }
                 }
@@ -764,7 +764,8 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
             if run_parallel {
                 let candidate_chunk_size = prune_filter_chunk_size(prune_len, thread_count);
                 let meta_ptr = SendConstPtr::new(arena.meta.as_ptr());
-                let neighbors_ptr = SendConstPtr::new(arena.neighbors.as_ptr().cast::<[u32; 8]>());
+                let neighbors_ptr =
+                    SendConstPtr::new(arena.neighbors.as_ptr().cast::<[NeighborIdx; 8]>());
                 let live_masks_ptr = SendConstPtr::new(live_masks_ptr);
                 if prune_len >= PARALLEL_PRUNE_BITMAP_MIN {
                     let words_len = prune_len.div_ceil(64);
@@ -837,7 +838,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                 }
             } else {
                 let meta_ptr = arena.meta.as_ptr();
-                let neighbors_ptr = arena.neighbors.as_ptr().cast::<[u32; 8]>();
+                let neighbors_ptr = arena.neighbors.as_ptr().cast::<[NeighborIdx; 8]>();
                 for i in 0..prune_len {
                     let idx = arena.prune_buf[i];
                     let ii = idx.index();
@@ -1036,7 +1037,7 @@ mod tests {
             expected.insert(idx.0);
             for &ni in arena.neighbors[idx.index()].iter() {
                 if ni != NO_NEIGHBOR {
-                    expected.insert(ni);
+                    expected.insert(ni as u32);
                 }
             }
         }

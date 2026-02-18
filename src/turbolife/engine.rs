@@ -18,7 +18,7 @@ use super::kernel::{
 use super::kernel::{advance_tile_fused_avx2_no_track, advance_tile_fused_avx2_track};
 #[cfg(target_arch = "aarch64")]
 use super::kernel::{advance_tile_fused_neon_no_track_fast, advance_tile_fused_neon_track};
-use super::tile::{self, Direction, NO_NEIGHBOR, TileIdx};
+use super::tile::{self, Direction, NO_NEIGHBOR, NeighborIdx, TileIdx};
 use super::tile_cache::{
     TileCache, advance_tile_cached_scalar_no_track, advance_tile_cached_scalar_track,
 };
@@ -196,7 +196,7 @@ unsafe fn prefetch_l2_write<T>(ptr: *const T) {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn prefetch_neighbor_border_lines(
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     borders_north_read_ptr: *const u64,
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
@@ -256,7 +256,7 @@ unsafe fn advance_tile_fused_scalar_backend<const TRACK_NEIGHBOR_INFLUENCE: bool
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -319,7 +319,7 @@ unsafe fn advance_tile_fused_avx2_backend<const TRACK_NEIGHBOR_INFLUENCE: bool>(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -382,7 +382,7 @@ unsafe fn advance_tile_fused_avx2_backend<const TRACK_NEIGHBOR_INFLUENCE: bool>(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -426,7 +426,7 @@ unsafe fn advance_tile_fused_neon_backend<
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -516,7 +516,7 @@ unsafe fn advance_tile_fused_neon_backend<
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -560,7 +560,7 @@ unsafe fn advance_tile_cached_scalar_backend<const TRACK_NEIGHBOR_INFLUENCE: boo
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -626,7 +626,7 @@ unsafe fn advance_tile_cached_avx2_backend<const TRACK_NEIGHBOR_INFLUENCE: bool>
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -692,7 +692,7 @@ unsafe fn advance_tile_cached_avx2_backend<const TRACK_NEIGHBOR_INFLUENCE: bool>
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -723,7 +723,7 @@ unsafe fn advance_tile_cached_avx2_backend<const TRACK_NEIGHBOR_INFLUENCE: bool>
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn prefetch_neighbor_border_lines(
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     borders_north_read_ptr: *const u64,
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
@@ -1872,7 +1872,7 @@ impl TurboLife {
             reserve_additional_capacity(&mut self.arena.expand_buf, active_len.saturating_mul(8));
 
             // Serial path: cached kernel with multi-level prefetching.
-            let neighbors_ptr = self.arena.neighbors.as_ptr().cast::<[u32; 8]>();
+            let neighbors_ptr = self.arena.neighbors.as_ptr().cast::<[NeighborIdx; 8]>();
             let borders_north_read_ptr = borders_read.north_ptr();
             let borders_south_read_ptr = borders_read.south_ptr();
             let borders_west_read_ptr = borders_read.west_ptr();
@@ -2181,7 +2181,8 @@ impl TurboLife {
             let current_ptr = SendConstPtr::new(current_vec.as_ptr());
             let next_ptr = SendPtr::new(next_vec.as_mut_ptr());
             let meta_ptr = SendPtr::new(self.arena.meta.as_mut_ptr());
-            let neighbors_ptr = SendConstPtr::new(self.arena.neighbors.as_ptr().cast::<[u32; 8]>());
+            let neighbors_ptr =
+                SendConstPtr::new(self.arena.neighbors.as_ptr().cast::<[NeighborIdx; 8]>());
             let next_borders_north_ptr = SendPtr::new(next_borders_vec.north_mut_ptr());
             let next_borders_south_ptr = SendPtr::new(next_borders_vec.south_mut_ptr());
             let next_borders_west_ptr = SendPtr::new(next_borders_vec.west_mut_ptr());

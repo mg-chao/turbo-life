@@ -6,7 +6,8 @@
 //! can use unconditional loads — NO_NEIGHBOR maps to the sentinel.
 
 use super::tile::{
-    BorderData, CellBuf, EMPTY_NEIGHBORS, NO_NEIGHBOR, Neighbors, TILE_SIZE, TileIdx, TileMeta,
+    BorderData, CellBuf, EMPTY_NEIGHBORS, MAX_NEIGHBOR_INDEX, NO_NEIGHBOR, NeighborIdx, Neighbors,
+    TILE_SIZE, TileIdx, TileMeta,
 };
 use super::tilemap::{TileMap, tile_hash};
 
@@ -60,6 +61,16 @@ const fn build_expand_neighbor_hints() -> [[i8; 8]; 8] {
 }
 
 const EXPAND_NEIGHBOR_HINTS: [[i8; 8]; 8] = build_expand_neighbor_hints();
+
+#[inline(always)]
+fn encode_neighbor_idx(idx: TileIdx) -> NeighborIdx {
+    NeighborIdx::try_from(idx.0).expect("tile index exceeds NeighborIdx capacity")
+}
+
+#[inline(always)]
+fn encode_neighbor_usize(idx: usize) -> NeighborIdx {
+    NeighborIdx::try_from(idx).expect("tile index exceeds NeighborIdx capacity")
+}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -744,7 +755,14 @@ impl TileArena {
             recycled
         } else {
             self.ensure_growth_capacity();
-            let idx = TileIdx(self.cell_bufs[0].len() as u32);
+            let next_index = self.cell_bufs[0].len();
+            assert!(
+                next_index <= MAX_NEIGHBOR_INDEX,
+                "TurboLife neighbor index overflow: {} exceeds {}",
+                next_index,
+                MAX_NEIGHBOR_INDEX
+            );
+            let idx = TileIdx(next_index as u32);
             self.cell_bufs[0].push(CellBuf::empty());
             self.cell_bufs[1].push(CellBuf::empty());
             self.meta.push(TileMeta::empty());
@@ -769,9 +787,11 @@ impl TileArena {
         neighbor_i: usize,
     ) {
         let reverse_dir = DIR_REVERSE[dir_idx];
+        let tile_raw = encode_neighbor_usize(tile_i);
+        let neighbor_raw = encode_neighbor_usize(neighbor_i);
         unsafe {
-            (&mut *neighbors_ptr.add(tile_i))[dir_idx] = neighbor_i as u32;
-            (&mut *neighbors_ptr.add(neighbor_i))[reverse_dir] = tile_i as u32;
+            (&mut *neighbors_ptr.add(tile_i))[dir_idx] = neighbor_raw;
+            (&mut *neighbors_ptr.add(neighbor_i))[reverse_dir] = tile_raw;
             (*meta_ptr.add(tile_i)).missing_mask &= !(1u8 << dir_idx);
             (*meta_ptr.add(neighbor_i)).missing_mask &= !(1u8 << reverse_dir);
         }
@@ -820,7 +840,7 @@ impl TileArena {
         let src_i = src.index();
         let existing_neighbor = self.neighbors[src_i][dir_idx];
         if existing_neighbor != NO_NEIGHBOR {
-            return (TileIdx(existing_neighbor), false);
+            return (TileIdx(existing_neighbor as u32), false);
         }
 
         let (sx, sy) = self.coords[src_i];
@@ -884,7 +904,7 @@ impl TileArena {
                         } else {
                             let neighbor_hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
                             self.idx_at_cached_hashed(neighbor_coord, neighbor_hash)
-                                .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
+                                .map_or(NO_NEIGHBOR, encode_neighbor_idx)
                         }
                     }
                     #[cfg(not(any(test, debug_assertions)))]
@@ -898,7 +918,7 @@ impl TileArena {
                         let neighbor_coord = (coord.0 + ndx, coord.1 + ndy);
                         let neighbor_hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
                         self.idx_at_cached_hashed(neighbor_coord, neighbor_hash)
-                            .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
+                            .map_or(NO_NEIGHBOR, encode_neighbor_idx)
                     }
                     #[cfg(not(any(test, debug_assertions)))]
                     {
@@ -912,7 +932,7 @@ impl TileArena {
                 let neighbor_coord = (coord.0 + ndx, coord.1 + ndy);
                 let neighbor_hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
                 self.idx_at_cached_hashed(neighbor_coord, neighbor_hash)
-                    .map_or(NO_NEIGHBOR, |neighbor_idx| neighbor_idx.0)
+                    .map_or(NO_NEIGHBOR, encode_neighbor_idx)
             };
 
             if neighbor_raw == NO_NEIGHBOR {
@@ -996,7 +1016,7 @@ impl TileArena {
 #[cfg(test)]
 mod tests {
     use super::{CHANGED_INFLUENCE_ALL, TileArena};
-    use crate::turbolife::tile::{BorderData, NO_NEIGHBOR};
+    use crate::turbolife::tile::{BorderData, NO_NEIGHBOR, NeighborIdx};
 
     #[test]
     fn mark_changed_dedupes_after_kernel_queue_becomes_unsynced() {
@@ -1204,13 +1224,13 @@ mod tests {
         let west_i = west.index();
         arena.neighbors[src_i][2] = NO_NEIGHBOR;
         arena.meta[src_i].missing_mask |= 1u8 << 2;
-        assert_eq!(arena.neighbors[west_i][3], src.0);
+        assert_eq!(arena.neighbors[west_i][3] as u32, src.0);
 
         let (north, allocated) = arena.allocate_absent_neighbor_from(src, 0);
         assert!(allocated);
         assert_eq!(arena.coords[north.index()], (0, 1));
-        assert_eq!(arena.neighbors[north.index()][6], west.0);
-        assert_eq!(arena.neighbors[west_i][5], north.0);
+        assert_eq!(arena.neighbors[north.index()][6] as u32, west.0);
+        assert_eq!(arena.neighbors[west_i][5] as u32, north.0);
     }
 
     #[test]
@@ -1221,14 +1241,14 @@ mod tests {
         let wrong = arena.allocate((42, 42));
 
         let src_i = src.index();
-        arena.neighbors[src_i][2] = wrong.0;
+        arena.neighbors[src_i][2] = wrong.0 as NeighborIdx;
         arena.meta[src_i].missing_mask &= !(1u8 << 2);
 
         let (north, allocated) = arena.allocate_absent_neighbor_from(src, 0);
         assert!(allocated);
         assert_eq!(arena.coords[north.index()], (0, 1));
-        assert_eq!(arena.neighbors[north.index()][6], west.0);
-        assert_eq!(arena.neighbors[west.index()][5], north.0);
+        assert_eq!(arena.neighbors[north.index()][6] as u32, west.0);
+        assert_eq!(arena.neighbors[west.index()][5] as u32, north.0);
         assert_eq!(arena.neighbors[wrong.index()][5], NO_NEIGHBOR);
     }
 }

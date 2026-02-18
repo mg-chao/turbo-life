@@ -2,7 +2,7 @@ use super::kernel::TileAdvanceResult;
 use super::kernel::{
     advance_core_empty_with_clear, ghost_is_empty_from_live_masks_ptr, tile_is_empty,
 };
-use super::tile::{BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, TILE_SIZE};
+use super::tile::{BorderData, CellBuf, GhostZone, MISSING_ALL_NEIGHBORS, NeighborIdx, TILE_SIZE};
 
 const CACHE_SIZE: usize = 1 << 12;
 const CACHE_MASK: usize = CACHE_SIZE - 1;
@@ -265,7 +265,7 @@ unsafe fn advance_tile_cached_impl<const USE_AVX2: bool, const TRACK_NEIGHBOR_IN
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -562,7 +562,7 @@ pub unsafe fn advance_tile_cached_scalar_track(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -606,7 +606,7 @@ pub unsafe fn advance_tile_cached_scalar_no_track(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -651,7 +651,7 @@ pub unsafe fn advance_tile_cached_avx2_track(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
@@ -696,7 +696,7 @@ pub unsafe fn advance_tile_cached_avx2_no_track(
     borders_south_read_ptr: *const u64,
     borders_west_read_ptr: *const u64,
     borders_east_read_ptr: *const u64,
-    neighbors_ptr: *const [u32; 8],
+    neighbors_ptr: *const [NeighborIdx; 8],
     live_masks_read_ptr: *const u8,
     next_live_masks_ptr: *mut u8,
     idx: usize,
