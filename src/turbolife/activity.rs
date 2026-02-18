@@ -17,7 +17,9 @@ const ACTIVE_BITMAP_REBUILD_MIN_OCCUPIED: usize = 2_048;
 const ACTIVE_BITMAP_REBUILD_MAX_OCCUPIED: usize = 8_192;
 const ACTIVE_BITMAP_REBUILD_MIN_CHANGED: usize = 1_024;
 const ACTIVE_BITMAP_REBUILD_DENSE_CHANGED_PCT: usize = 30;
-const DENSE_REBUILD_CHANGED_PCT: usize = 90;
+// Once churn reaches this threshold, scanning all occupied tiles is typically
+// cheaper than maintaining per-change neighbor expansion state.
+const DENSE_REBUILD_CHANGED_PCT: usize = 80;
 const CHANGED_BITMAP_FULL_CLEAR_THRESHOLD_WORD_FACTOR: usize = 8;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const ACTIVE_BITMAP_REBUILD_BYPASS_OCCUPIED_MIN: usize = 4_096;
@@ -935,9 +937,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        PARALLEL_PRUNE_BITMAP_MIN, PARALLEL_PRUNE_CANDIDATES_MIN, TileArena, active_set_is_sorted,
-        finalize_prune_and_expand, rebuild_active_set, should_use_bitmap_active_rebuild,
-        vec_push_fast,
+        DENSE_REBUILD_CHANGED_PCT, PARALLEL_PRUNE_BITMAP_MIN, PARALLEL_PRUNE_CANDIDATES_MIN,
+        TileArena, active_set_is_sorted, finalize_prune_and_expand, rebuild_active_set,
+        should_use_bitmap_active_rebuild, vec_push_fast,
     };
     use crate::turbolife::tile::{MISSING_ALL_NEIGHBORS, NO_NEIGHBOR, TileIdx};
 
@@ -1066,6 +1068,40 @@ mod tests {
         for (i, idx) in arena.active_set.iter().enumerate() {
             assert_eq!(idx.0, (i + 1) as u32);
         }
+    }
+
+    #[test]
+    fn dense_rebuild_gate_switches_at_configured_threshold() {
+        let mut arena = TileArena::new();
+        let tile_count = 4_096usize;
+        let dense_threshold = tile_count
+            .saturating_mul(DENSE_REBUILD_CHANGED_PCT)
+            .div_ceil(100);
+        let mut tiles = Vec::with_capacity(tile_count);
+
+        for x in 0..tile_count {
+            tiles.push(arena.allocate((x as i64, 0)));
+        }
+
+        for &idx in tiles.iter().take(dense_threshold - 1) {
+            arena.mark_changed_with_influence(idx, 0);
+        }
+        rebuild_active_set(&mut arena);
+        assert_eq!(arena.active_set.len(), dense_threshold - 1);
+        assert!(!arena.active_set_dense_contiguous);
+
+        for &idx in tiles.iter().take(dense_threshold) {
+            arena.mark_changed_with_influence(idx, 0);
+        }
+        rebuild_active_set(&mut arena);
+
+        assert_eq!(arena.active_set.len(), tile_count);
+        assert!(arena.active_set_dense_contiguous);
+        assert_eq!(arena.active_set.first().map(|idx| idx.0), Some(1));
+        assert_eq!(
+            arena.active_set.last().map(|idx| idx.0),
+            Some(tile_count as u32)
+        );
     }
 
     #[test]
