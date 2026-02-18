@@ -1122,12 +1122,14 @@ fn auto_pool_thread_count_for_physical(physical: usize) -> usize {
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 #[inline]
 fn auto_pool_thread_count_for_apple_hybrid(physical: usize, logical: usize) -> usize {
+    let physical = physical.max(1);
     let logical = logical.max(1);
     if logical > physical {
-        // Blend perf-core-aware sizing with efficiency cores while still
-        // respecting the existing bandwidth-oriented sizing curve.
-        let blended = logical.saturating_sub(1).max(physical);
-        auto_pool_thread_count_for_physical(blended)
+        // Keep one logical CPU for foreground/system work, then let the
+        // step-time scheduler clamp effective workers by frontier size and
+        // memory bandwidth. This gives higher-throughput pools on Apple
+        // hybrid chips for dense frontiers.
+        logical.saturating_sub(1).max(physical)
     } else {
         auto_pool_thread_count_for_physical(physical)
     }
@@ -2853,14 +2855,14 @@ mod tests {
 
     use rand::{Rng, SeedableRng};
 
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    use super::auto_pool_thread_count_for_apple_hybrid;
     use super::{
         KernelBackend, PARALLEL_KERNEL_MIN_ACTIVE, TILE_SIZE_I64, TurboLife, TurboLifeConfig,
         auto_pool_thread_count, auto_pool_thread_count_for_physical, churn_at_most_percent,
         churn_below_percent, dynamic_parallel_chunk_size, dynamic_target_chunks_per_worker,
         macos_perf_only_enabled, memory_parallel_cap, parse_env_bool, run_parallel_workers,
     };
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    use super::auto_pool_thread_count_for_apple_hybrid;
 
     const PARALLEL_TEST_TILE_GRID: i64 = 12;
     const PARALLEL_TEST_CELLS_PER_TILE: usize = 16;
@@ -3037,12 +3039,13 @@ mod tests {
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
-    fn apple_hybrid_auto_pool_blend_respects_bandwidth_curve() {
+    fn apple_hybrid_auto_pool_reserves_one_logical_cpu() {
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(0, 0), 1);
         assert_eq!(auto_pool_thread_count_for_apple_hybrid(4, 8), 7);
-        assert_eq!(auto_pool_thread_count_for_apple_hybrid(4, 10), 6);
-        assert_eq!(auto_pool_thread_count_for_apple_hybrid(6, 10), 6);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(4, 10), 9);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(6, 10), 9);
         assert_eq!(auto_pool_thread_count_for_apple_hybrid(10, 10), 6);
-        assert_eq!(auto_pool_thread_count_for_apple_hybrid(12, 16), 8);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(12, 16), 15);
     }
 
     #[test]
