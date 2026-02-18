@@ -1119,6 +1119,29 @@ fn auto_pool_thread_count_for_physical(physical: usize) -> usize {
     }
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline]
+fn auto_pool_thread_count_for_apple_hybrid(physical: usize, logical: usize) -> usize {
+    let logical = logical.max(1);
+    if logical > physical {
+        // Blend perf-core-aware sizing with efficiency cores while still
+        // respecting the existing bandwidth-oriented sizing curve.
+        let blended = logical.saturating_sub(1).max(physical);
+        auto_pool_thread_count_for_physical(blended)
+    } else {
+        auto_pool_thread_count_for_physical(physical)
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline]
+fn auto_pool_thread_count() -> usize {
+    let physical = physical_core_count();
+    let logical = num_cpus::get().max(1);
+    auto_pool_thread_count_for_apple_hybrid(physical, logical)
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 #[inline]
 fn auto_pool_thread_count() -> usize {
     auto_pool_thread_count_for_physical(physical_core_count())
@@ -2832,10 +2855,12 @@ mod tests {
 
     use super::{
         KernelBackend, PARALLEL_KERNEL_MIN_ACTIVE, TILE_SIZE_I64, TurboLife, TurboLifeConfig,
-        auto_pool_thread_count_for_physical, churn_at_most_percent, churn_below_percent,
-        dynamic_parallel_chunk_size, dynamic_target_chunks_per_worker, macos_perf_only_enabled,
-        memory_parallel_cap, parse_env_bool, physical_core_count, run_parallel_workers,
+        auto_pool_thread_count, auto_pool_thread_count_for_physical, churn_at_most_percent,
+        churn_below_percent, dynamic_parallel_chunk_size, dynamic_target_chunks_per_worker,
+        macos_perf_only_enabled, memory_parallel_cap, parse_env_bool, run_parallel_workers,
     };
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    use super::auto_pool_thread_count_for_apple_hybrid;
 
     const PARALLEL_TEST_TILE_GRID: i64 = 12;
     const PARALLEL_TEST_CELLS_PER_TILE: usize = 16;
@@ -3010,6 +3035,16 @@ mod tests {
         assert_eq!(auto_pool_thread_count_for_physical(24), 12);
     }
 
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn apple_hybrid_auto_pool_blend_respects_bandwidth_curve() {
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(4, 8), 7);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(4, 10), 6);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(6, 10), 6);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(10, 10), 6);
+        assert_eq!(auto_pool_thread_count_for_apple_hybrid(12, 16), 8);
+    }
+
     #[test]
     fn dynamic_chunk_targets_follow_platform_frontier_policy() {
         assert_eq!(dynamic_target_chunks_per_worker(1, 1), 1);
@@ -3141,7 +3176,7 @@ mod tests {
     #[test]
     fn default_pool_uses_auto_thread_count() {
         let engine = TurboLife::new();
-        let expected = auto_pool_thread_count_for_physical(physical_core_count());
+        let expected = auto_pool_thread_count();
         assert_eq!(engine.pool.current_num_threads(), expected);
     }
 
