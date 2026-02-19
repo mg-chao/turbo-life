@@ -1159,10 +1159,11 @@ unsafe fn advance_tile_fused_empty_tile<const TRACK_NEIGHBOR_INFLUENCE: bool>(
             (*meta_slot).update_after_step(false, false);
         }
         debug_assert!(force_store || tile_is_empty(next));
+        let prune_ready = false;
         let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
             0
         } else {
-            no_track_hint(false, false)
+            no_track_hint(false, prune_ready)
         };
         return TileAdvanceResult::new(
             false,
@@ -1170,7 +1171,7 @@ unsafe fn advance_tile_fused_empty_tile<const TRACK_NEIGHBOR_INFLUENCE: bool>(
             missing_mask,
             0,
             neighbor_influence_mask,
-            false,
+            prune_ready,
         );
     }
 
@@ -1383,7 +1384,7 @@ unsafe fn advance_tile_fused_impl<
             (changed, border, has_live)
         }
     };
-    let prune_ready = false;
+    let prune_ready = !has_live && missing_mask == MISSING_ALL_NEIGHBORS;
     let live_mask = border.live_mask();
 
     unsafe {
@@ -1834,10 +1835,10 @@ pub unsafe fn advance_tile_split(
 mod tests {
     use super::{
         BorderData, CellBuf, GhostZone, TILE_SIZE, TileMeta, advance_core_empty,
-        advance_core_scalar, ghost_bit, ghost_is_empty, ghost_is_empty_from_live_masks,
-        ghost_is_empty_from_live_masks_ptr, tile_is_empty,
+        advance_core_scalar, advance_tile_fused_scalar_no_track, ghost_bit, ghost_is_empty,
+        ghost_is_empty_from_live_masks, ghost_is_empty_from_live_masks_ptr, tile_is_empty,
     };
-    use crate::turbolife::tile::NeighborIdx;
+    use crate::turbolife::tile::{MISSING_ALL_NEIGHBORS, NeighborIdx};
 
     #[cfg(target_arch = "x86_64")]
     use super::advance_core_avx2;
@@ -1904,6 +1905,236 @@ mod tests {
         assert_eq!(border.west, 0);
         assert_eq!(border.east, 0);
         assert_eq!(border.live_mask(), 0);
+    }
+
+    #[test]
+    fn scalar_fused_no_track_empty_ghost_requires_prune_verification() {
+        let current = [CellBuf::empty(), CellBuf::empty()];
+        let mut next = [CellBuf::empty(), CellBuf::empty()];
+        let mut meta = [TileMeta::empty(), TileMeta::empty()];
+        meta[0].missing_mask = 0;
+        meta[0].set_has_live(false);
+        meta[0].set_alt_phase_dirty(false);
+        meta[1].set_has_live(false);
+        meta[1].set_alt_phase_dirty(false);
+
+        let mut next_borders_north = [u64::MAX; 2];
+        let mut next_borders_south = [u64::MAX; 2];
+        let mut next_borders_west = [u64::MAX; 2];
+        let mut next_borders_east = [u64::MAX; 2];
+        let borders_north_read = [0u64; 2];
+        let borders_south_read = [0u64; 2];
+        let borders_west_read = [0u64; 2];
+        let borders_east_read = [0u64; 2];
+        let neighbors = [[0 as NeighborIdx; 8], [0 as NeighborIdx; 8]];
+        let live_masks_read = [0u8; 2];
+        let mut next_live_masks = [u8::MAX; 2];
+
+        let result = unsafe {
+            advance_tile_fused_scalar_no_track(
+                current.as_ptr(),
+                next.as_mut_ptr(),
+                meta.as_mut_ptr(),
+                next_borders_north.as_mut_ptr(),
+                next_borders_south.as_mut_ptr(),
+                next_borders_west.as_mut_ptr(),
+                next_borders_east.as_mut_ptr(),
+                borders_north_read.as_ptr(),
+                borders_south_read.as_ptr(),
+                borders_west_read.as_ptr(),
+                borders_east_read.as_ptr(),
+                neighbors.as_ptr(),
+                live_masks_read.as_ptr(),
+                next_live_masks.as_mut_ptr(),
+                0,
+            )
+        };
+
+        assert!(!result.changed);
+        assert!(!result.has_live);
+        assert!(!result.prune_ready);
+        assert_eq!(next_live_masks[0], 0);
+    }
+
+    #[test]
+    fn scalar_fused_no_track_dying_tile_with_empty_ghost_requires_prune_verification() {
+        let mut current = [CellBuf::empty(), CellBuf::empty()];
+        current[0].0[7] = 1u64 << 13;
+        let mut next = [CellBuf::empty(), CellBuf::empty()];
+        let mut meta = [TileMeta::empty(), TileMeta::empty()];
+        meta[0].missing_mask = 0;
+        meta[0].set_has_live(true);
+        meta[0].set_alt_phase_dirty(false);
+        meta[1].set_has_live(false);
+        meta[1].set_alt_phase_dirty(false);
+
+        let mut next_borders_north = [u64::MAX; 2];
+        let mut next_borders_south = [u64::MAX; 2];
+        let mut next_borders_west = [u64::MAX; 2];
+        let mut next_borders_east = [u64::MAX; 2];
+        let borders_north_read = [0u64; 2];
+        let borders_south_read = [0u64; 2];
+        let borders_west_read = [0u64; 2];
+        let borders_east_read = [0u64; 2];
+        let neighbors = [[0 as NeighborIdx; 8], [0 as NeighborIdx; 8]];
+        let live_masks_read = [0u8; 2];
+        let mut next_live_masks = [u8::MAX; 2];
+
+        let result = unsafe {
+            advance_tile_fused_scalar_no_track(
+                current.as_ptr(),
+                next.as_mut_ptr(),
+                meta.as_mut_ptr(),
+                next_borders_north.as_mut_ptr(),
+                next_borders_south.as_mut_ptr(),
+                next_borders_west.as_mut_ptr(),
+                next_borders_east.as_mut_ptr(),
+                borders_north_read.as_ptr(),
+                borders_south_read.as_ptr(),
+                borders_west_read.as_ptr(),
+                borders_east_read.as_ptr(),
+                neighbors.as_ptr(),
+                live_masks_read.as_ptr(),
+                next_live_masks.as_mut_ptr(),
+                0,
+            )
+        };
+
+        assert!(result.changed);
+        assert!(!result.has_live);
+        assert!(!result.prune_ready);
+    }
+
+    #[test]
+    fn scalar_fused_no_track_isolated_dying_tile_sets_prune_ready() {
+        let mut current = [CellBuf::empty(), CellBuf::empty()];
+        current[0].0[7] = 1u64 << 13;
+        let mut next = [CellBuf::empty(), CellBuf::empty()];
+        let mut meta = [TileMeta::empty(), TileMeta::empty()];
+        meta[0].missing_mask = MISSING_ALL_NEIGHBORS;
+        meta[0].set_has_live(true);
+        meta[0].set_alt_phase_dirty(false);
+        meta[1].set_has_live(false);
+        meta[1].set_alt_phase_dirty(false);
+
+        let mut next_borders_north = [u64::MAX; 2];
+        let mut next_borders_south = [u64::MAX; 2];
+        let mut next_borders_west = [u64::MAX; 2];
+        let mut next_borders_east = [u64::MAX; 2];
+        let borders_north_read = [0u64; 2];
+        let borders_south_read = [0u64; 2];
+        let borders_west_read = [0u64; 2];
+        let borders_east_read = [0u64; 2];
+        let neighbors = [[0 as NeighborIdx; 8], [0 as NeighborIdx; 8]];
+        let live_masks_read = [0u8; 2];
+        let mut next_live_masks = [u8::MAX; 2];
+
+        let result = unsafe {
+            advance_tile_fused_scalar_no_track(
+                current.as_ptr(),
+                next.as_mut_ptr(),
+                meta.as_mut_ptr(),
+                next_borders_north.as_mut_ptr(),
+                next_borders_south.as_mut_ptr(),
+                next_borders_west.as_mut_ptr(),
+                next_borders_east.as_mut_ptr(),
+                borders_north_read.as_ptr(),
+                borders_south_read.as_ptr(),
+                borders_west_read.as_ptr(),
+                borders_east_read.as_ptr(),
+                neighbors.as_ptr(),
+                live_masks_read.as_ptr(),
+                next_live_masks.as_mut_ptr(),
+                0,
+            )
+        };
+
+        assert!(result.changed);
+        assert!(!result.has_live);
+        assert!(result.prune_ready);
+    }
+
+    #[test]
+    fn scalar_fused_no_track_empty_ghost_can_hide_future_neighbor_border_births() {
+        let mut current = [CellBuf::empty(), CellBuf::empty(), CellBuf::empty()];
+        // Horizontal triplet one row above the south edge. This births a live
+        // cell on the south edge next generation without any current south-edge
+        // activity.
+        current[2].0[1] = (1u64 << 10) | (1u64 << 11) | (1u64 << 12);
+
+        let mut next = [CellBuf::empty(), CellBuf::empty(), CellBuf::empty()];
+        let mut meta = [TileMeta::empty(), TileMeta::empty(), TileMeta::empty()];
+        meta[1].missing_mask = MISSING_ALL_NEIGHBORS & !(1 << 0);
+        meta[1].set_has_live(false);
+        meta[2].missing_mask = MISSING_ALL_NEIGHBORS & !(1 << 1);
+        meta[2].set_has_live(true);
+        for slot in &mut meta {
+            slot.set_alt_phase_dirty(false);
+        }
+
+        let mut next_borders_north = [u64::MAX; 3];
+        let mut next_borders_south = [u64::MAX; 3];
+        let mut next_borders_west = [u64::MAX; 3];
+        let mut next_borders_east = [u64::MAX; 3];
+        let borders_north_read = [0u64; 3];
+        let borders_south_read = [0u64; 3];
+        let borders_west_read = [0u64; 3];
+        let borders_east_read = [0u64; 3];
+        let mut neighbors = [[0 as NeighborIdx; 8]; 3];
+        neighbors[1][0] = 2;
+        neighbors[2][1] = 1;
+        let live_masks_read = [0u8; 3];
+        let mut next_live_masks = [u8::MAX; 3];
+
+        let target_result = unsafe {
+            advance_tile_fused_scalar_no_track(
+                current.as_ptr(),
+                next.as_mut_ptr(),
+                meta.as_mut_ptr(),
+                next_borders_north.as_mut_ptr(),
+                next_borders_south.as_mut_ptr(),
+                next_borders_west.as_mut_ptr(),
+                next_borders_east.as_mut_ptr(),
+                borders_north_read.as_ptr(),
+                borders_south_read.as_ptr(),
+                borders_west_read.as_ptr(),
+                borders_east_read.as_ptr(),
+                neighbors.as_ptr(),
+                live_masks_read.as_ptr(),
+                next_live_masks.as_mut_ptr(),
+                1,
+            )
+        };
+        let north_result = unsafe {
+            advance_tile_fused_scalar_no_track(
+                current.as_ptr(),
+                next.as_mut_ptr(),
+                meta.as_mut_ptr(),
+                next_borders_north.as_mut_ptr(),
+                next_borders_south.as_mut_ptr(),
+                next_borders_west.as_mut_ptr(),
+                next_borders_east.as_mut_ptr(),
+                borders_north_read.as_ptr(),
+                borders_south_read.as_ptr(),
+                borders_west_read.as_ptr(),
+                borders_east_read.as_ptr(),
+                neighbors.as_ptr(),
+                live_masks_read.as_ptr(),
+                next_live_masks.as_mut_ptr(),
+                2,
+            )
+        };
+
+        assert!(!target_result.changed);
+        assert!(!target_result.has_live);
+        assert!(!target_result.prune_ready);
+
+        assert!(north_result.changed);
+        assert!(north_result.has_live);
+        assert_ne!(next_live_masks[2] & super::LIVE_S, 0);
+        assert!(!unsafe {
+            ghost_is_empty_from_live_masks_ptr(next_live_masks.as_ptr(), &neighbors[1])
+        });
     }
 
     #[test]

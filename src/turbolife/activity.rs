@@ -1027,6 +1027,15 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
 
     if !arena.expand_buf.is_empty() {
         arena.reserve_additional_tiles(arena.expand_buf.len());
+        let mut keep_dense_contiguous_active = arena.active_set_dense_contiguous
+            && arena.free_list.is_empty()
+            && arena.active_set.len() == arena.occupied_count
+            && arena.occupied_count + 1 == arena.meta.len()
+            && arena.active_set.first().map(|idx| idx.0) == Some(1)
+            && arena.active_set.last().map(|idx| idx.0) == Some(arena.occupied_count as u32);
+        if keep_dense_contiguous_active {
+            arena.active_set.reserve(arena.expand_buf.len());
+        }
         for i in 0..arena.expand_buf.len() {
             let candidate = arena.expand_buf[i];
             let src_i = (candidate >> 3) as usize;
@@ -1037,7 +1046,26 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
             if !was_allocated {
                 continue;
             }
+            if keep_dense_contiguous_active {
+                let expected_idx = arena.active_set.len() + 1;
+                if idx.index() == expected_idx {
+                    unsafe {
+                        vec_push_unchecked(&mut arena.active_set, idx);
+                    }
+                } else {
+                    keep_dense_contiguous_active = false;
+                }
+            }
             arena.mark_changed_new_unique(idx);
+        }
+        if keep_dense_contiguous_active
+            && arena.free_list.is_empty()
+            && arena.active_set.len() == arena.occupied_count
+            && arena.occupied_count + 1 == arena.meta.len()
+            && arena.active_set.first().map(|idx| idx.0) == Some(1)
+            && arena.active_set.last().map(|idx| idx.0) == Some(arena.occupied_count as u32)
+        {
+            arena.active_set_dense_contiguous = true;
         }
     }
 
@@ -1336,6 +1364,23 @@ mod tests {
 
         assert!(!arena.meta(idx).occupied());
         assert!(arena.prune_buf.is_empty());
+    }
+
+    #[test]
+    fn finalize_prune_and_expand_preserves_dense_active_cache_on_append_growth() {
+        let mut arena = TileArena::new();
+        let origin = arena.allocate((0, 0));
+        arena.active_set = vec![origin];
+        arena.active_set_dense_contiguous = true;
+        arena.expand_buf.push((origin.0 << 3) | 3);
+
+        finalize_prune_and_expand(&mut arena);
+
+        assert_eq!(arena.occupied_count, 2);
+        assert_eq!(arena.idx_at((1, 0)), Some(TileIdx(2)));
+        assert_eq!(arena.active_set, vec![TileIdx(1), TileIdx(2)]);
+        assert!(arena.active_set_dense_contiguous);
+        assert_eq!(arena.changed_list, vec![TileIdx(2)]);
     }
 
     #[test]
