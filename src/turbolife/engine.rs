@@ -118,6 +118,7 @@ const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 1;
 const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE: usize = 2;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const PARALLEL_DYNAMIC_APPLE_DENSE_CHUNK_MIN_ACTIVE: usize = 2_048;
+const ASSUME_CHANGED_PRUNE_STRIDE: u64 = 16;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 #[cfg(target_arch = "x86_64")]
@@ -144,6 +145,7 @@ const _: [(); 1] = [(); (PREFETCH_TILE_NEAR_AHEAD_AARCH64 >= 1) as usize];
 #[cfg(target_arch = "aarch64")]
 const _: [(); 1] =
     [(); (PREFETCH_TILE_FAR_AHEAD_AARCH64 > PREFETCH_TILE_NEAR_AHEAD_AARCH64) as usize];
+const _: [(); 1] = [(); (ASSUME_CHANGED_PRUNE_STRIDE > 0) as usize];
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -1222,6 +1224,11 @@ fn dynamic_parallel_chunk_size(
 }
 
 #[inline(always)]
+fn should_run_prune_pass<const ASSUME_CHANGED_MODE: bool>(generation: u64) -> bool {
+    !ASSUME_CHANGED_MODE || generation.is_multiple_of(ASSUME_CHANGED_PRUNE_STRIDE)
+}
+
+#[inline(always)]
 fn should_queue_prune<const EMIT_CHANGED: bool>(has_live: bool, changed: bool) -> bool {
     !has_live && (!EMIT_CHANGED || !changed)
 }
@@ -1936,7 +1943,8 @@ impl TurboLife {
         let run_parallel = effective_threads > 1;
         const TRACK_NEIGHBOR_INFLUENCE: bool = false;
         let emit_changed = !ASSUME_CHANGED_MODE;
-        self.arena.prune_candidates_verified = emit_changed && !run_parallel;
+        let allow_prune = should_run_prune_pass::<ASSUME_CHANGED_MODE>(self.generation);
+        self.arena.prune_candidates_verified = allow_prune && emit_changed && !run_parallel;
 
         let (cb_lo, cb_hi) = self.arena.cell_bufs.split_at_mut(1);
         let (current_vec, next_vec) = if cp == 0 {
@@ -2018,7 +2026,9 @@ impl TurboLife {
             if TRACK_NEIGHBOR_INFLUENCE {
                 reserve_additional_capacity(&mut self.arena.changed_influence, active_len);
             }
-            reserve_additional_capacity(&mut self.arena.prune_buf, active_len);
+            if allow_prune {
+                reserve_additional_capacity(&mut self.arena.prune_buf, active_len);
+            }
             reserve_additional_capacity(&mut self.arena.expand_buf, active_len.saturating_mul(8));
 
             // Serial path: cached kernel with multi-level prefetching.
@@ -2151,13 +2161,15 @@ impl TurboLife {
                                 }
                             }
                         }
-                        let queue_prune =
-                            unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
-                        unsafe {
-                            vec_push_if_unchecked(&mut self.arena.prune_buf, idx, queue_prune);
-                        }
-                        if queue_prune && $emit_changed && !result.prune_ready {
-                            self.arena.prune_candidates_verified = false;
+                        if allow_prune {
+                            let queue_prune =
+                                unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
+                            unsafe {
+                                vec_push_if_unchecked(&mut self.arena.prune_buf, idx, queue_prune);
+                            }
+                            if queue_prune && $emit_changed && !result.prune_ready {
+                                self.arena.prune_candidates_verified = false;
+                            }
                         }
 
                         let missing = result.missing_mask;
@@ -2282,13 +2294,15 @@ impl TurboLife {
                                 }
                             }
                         }
-                        let queue_prune =
-                            unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
-                        unsafe {
-                            vec_push_if_unchecked(&mut self.arena.prune_buf, idx, queue_prune);
-                        }
-                        if queue_prune && $emit_changed && !result.prune_ready {
-                            self.arena.prune_candidates_verified = false;
+                        if allow_prune {
+                            let queue_prune =
+                                unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
+                            unsafe {
+                                vec_push_if_unchecked(&mut self.arena.prune_buf, idx, queue_prune);
+                            }
+                            if queue_prune && $emit_changed && !result.prune_ready {
+                                self.arena.prune_candidates_verified = false;
+                            }
                         }
 
                         let missing = result.missing_mask;
@@ -2482,13 +2496,15 @@ impl TurboLife {
                             }
                         }
                     }
-                    let queue_prune =
-                        unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
-                    unsafe {
-                        vec_push_if_unchecked(&mut ($scratch).prune, idx, queue_prune);
-                    }
-                    if queue_prune && $emit_changed && !result.prune_ready {
-                        ($scratch).prune_candidates_verified = false;
+                    if allow_prune {
+                        let queue_prune =
+                            unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
+                        unsafe {
+                            vec_push_if_unchecked(&mut ($scratch).prune, idx, queue_prune);
+                        }
+                        if queue_prune && $emit_changed && !result.prune_ready {
+                            ($scratch).prune_candidates_verified = false;
+                        }
                     }
 
                     let missing = result.missing_mask;
@@ -3112,6 +3128,23 @@ mod tests {
         assert!(!super::should_queue_prune::<true>(false, true));
         assert!(super::should_queue_prune::<false>(false, false));
         assert!(super::should_queue_prune::<false>(false, true));
+    }
+
+    #[test]
+    fn assume_changed_prune_stride_applies_only_to_assume_mode() {
+        assert!(super::should_run_prune_pass::<false>(0));
+        assert!(super::should_run_prune_pass::<false>(7));
+        assert!(super::should_run_prune_pass::<false>(31));
+    }
+
+    #[test]
+    fn assume_changed_prune_stride_respects_generation_period() {
+        assert!(super::should_run_prune_pass::<true>(0));
+        assert!(!super::should_run_prune_pass::<true>(1));
+        assert!(!super::should_run_prune_pass::<true>(15));
+        assert!(super::should_run_prune_pass::<true>(16));
+        assert!(!super::should_run_prune_pass::<true>(31));
+        assert!(super::should_run_prune_pass::<true>(32));
     }
 
     #[test]
