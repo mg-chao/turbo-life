@@ -713,7 +713,7 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
 
     let mut changed = !TRACK_DIFF;
     let mut diff_acc = vdupq_n_u64(0);
-    let mut has_live = false;
+    let mut live_acc_scalar = 0u64;
     let mut border_west = 0u64;
     let mut border_east = 0u64;
     let current_ptr = current.as_ptr();
@@ -802,7 +802,7 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
             }
             let row0 = vgetq_lane_u64(next_rows, 0);
             let row1 = vgetq_lane_u64(next_rows, 1);
-            has_live |= (row0 | row1) != 0;
+            live_acc_scalar |= row0 | row1;
             let west_bits = (row0 & 1) | ((row1 & 1) << 1);
             let east_bits = ((row0 >> 63) & 1) | (((row1 >> 63) & 1) << 1);
             border_west |= west_bits << $row_base;
@@ -930,6 +930,7 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
         changed = vget_lane_u64(vorr_u64(vget_low_u64(diff_acc), vget_high_u64(diff_acc)), 0) != 0;
     }
 
+    let has_live = live_acc_scalar != 0;
     let border = BorderData::from_edges(border_north, border_south, border_west, border_east);
     (changed, border, has_live)
 }
@@ -1068,7 +1069,10 @@ unsafe fn advance_core_const<const CORE_BACKEND: u8, const ASSUME_CHANGED: bool>
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn advance_tile_fused_empty_tile<const TRACK_NEIGHBOR_INFLUENCE: bool>(
+unsafe fn advance_tile_fused_empty_tile<
+    const TRACK_NEIGHBOR_INFLUENCE: bool,
+    const ASSUME_CHANGED: bool,
+>(
     current: &[u64; TILE_SIZE],
     next: &mut [u64; TILE_SIZE],
     meta_slot: *mut TileMeta,
@@ -1110,7 +1114,7 @@ unsafe fn advance_tile_fused_empty_tile<const TRACK_NEIGHBOR_INFLUENCE: bool>(
             (*meta_slot).update_after_step(false, false);
         }
         debug_assert!(force_store || tile_is_empty(next));
-        let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
+        let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE || ASSUME_CHANGED {
             0
         } else {
             no_track_hint(false, true)
@@ -1160,7 +1164,7 @@ unsafe fn advance_tile_fused_empty_tile<const TRACK_NEIGHBOR_INFLUENCE: bool>(
         }
         debug_assert!(force_store || tile_is_empty(next));
         let prune_ready = false;
-        let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
+        let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE || ASSUME_CHANGED {
             0
         } else {
             no_track_hint(false, prune_ready)
@@ -1209,6 +1213,8 @@ unsafe fn advance_tile_fused_empty_tile<const TRACK_NEIGHBOR_INFLUENCE: bool>(
         } else {
             0
         }
+    } else if ASSUME_CHANGED {
+        0
     } else {
         no_track_hint(changed, false)
     };
@@ -1260,6 +1266,15 @@ unsafe fn advance_tile_fused_impl<
     next_live_masks_ptr: *mut u8,
     idx: usize,
 ) -> TileAdvanceResult {
+    debug_assert!(
+        !ASSUME_CHANGED || CORE_BACKEND == CORE_BACKEND_NEON,
+        "ASSUME_CHANGED is only supported for the NEON backend"
+    );
+    debug_assert!(
+        !ASSUME_CHANGED || !TRACK_NEIGHBOR_INFLUENCE,
+        "ASSUME_CHANGED mode does not emit neighbor influence"
+    );
+
     let nb = unsafe { *neighbors_ptr.add(idx) };
     let current = unsafe { &(*current_ptr.add(idx)).0 };
     let next = unsafe { &mut (*next_ptr.add(idx)).0 };
@@ -1279,7 +1294,7 @@ unsafe fn advance_tile_fused_impl<
 
     if !tile_has_live {
         return unsafe {
-            advance_tile_fused_empty_tile::<TRACK_NEIGHBOR_INFLUENCE>(
+            advance_tile_fused_empty_tile::<TRACK_NEIGHBOR_INFLUENCE, ASSUME_CHANGED>(
                 current,
                 next,
                 meta_slot,
@@ -1407,6 +1422,8 @@ unsafe fn advance_tile_fused_impl<
         } else {
             0
         }
+    } else if ASSUME_CHANGED {
+        0
     } else {
         no_track_hint(changed, prune_ready)
     };
