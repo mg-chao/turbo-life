@@ -110,6 +110,27 @@ unsafe fn vec_push_if_branchless_unchecked<T: Copy>(buf: &mut Vec<T>, value: T, 
     }
 }
 
+/// # Safety
+/// When `target_len > buf.len()`, callers must overwrite every newly exposed
+/// element before any read of the vector contents.
+///
+/// This helper is restricted to `Copy` elements so panic-unwind paths cannot
+/// drop uninitialized values.
+#[inline(always)]
+unsafe fn vec_resize_uninit<T: Copy>(buf: &mut Vec<T>, target_len: usize) {
+    let len = buf.len();
+    if target_len <= len {
+        buf.truncate(target_len);
+        return;
+    }
+    if buf.capacity() < target_len {
+        buf.reserve(target_len - len);
+    }
+    unsafe {
+        buf.set_len(target_len);
+    }
+}
+
 #[inline]
 fn rebuild_active_set_from_occupied_bits(arena: &mut TileArena) {
     let target_len = arena.occupied_count;
@@ -915,10 +936,12 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                 let live_masks_ptr = SendConstPtr::new(live_masks_ptr);
                 if prune_len >= PARALLEL_PRUNE_BITMAP_MIN {
                     let words_len = prune_len.div_ceil(64);
-                    arena.prune_marks_words.resize(words_len, 0);
+                    unsafe {
+                        vec_resize_uninit(&mut arena.prune_marks_words, words_len);
+                    }
                     let word_chunk_size = candidate_chunk_size.div_ceil(64).max(1);
                     let prune_candidates_ptr = SendConstPtr::new(arena.prune_buf.as_ptr());
-                    let prune_marks_words = &mut arena.prune_marks_words;
+                    let prune_marks_words = &mut arena.prune_marks_words[..words_len];
                     prune_marks_words
                         .par_chunks_mut(word_chunk_size)
                         .enumerate()
@@ -945,8 +968,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                             }
                         });
 
-                    let prune_word_len = arena.prune_marks_words.len();
-                    for word_idx in 0..prune_word_len {
+                    for word_idx in 0..words_len {
                         let mut bits = arena.prune_marks_words[word_idx];
                         while bits != 0 {
                             let bit = bits.trailing_zeros() as usize;
@@ -956,9 +978,11 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                         }
                     }
                 } else {
-                    arena.prune_marks.resize(prune_len, 0);
+                    unsafe {
+                        vec_resize_uninit(&mut arena.prune_marks, prune_len);
+                    }
                     let prune_candidates = &arena.prune_buf;
-                    let prune_marks = &mut arena.prune_marks;
+                    let prune_marks = &mut arena.prune_marks[..prune_len];
                     prune_candidates
                         .par_chunks(candidate_chunk_size)
                         .zip(prune_marks.par_chunks_mut(candidate_chunk_size))

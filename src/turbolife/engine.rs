@@ -2676,9 +2676,6 @@ impl TurboLife {
             let mut total_expand = 0usize;
             let mut total_prune = 0usize;
             let mut total_changed = 0usize;
-            let mut max_expand = (0usize, 0usize);
-            let mut max_prune = (0usize, 0usize);
-            let mut max_changed = (0usize, 0usize);
             let mut all_prune_candidates_verified = allow_prune;
             for worker_id in 0..worker_count {
                 let scratch = &self.worker_scratch[worker_id];
@@ -2689,16 +2686,6 @@ impl TurboLife {
                 total_expand = total_expand.saturating_add(expand_len);
                 total_prune = total_prune.saturating_add(prune_len);
                 total_changed = total_changed.saturating_add(changed_len);
-
-                if expand_len > max_expand.0 {
-                    max_expand = (expand_len, worker_id);
-                }
-                if prune_len > max_prune.0 {
-                    max_prune = (prune_len, worker_id);
-                }
-                if changed_len > max_changed.0 {
-                    max_changed = (changed_len, worker_id);
-                }
                 if !scratch.prune_candidates_verified {
                     all_prune_candidates_verified = false;
                 }
@@ -2709,34 +2696,51 @@ impl TurboLife {
             }
 
             macro_rules! merge_worker_vectors {
-                ($dst:expr, $field:ident, $total:expr, $max_pair:expr) => {{
+                ($dst:expr, $field:ident, $total:expr) => {{
                     if $total == 0 {
                         $dst.clear();
                     } else {
-                        let base_worker = $max_pair.1;
-                        std::mem::swap(&mut $dst, &mut self.worker_scratch[base_worker].$field);
-                        let additional = $total.saturating_sub($dst.len());
-                        reserve_additional_capacity(&mut $dst, additional);
+                        $dst.clear();
+                        reserve_additional_capacity(&mut $dst, $total);
+                        debug_assert!($dst.capacity() >= $total);
+                        let dst_ptr = $dst.as_mut_ptr();
+                        let mut write = 0usize;
                         for worker_id in 0..worker_count {
-                            if worker_id == base_worker {
-                                continue;
+                            let src = &mut self.worker_scratch[worker_id].$field;
+                            let len = src.len();
+                            if len != 0 {
+                                let end = write
+                                    .checked_add(len)
+                                    .expect("worker merge length overflowed usize");
+                                debug_assert!(end <= $total);
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        src.as_ptr(),
+                                        dst_ptr.add(write),
+                                        len,
+                                    );
+                                    src.set_len(0);
+                                }
+                                write = end;
                             }
-                            $dst.append(&mut self.worker_scratch[worker_id].$field);
+                        }
+                        debug_assert_eq!(write, $total);
+                        unsafe {
+                            $dst.set_len(write);
                         }
                     }
                 }};
             }
 
-            merge_worker_vectors!(self.arena.expand_buf, expand, total_expand, max_expand);
-            merge_worker_vectors!(self.arena.prune_buf, prune, total_prune, max_prune);
+            merge_worker_vectors!(self.arena.expand_buf, expand, total_expand);
+            merge_worker_vectors!(self.arena.prune_buf, prune, total_prune);
             if emit_changed {
-                merge_worker_vectors!(self.arena.changed_list, changed, total_changed, max_changed);
+                merge_worker_vectors!(self.arena.changed_list, changed, total_changed);
                 if TRACK_NEIGHBOR_INFLUENCE {
                     merge_worker_vectors!(
                         self.arena.changed_influence,
                         changed_influence,
-                        total_changed,
-                        max_changed
+                        total_changed
                     );
                 } else {
                     self.arena.changed_influence.clear();
