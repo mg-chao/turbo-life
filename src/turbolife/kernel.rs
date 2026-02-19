@@ -835,6 +835,89 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
 
     let mut prev_above = row_above_0;
     let mut row_base = 2usize;
+    // Process 8 rows (4 pairs) per iteration to reduce loop-control overhead.
+    while row_base < TILE_SIZE - 8 {
+        let byte_w_self = west_self_bits & 0xFF;
+        let byte_e_self = east_self_bits & 0xFF;
+        let byte_w_above = west_above_bits & 0xFF;
+        let byte_e_above = east_above_bits & 0xFF;
+        let byte_w_below = west_below_bits & 0xFF;
+        let byte_e_below = east_below_bits & 0xFF;
+
+        let row_below_0 = prev_above;
+        let row_self_0 = unsafe { vld1q_u64(current_ptr.add(row_base)) };
+        let row_above_0 = unsafe { vld1q_u64(current_ptr.add(row_base + 1)) };
+        let _ = process_pair!(
+            row_base,
+            row_above_0,
+            row_self_0,
+            row_below_0,
+            byte_w_above & 0b11,
+            byte_e_above & 0b11,
+            byte_w_self & 0b11,
+            byte_e_self & 0b11,
+            byte_w_below & 0b11,
+            byte_e_below & 0b11
+        );
+
+        let row_below_1 = row_above_0;
+        let row_self_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 2)) };
+        let row_above_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 3)) };
+        let _ = process_pair!(
+            row_base + 2,
+            row_above_1,
+            row_self_1,
+            row_below_1,
+            (byte_w_above >> 2) & 0b11,
+            (byte_e_above >> 2) & 0b11,
+            (byte_w_self >> 2) & 0b11,
+            (byte_e_self >> 2) & 0b11,
+            (byte_w_below >> 2) & 0b11,
+            (byte_e_below >> 2) & 0b11
+        );
+
+        let row_below_2 = row_above_1;
+        let row_self_2 = unsafe { vld1q_u64(current_ptr.add(row_base + 4)) };
+        let row_above_2 = unsafe { vld1q_u64(current_ptr.add(row_base + 5)) };
+        let _ = process_pair!(
+            row_base + 4,
+            row_above_2,
+            row_self_2,
+            row_below_2,
+            (byte_w_above >> 4) & 0b11,
+            (byte_e_above >> 4) & 0b11,
+            (byte_w_self >> 4) & 0b11,
+            (byte_e_self >> 4) & 0b11,
+            (byte_w_below >> 4) & 0b11,
+            (byte_e_below >> 4) & 0b11
+        );
+
+        let row_below_3 = row_above_2;
+        let row_self_3 = unsafe { vld1q_u64(current_ptr.add(row_base + 6)) };
+        let row_above_3 = unsafe { vld1q_u64(current_ptr.add(row_base + 7)) };
+        let _ = process_pair!(
+            row_base + 6,
+            row_above_3,
+            row_self_3,
+            row_below_3,
+            (byte_w_above >> 6) & 0b11,
+            (byte_e_above >> 6) & 0b11,
+            (byte_w_self >> 6) & 0b11,
+            (byte_e_self >> 6) & 0b11,
+            (byte_w_below >> 6) & 0b11,
+            (byte_e_below >> 6) & 0b11
+        );
+
+        prev_above = row_above_3;
+        west_self_bits >>= 8;
+        east_self_bits >>= 8;
+        west_above_bits >>= 8;
+        east_above_bits >>= 8;
+        west_below_bits >>= 8;
+        east_below_bits >>= 8;
+        row_base += 8;
+    }
+
     while row_base < TILE_SIZE - 4 {
         let nib_w_self = west_self_bits & 0b1111;
         let nib_e_self = east_self_bits & 0b1111;
