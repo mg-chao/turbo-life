@@ -124,7 +124,7 @@ const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 // Keep work packets small on Apple Silicon so lock-free stealing stays
 // granular across perf/efficiency cores.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 64;
+const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 112;
 #[cfg(target_arch = "x86_64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 #[cfg(target_arch = "aarch64")]
@@ -1280,6 +1280,22 @@ where
             rayon::join(
                 || rayon::join(|| worker_fn(0), || worker_fn(1)),
                 || rayon::join(|| worker_fn(2), || worker_fn(3)),
+            );
+        }
+        6 => {
+            rayon::join(
+                || {
+                    rayon::join(
+                        || rayon::join(|| worker_fn(0), || worker_fn(1)),
+                        || worker_fn(2),
+                    );
+                },
+                || {
+                    rayon::join(
+                        || rayon::join(|| worker_fn(3), || worker_fn(4)),
+                        || worker_fn(5),
+                    );
+                },
             );
         }
         8 => {
@@ -3078,7 +3094,7 @@ mod tests {
             .build()
             .expect("thread pool");
 
-        for worker_count in [1usize, 2, 3, 4, 5, 8, 9] {
+        for worker_count in [1usize, 2, 3, 4, 5, 6, 8, 9] {
             let visit_count = AtomicUsize::new(0);
             let visited_mask = AtomicUsize::new(0);
             pool.install(|| {
@@ -3173,10 +3189,10 @@ mod tests {
         let large = dynamic_parallel_chunk_size(65_536, 50_000, 4);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            assert_eq!(small, 64);
-            assert_eq!(medium_balanced, 64);
-            assert_eq!(medium_high, 64);
-            assert_eq!(large, 64);
+            assert_eq!(small, 100);
+            assert_eq!(medium_balanced, 112);
+            assert_eq!(medium_high, 112);
+            assert_eq!(large, 112);
         }
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         {
