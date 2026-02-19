@@ -40,7 +40,7 @@ if ! [[ "$TRAIN_RUNS" =~ ^[0-9]+$ ]] || [ "$TRAIN_RUNS" -eq 0 ]; then
 fi
 
 HARNESS_ARGS=("$@")
-for arg in "${HARNESS_ARGS[@]}"; do
+for arg in "$@"; do
     if [ "$arg" = "--pgo-train" ]; then
         echo "error: do not pass --pgo-train explicitly; build_maxperf.sh injects it for PGO training runs." >&2
         exit 2
