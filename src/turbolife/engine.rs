@@ -124,7 +124,11 @@ const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 64;
 #[cfg(target_arch = "x86_64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
-#[cfg(target_arch = "aarch64")]
+// Apple Silicon benefits from enabling border-line prefetching at a lower
+// frontier size than other AArch64 targets in the primary harness.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 4_096;
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 32_768;
 const CORE_BACKEND_SCALAR: u8 = 0;
 const CORE_BACKEND_AVX2: u8 = 1;
