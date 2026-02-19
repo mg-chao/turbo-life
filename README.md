@@ -57,6 +57,10 @@ To pass CLI args through to both training and benchmarking harness runs, append 
 ./scripts/build_pgo.sh 3 9 --threads 6 --kernel neon
 ```
 
+`--pgo-train` is reserved for internal script use and should not be passed manually.
+
+`build_pgo.sh` (and the PGO phase in `build_maxperf.sh`) now trains with `--pgo-train`, a TurboLife-only execution mode in `src/main.rs` that removes QuickLife/checkpoint I/O from profile collection so LLVM profile data stays focused on hot TurboLife kernels.
+
 Max-performance auto-tuner (builds multiple compiler/feature variants, benchmarks each with `src/main.rs`, rejects regressions, then optionally tests PGO on top of the best non-PGO candidate):
 
 ```

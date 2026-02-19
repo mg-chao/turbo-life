@@ -40,6 +40,12 @@ if ! [[ "$TRAIN_RUNS" =~ ^[0-9]+$ ]] || [ "$TRAIN_RUNS" -eq 0 ]; then
 fi
 
 HARNESS_ARGS=("$@")
+for arg in "${HARNESS_ARGS[@]}"; do
+    if [ "$arg" = "--pgo-train" ]; then
+        echo "error: do not pass --pgo-train explicitly; build_maxperf.sh injects it for PGO training runs." >&2
+        exit 2
+    fi
+done
 
 HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
 SYSROOT="$(rustc --print sysroot)"
@@ -206,14 +212,14 @@ if [ "$PGO_CANDIDATE_READY" = "1" ]; then
         echo "  training run $i/$TRAIN_RUNS"
         if [ "${#HARNESS_ARGS[@]}" -eq 0 ]; then
             if ! LLVM_PROFILE_FILE="$PGO_DATA_DIR/turbo-life-%p-%m.profraw" \
-                "$PGO_GEN_DIR/release/turbo-life" >/dev/null; then
+                "$PGO_GEN_DIR/release/turbo-life" --pgo-train >/dev/null; then
                 echo "warning: skipped PGO candidate (training run $i failed)" >&2
                 PGO_CANDIDATE_READY="0"
                 break
             fi
         else
             if ! LLVM_PROFILE_FILE="$PGO_DATA_DIR/turbo-life-%p-%m.profraw" \
-                "$PGO_GEN_DIR/release/turbo-life" "${HARNESS_ARGS[@]}" >/dev/null; then
+                "$PGO_GEN_DIR/release/turbo-life" --pgo-train "${HARNESS_ARGS[@]}" >/dev/null; then
                 echo "warning: skipped PGO candidate (training run $i failed)" >&2
                 PGO_CANDIDATE_READY="0"
                 break

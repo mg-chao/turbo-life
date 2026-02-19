@@ -8,9 +8,20 @@ use std::time::Instant;
 use turbo_life::quicklife::QuickLife;
 use turbo_life::turbolife::{KernelBackend, TurboLife, TurboLifeConfig};
 
-fn parse_args() -> TurboLifeConfig {
+const SEED_SIDE: i32 = 4096;
+const LIVE_DENSITY: f64 = 0.42;
+const TOTAL_ITERATIONS: u64 = 2000;
+const CHECK_INTERVAL: u64 = 1000;
+
+struct MainArgs {
+    config: TurboLifeConfig,
+    pgo_train: bool,
+}
+
+fn parse_args() -> MainArgs {
     let args: Vec<String> = std::env::args().collect();
     let mut config = TurboLifeConfig::default();
+    let mut pgo_train = false;
     let next_arg = |i: usize, flag: &str| -> &str {
         args.get(i)
             .map(String::as_str)
@@ -45,48 +56,53 @@ fn parse_args() -> TurboLifeConfig {
                 };
                 config = config.kernel(backend);
             }
+            "--pgo-train" => {
+                pgo_train = true;
+            }
             other => panic!(
-                "unknown argument: {other}\nusage: turbo-life [--threads N] [--max-threads N] [--kernel scalar|avx2|neon]"
+                "unknown argument: {other}\nusage: turbo-life [--threads N] [--max-threads N] [--kernel scalar|avx2|neon] [--pgo-train]"
             ),
         }
         i += 1;
     }
-    config
+    MainArgs { config, pgo_train }
 }
 
-fn main() {
-    let config = parse_args();
-
-    let mut quick = QuickLife::new();
-    let mut turbo = TurboLife::with_config(config);
+fn seed_random_world(turbo: &mut TurboLife, mut quick: Option<&mut QuickLife>) {
     let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_1234_ABCD_EF01);
-    let threshold = (u64::MAX as f64 * 0.42) as u64;
+    let threshold = (u64::MAX as f64 * LIVE_DENSITY) as u64;
 
-    for y in 0..=4096 {
-        for x in 0..=4096 {
+    for y in 0..SEED_SIDE {
+        for x in 0..SEED_SIDE {
             if rng.next_u64() <= threshold {
-                quick.set_cell(x, y, true);
+                if let Some(quick) = quick.as_deref_mut() {
+                    quick.set_cell(x, y, true);
+                }
                 turbo.set_cell_alive(x as i64, y as i64);
             }
         }
     }
+}
 
-    let total_iterations = 2000u64;
-    let check_interval = 1000u64;
+fn run_checked(config: TurboLifeConfig) {
+    let mut quick = QuickLife::new();
+    let mut turbo = TurboLife::with_config(config);
+    seed_random_world(&mut turbo, Some(&mut quick));
+
     let mut quick_total_duration = std::time::Duration::ZERO;
     let mut turbo_total_duration = std::time::Duration::ZERO;
     let mut quick_prev_duration = std::time::Duration::ZERO;
     let mut turbo_prev_duration = std::time::Duration::ZERO;
 
-    for checkpoint in 1..=(total_iterations / check_interval) {
-        let iteration = checkpoint * check_interval;
+    for checkpoint in 1..=(TOTAL_ITERATIONS / CHECK_INTERVAL) {
+        let iteration = checkpoint * CHECK_INTERVAL;
 
         let start = Instant::now();
-        quick.step(check_interval);
+        quick.step(CHECK_INTERVAL);
         quick_total_duration += start.elapsed();
 
         let start = Instant::now();
-        turbo.step_n(check_interval);
+        turbo.step_n(CHECK_INTERVAL);
         turbo_total_duration += start.elapsed();
 
         let quick_phase = quick_total_duration - quick_prev_duration;
@@ -96,8 +112,8 @@ fn main() {
 
         let quick_ms = quick_phase.as_secs_f64() * 1000.0;
         let turbo_ms = turbo_phase.as_secs_f64() * 1000.0;
-        let quick_avg_ms = quick_ms / check_interval as f64;
-        let turbo_avg_ms = turbo_ms / check_interval as f64;
+        let quick_avg_ms = quick_ms / CHECK_INTERVAL as f64;
+        let turbo_avg_ms = turbo_ms / CHECK_INTERVAL as f64;
 
         let quick_population = quick.population();
         let turbo_population = turbo.population();
@@ -116,12 +132,28 @@ fn main() {
 
     let quick_total_ms = quick_total_duration.as_secs_f64() * 1000.0;
     let turbo_total_ms = turbo_total_duration.as_secs_f64() * 1000.0;
-    let quick_avg_ms = quick_total_ms / total_iterations as f64;
-    let turbo_avg_ms = turbo_total_ms / total_iterations as f64;
+    let quick_avg_ms = quick_total_ms / TOTAL_ITERATIONS as f64;
+    let turbo_avg_ms = turbo_total_ms / TOTAL_ITERATIONS as f64;
     let speedup = quick_total_ms / turbo_total_ms;
 
-    println!("\n--- Summary ({total_iterations} iterations) ---");
+    println!("\n--- Summary ({TOTAL_ITERATIONS} iterations) ---");
     println!("QuickLife: {quick_total_ms:.3} ms total, {quick_avg_ms:.6} ms/iter");
     println!("TurboLife: {turbo_total_ms:.3} ms total, {turbo_avg_ms:.6} ms/iter");
     println!("Speedup (QuickLife / TurboLife): {speedup:.2}x");
+}
+
+fn run_pgo_train(config: TurboLifeConfig) {
+    let mut turbo = TurboLife::with_config(config);
+    seed_random_world(&mut turbo, None);
+    turbo.step_n(TOTAL_ITERATIONS);
+    std::hint::black_box(turbo.population());
+}
+
+fn main() {
+    let args = parse_args();
+    if args.pgo_train {
+        run_pgo_train(args.config);
+    } else {
+        run_checked(args.config);
+    }
 }

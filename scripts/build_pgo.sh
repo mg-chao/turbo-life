@@ -39,6 +39,13 @@ if ! [[ "$BENCH_RUNS" =~ ^[0-9]+$ ]] || [ "$BENCH_RUNS" -eq 0 ]; then
     exit 2
 fi
 
+for arg in "$@"; do
+    if [ "$arg" = "--pgo-train" ]; then
+        echo "error: do not pass --pgo-train explicitly; build_pgo.sh injects it for training runs." >&2
+        exit 2
+    fi
+done
+
 HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
 SYSROOT="$(rustc --print sysroot)"
 PROFDATA_BIN="$SYSROOT/lib/rustlib/$HOST_TRIPLE/bin/llvm-profdata"
@@ -100,7 +107,7 @@ echo "==> collecting PGO profiles via main.rs harness (${TRAIN_RUNS} runs)"
 for ((i = 1; i <= TRAIN_RUNS; i++)); do
     echo "  training run $i/$TRAIN_RUNS"
     LLVM_PROFILE_FILE="$PGO_DIR/turbo-life-%p-%m.profraw" \
-        "$GEN_TARGET_DIR/release/turbo-life" "$@"
+        "$GEN_TARGET_DIR/release/turbo-life" --pgo-train "$@"
 done
 
 echo "==> merging profile data"
