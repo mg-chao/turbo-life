@@ -1944,7 +1944,7 @@ impl TurboLife {
         const TRACK_NEIGHBOR_INFLUENCE: bool = false;
         let emit_changed = !ASSUME_CHANGED_MODE;
         let allow_prune = should_run_prune_pass::<ASSUME_CHANGED_MODE>(self.generation);
-        self.arena.prune_candidates_verified = allow_prune && emit_changed && !run_parallel;
+        self.arena.prune_candidates_verified = allow_prune && !run_parallel;
 
         let (cb_lo, cb_hi) = self.arena.cell_bufs.split_at_mut(1);
         let (current_vec, next_vec) = if cp == 0 {
@@ -1974,46 +1974,49 @@ impl TurboLife {
         debug_assert_eq!(self.arena.meta.len(), self.arena.neighbors.len());
         let dense_active_contiguous = self.arena.active_set_dense_contiguous;
 
-        macro_rules! dispatch_by_emit {
-            ($macro_name:ident, $advance:path, $track:expr) => {{
+        macro_rules! dispatch_by_emit_with_prune {
+            ($macro_name:ident, $advance:path, $track:expr, $allow_prune:literal) => {{
                 if dense_active_contiguous {
                     if emit_changed {
-                        $macro_name!($advance, $track, true, true);
+                        $macro_name!($advance, $track, true, true, $allow_prune);
                     } else {
-                        $macro_name!($advance, $track, false, true);
+                        $macro_name!($advance, $track, false, true, $allow_prune);
                     }
                 } else {
                     if emit_changed {
-                        $macro_name!($advance, $track, true, false);
+                        $macro_name!($advance, $track, true, false, $allow_prune);
                     } else {
-                        $macro_name!($advance, $track, false, false);
+                        $macro_name!($advance, $track, false, false, $allow_prune);
                     }
                 }
             }};
         }
 
-        macro_rules! dispatch_fused_kernel_by_emit {
-            ($macro_name:ident) => {{
+        macro_rules! dispatch_fused_kernel_by_emit_with_prune {
+            ($macro_name:ident, $allow_prune:literal) => {{
                 if CORE_BACKEND == CORE_BACKEND_SCALAR {
-                    dispatch_by_emit!(
+                    dispatch_by_emit_with_prune!(
                         $macro_name,
                         advance_tile_fused_scalar_backend::<TRACK_NEIGHBOR_INFLUENCE>,
-                        TRACK_NEIGHBOR_INFLUENCE
+                        TRACK_NEIGHBOR_INFLUENCE,
+                        $allow_prune
                     );
                 } else if CORE_BACKEND == CORE_BACKEND_AVX2 {
-                    dispatch_by_emit!(
+                    dispatch_by_emit_with_prune!(
                         $macro_name,
                         advance_tile_fused_avx2_backend::<TRACK_NEIGHBOR_INFLUENCE>,
-                        TRACK_NEIGHBOR_INFLUENCE
+                        TRACK_NEIGHBOR_INFLUENCE,
+                        $allow_prune
                     );
                 } else if CORE_BACKEND == CORE_BACKEND_NEON {
-                    dispatch_by_emit!(
+                    dispatch_by_emit_with_prune!(
                         $macro_name,
                         advance_tile_fused_neon_backend::<
                             TRACK_NEIGHBOR_INFLUENCE,
                             ASSUME_CHANGED_MODE,
                         >,
-                        TRACK_NEIGHBOR_INFLUENCE
+                        TRACK_NEIGHBOR_INFLUENCE,
+                        $allow_prune
                     );
                 } else {
                     unreachable!("invalid fused backend selector: {CORE_BACKEND}");
@@ -2054,7 +2057,13 @@ impl TurboLife {
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
 
             macro_rules! serial_loop_cached {
-                ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
+                (
+                    $advance:path,
+                    $track:expr,
+                    $emit_changed:literal,
+                    $dense:literal,
+                    $allow_prune:literal
+                ) => {{
                     for i in 0..active_len {
                         let idx = unsafe { active_tile_at::<$dense>(active_ptr, i) };
                         let ii = idx.index();
@@ -2161,13 +2170,13 @@ impl TurboLife {
                                 }
                             }
                         }
-                        if allow_prune {
+                        if $allow_prune {
                             let queue_prune =
                                 unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
                             unsafe {
                                 vec_push_if_unchecked(&mut self.arena.prune_buf, idx, queue_prune);
                             }
-                            if queue_prune && $emit_changed && !result.prune_ready {
+                            if queue_prune && !result.prune_ready {
                                 self.arena.prune_candidates_verified = false;
                             }
                         }
@@ -2188,7 +2197,13 @@ impl TurboLife {
             }
 
             macro_rules! serial_loop_fused {
-                ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
+                (
+                    $advance:path,
+                    $track:expr,
+                    $emit_changed:literal,
+                    $dense:literal,
+                    $allow_prune:literal
+                ) => {{
                     for i in 0..active_len {
                         let idx = unsafe { active_tile_at::<$dense>(active_ptr, i) };
                         let ii = idx.index();
@@ -2294,13 +2309,13 @@ impl TurboLife {
                                 }
                             }
                         }
-                        if allow_prune {
+                        if $allow_prune {
                             let queue_prune =
                                 unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
                             unsafe {
                                 vec_push_if_unchecked(&mut self.arena.prune_buf, idx, queue_prune);
                             }
-                            if queue_prune && $emit_changed && !result.prune_ready {
+                            if queue_prune && !result.prune_ready {
                                 self.arena.prune_candidates_verified = false;
                             }
                         }
@@ -2321,21 +2336,41 @@ impl TurboLife {
             }
 
             if use_serial_cache {
-                if CORE_BACKEND == CORE_BACKEND_AVX2 {
-                    dispatch_by_emit!(
+                if allow_prune {
+                    if CORE_BACKEND == CORE_BACKEND_AVX2 {
+                        dispatch_by_emit_with_prune!(
+                            serial_loop_cached,
+                            advance_tile_cached_avx2_backend::<TRACK_NEIGHBOR_INFLUENCE>,
+                            TRACK_NEIGHBOR_INFLUENCE,
+                            true
+                        );
+                    } else {
+                        dispatch_by_emit_with_prune!(
+                            serial_loop_cached,
+                            advance_tile_cached_scalar_backend::<TRACK_NEIGHBOR_INFLUENCE>,
+                            TRACK_NEIGHBOR_INFLUENCE,
+                            true
+                        );
+                    }
+                } else if CORE_BACKEND == CORE_BACKEND_AVX2 {
+                    dispatch_by_emit_with_prune!(
                         serial_loop_cached,
                         advance_tile_cached_avx2_backend::<TRACK_NEIGHBOR_INFLUENCE>,
-                        TRACK_NEIGHBOR_INFLUENCE
+                        TRACK_NEIGHBOR_INFLUENCE,
+                        false
                     );
                 } else {
-                    dispatch_by_emit!(
+                    dispatch_by_emit_with_prune!(
                         serial_loop_cached,
                         advance_tile_cached_scalar_backend::<TRACK_NEIGHBOR_INFLUENCE>,
-                        TRACK_NEIGHBOR_INFLUENCE
+                        TRACK_NEIGHBOR_INFLUENCE,
+                        false
                     );
                 }
+            } else if allow_prune {
+                dispatch_fused_kernel_by_emit_with_prune!(serial_loop_fused, true);
             } else {
-                dispatch_fused_kernel_by_emit!(serial_loop_fused);
+                dispatch_fused_kernel_by_emit_with_prune!(serial_loop_fused, false);
             }
         } else {
             // Parallel kernel compute with a hybrid scheduler:
@@ -2455,7 +2490,8 @@ impl TurboLife {
                     $end:expr,
                     $track:expr,
                     $emit_changed:literal,
-                    $dense:literal
+                    $dense:literal,
+                    $allow_prune:literal
                 ) => {{
                     prefetch_for_work_item!($i, $end, $dense);
                     let idx = unsafe { active_tile_at::<$dense>(active_ptr.get(), $i) };
@@ -2496,13 +2532,13 @@ impl TurboLife {
                             }
                         }
                     }
-                    if allow_prune {
+                    if $allow_prune {
                         let queue_prune =
                             unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
                         unsafe {
                             vec_push_if_unchecked(&mut ($scratch).prune, idx, queue_prune);
                         }
-                        if queue_prune && $emit_changed && !result.prune_ready {
+                        if queue_prune && !result.prune_ready {
                             ($scratch).prune_candidates_verified = false;
                         }
                     }
@@ -2522,7 +2558,13 @@ impl TurboLife {
             }
 
             macro_rules! parallel_kernel_static {
-                ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
+                (
+                    $advance:path,
+                    $track:expr,
+                    $emit_changed:literal,
+                    $dense:literal,
+                    $allow_prune:literal
+                ) => {{
                     run_parallel_workers(active_workers, &|worker_id| {
                         let start = worker_id.saturating_mul(static_chunk_size);
                         if start >= active_len {
@@ -2539,7 +2581,8 @@ impl TurboLife {
                                 end,
                                 $track,
                                 $emit_changed,
-                                $dense
+                                $dense,
+                                $allow_prune
                             );
                         }
                     });
@@ -2547,11 +2590,21 @@ impl TurboLife {
             }
 
             if use_static_schedule {
-                dispatch_fused_kernel_by_emit!(parallel_kernel_static);
+                if allow_prune {
+                    dispatch_fused_kernel_by_emit_with_prune!(parallel_kernel_static, true);
+                } else {
+                    dispatch_fused_kernel_by_emit_with_prune!(parallel_kernel_static, false);
+                }
             } else {
                 let cursor = CacheAlignedAtomicUsize::new(0);
                 macro_rules! parallel_kernel_lockfree {
-                    ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
+                    (
+                        $advance:path,
+                        $track:expr,
+                        $emit_changed:literal,
+                        $dense:literal,
+                        $allow_prune:literal
+                    ) => {{
                         let cursor_ref = &cursor;
                         run_parallel_workers(active_workers, &|worker_id| {
                             let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
@@ -2581,7 +2634,8 @@ impl TurboLife {
                                         end,
                                         $track,
                                         $emit_changed,
-                                        $dense
+                                        $dense,
+                                        $allow_prune
                                     );
                                 }
                             }
@@ -2589,7 +2643,11 @@ impl TurboLife {
                     }};
                 }
 
-                dispatch_fused_kernel_by_emit!(parallel_kernel_lockfree);
+                if allow_prune {
+                    dispatch_fused_kernel_by_emit_with_prune!(parallel_kernel_lockfree, true);
+                } else {
+                    dispatch_fused_kernel_by_emit_with_prune!(parallel_kernel_lockfree, false);
+                }
             }
 
             let mut total_expand = 0usize;
@@ -2598,7 +2656,7 @@ impl TurboLife {
             let mut max_expand = (0usize, 0usize);
             let mut max_prune = (0usize, 0usize);
             let mut max_changed = (0usize, 0usize);
-            let mut all_prune_candidates_verified = emit_changed;
+            let mut all_prune_candidates_verified = allow_prune;
             for worker_id in 0..worker_count {
                 let scratch = &self.worker_scratch[worker_id];
                 let expand_len = scratch.expand.len();
@@ -2618,7 +2676,7 @@ impl TurboLife {
                 if changed_len > max_changed.0 {
                     max_changed = (changed_len, worker_id);
                 }
-                if emit_changed && !scratch.prune_candidates_verified {
+                if !scratch.prune_candidates_verified {
                     all_prune_candidates_verified = false;
                 }
 
