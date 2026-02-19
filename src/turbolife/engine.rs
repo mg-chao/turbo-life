@@ -1947,7 +1947,31 @@ impl TurboLife {
             "assume-changed mode is only valid for the NEON backend"
         );
 
-        rebuild_active_set(&mut self.arena);
+        let allow_prune = should_run_prune_pass::<ASSUME_CHANGED_MODE>(self.generation);
+        let skip_rebuild_assume_no_prune = ASSUME_CHANGED_MODE
+            && !allow_prune
+            && self.arena.active_set_dense_contiguous
+            && self.arena.free_list.is_empty()
+            && self.arena.active_set.len() == self.arena.occupied_count
+            && self.arena.occupied_count + 1 == self.arena.meta.len()
+            && self.arena.changed_list.len() == self.arena.active_set.len()
+            && self.arena.changed_list.first().map(|idx| idx.0) == Some(1)
+            && self.arena.changed_list.last().map(|idx| idx.0)
+                == Some(self.arena.occupied_count as u32)
+            && self.arena.changed_influence.is_empty();
+        debug_assert!(
+            !skip_rebuild_assume_no_prune
+                || self.arena.changed_list.iter().copied().eq(self
+                    .arena
+                    .active_set
+                    .iter()
+                    .copied()),
+            "assume-changed skip path requires changed_list to mirror active_set"
+        );
+
+        if !skip_rebuild_assume_no_prune {
+            rebuild_active_set(&mut self.arena);
+        }
 
         if self.arena.active_set.is_empty() {
             self.generation += 1;
@@ -1955,7 +1979,11 @@ impl TurboLife {
         }
 
         let active_len = self.arena.active_set.len();
-        let changed_len = self.arena.changed_scratch.len();
+        let changed_len = if skip_rebuild_assume_no_prune {
+            active_len
+        } else {
+            self.arena.changed_scratch.len()
+        };
         self.arena.expand_buf.clear();
         self.arena.prune_buf.clear();
         let use_serial_cache = SERIAL_CACHE_MAX_ACTIVE.is_some_and(|limit| active_len <= limit)
@@ -1970,7 +1998,6 @@ impl TurboLife {
         let run_parallel = effective_threads > 1;
         const TRACK_NEIGHBOR_INFLUENCE: bool = false;
         let emit_changed = !ASSUME_CHANGED_MODE;
-        let allow_prune = should_run_prune_pass::<ASSUME_CHANGED_MODE>(self.generation);
         self.arena.prune_candidates_verified = allow_prune && !run_parallel;
 
         let (cb_lo, cb_hi) = self.arena.cell_bufs.split_at_mut(1);
@@ -2750,12 +2777,14 @@ impl TurboLife {
                     self.arena.changed_influence.clear();
                 }
             } else {
-                self.arena.changed_list.clear();
+                if !skip_rebuild_assume_no_prune {
+                    self.arena.changed_list.clear();
+                }
                 self.arena.changed_influence.clear();
             }
             self.arena.prune_candidates_verified = all_prune_candidates_verified;
         }
-        if ASSUME_CHANGED_MODE {
+        if ASSUME_CHANGED_MODE && !skip_rebuild_assume_no_prune {
             self.derive_changed_from_active_minus_prune();
         }
         if !self.arena.changed_list.is_empty() {
@@ -3252,6 +3281,55 @@ mod tests {
         assert_eq!(engine.population(), 0);
         assert_eq!(engine.arena.occupied_count, 0);
         assert!(engine.arena.active_set.is_empty());
+    }
+
+    fn seed_assume_changed_dense_skip_fixture(
+        engine: &mut TurboLife,
+        tile_count: usize,
+    ) -> Vec<TileIdx> {
+        assert!(tile_count > 0);
+        let mut idxs = Vec::with_capacity(tile_count);
+        for tx in 0..tile_count as i64 {
+            idxs.push(engine.arena.allocate((tx, 0)));
+        }
+        engine.arena.active_set = idxs.clone();
+        engine.arena.active_set_dense_contiguous = true;
+        engine.arena.changed_list = idxs.clone();
+        engine.arena.changed_influence.clear();
+        engine.generation = 1;
+        idxs
+    }
+
+    #[test]
+    fn assume_changed_skip_rebuild_keeps_changed_queue_serial() {
+        let mut engine = TurboLife::with_config(TurboLifeConfig::default().thread_count(1));
+        let expected_changed = seed_assume_changed_dense_skip_fixture(&mut engine, 8);
+        let sentinel = TileIdx(u32::MAX);
+        engine.arena.changed_scratch = vec![sentinel];
+
+        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true>();
+
+        assert_eq!(engine.arena.changed_scratch, vec![sentinel]);
+        assert_eq!(engine.arena.changed_list, expected_changed);
+        assert!(engine.arena.changed_influence.is_empty());
+    }
+
+    #[test]
+    fn assume_changed_skip_rebuild_keeps_changed_queue_parallel() {
+        let mut engine = TurboLife::with_config(TurboLifeConfig::default().thread_count(4));
+        let expected_changed =
+            seed_assume_changed_dense_skip_fixture(&mut engine, PARALLEL_KERNEL_MIN_ACTIVE);
+        assert!(
+            super::tuned_parallel_threads(engine.arena.active_set.len(), engine.pool_threads) > 1
+        );
+        let sentinel = TileIdx(u32::MAX);
+        engine.arena.changed_scratch = vec![sentinel];
+
+        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true>();
+
+        assert_eq!(engine.arena.changed_scratch, vec![sentinel]);
+        assert_eq!(engine.arena.changed_list, expected_changed);
+        assert!(engine.arena.changed_influence.is_empty());
     }
 
     #[test]
