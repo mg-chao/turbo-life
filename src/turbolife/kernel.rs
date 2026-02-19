@@ -1776,6 +1776,117 @@ pub unsafe fn advance_tile_fused_neon_no_track(
 #[inline(always)]
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
+unsafe fn advance_tile_fused_neon_assume_changed_no_track_impl(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
+    meta_ptr: *mut TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [NeighborIdx; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+) -> TileAdvanceResult {
+    let nb = unsafe { *neighbors_ptr.add(idx) };
+    let current = unsafe { &(*current_ptr.add(idx)).0 };
+    let next = unsafe { &mut (*next_ptr.add(idx)).0 };
+    let meta_slot = unsafe { meta_ptr.add(idx) };
+    let meta = unsafe { *meta_slot };
+    let missing_mask = meta.missing_mask;
+    let tile_has_live = meta.has_live();
+    let north_i = nb[0] as usize;
+    let south_i = nb[1] as usize;
+    let west_i = nb[2] as usize;
+    let east_i = nb[3] as usize;
+    let nw_i = nb[4] as usize;
+    let ne_i = nb[5] as usize;
+    let sw_i = nb[6] as usize;
+    let se_i = nb[7] as usize;
+
+    if !tile_has_live {
+        let force_store = meta.alt_phase_dirty();
+        return unsafe {
+            advance_tile_fused_empty_tile::<false, true>(
+                current,
+                next,
+                meta_slot,
+                missing_mask,
+                force_store,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+                north_i,
+                south_i,
+                west_i,
+                east_i,
+                nw_i,
+                ne_i,
+                sw_i,
+                se_i,
+            )
+        };
+    }
+
+    let ghost_north = unsafe { *borders_south_read_ptr.add(north_i) };
+    let ghost_south = unsafe { *borders_north_read_ptr.add(south_i) };
+    let ghost_west = unsafe { *borders_east_read_ptr.add(west_i) };
+    let ghost_east = unsafe { *borders_west_read_ptr.add(east_i) };
+    let nw_live = unsafe { *live_masks_read_ptr.add(nw_i) };
+    let ne_live = unsafe { *live_masks_read_ptr.add(ne_i) };
+    let sw_live = unsafe { *live_masks_read_ptr.add(sw_i) };
+    let se_live = unsafe { *live_masks_read_ptr.add(se_i) };
+    let ghost_nw = (nw_live & LIVE_SE) != 0;
+    let ghost_ne = (ne_live & LIVE_SW) != 0;
+    let ghost_sw = (sw_live & LIVE_NE) != 0;
+    let ghost_se = (se_live & LIVE_NW) != 0;
+
+    let (changed, border, has_live) = unsafe {
+        advance_core_neon_impl_raw::<false, true>(
+            current,
+            next,
+            ghost_north,
+            ghost_south,
+            ghost_west,
+            ghost_east,
+            ghost_nw as u64,
+            ghost_ne as u64,
+            ghost_sw as u64,
+            ghost_se as u64,
+        )
+    };
+    let prune_ready = !has_live && missing_mask == MISSING_ALL_NEIGHBORS;
+    let live_mask = border.live_mask();
+
+    unsafe {
+        *next_borders_north_ptr.add(idx) = border.north;
+        *next_borders_south_ptr.add(idx) = border.south;
+        *next_borders_west_ptr.add(idx) = border.west;
+        *next_borders_east_ptr.add(idx) = border.east;
+        *next_live_masks_ptr.add(idx) = live_mask;
+        (*meta_slot).update_after_step(changed, has_live);
+    }
+
+    TileAdvanceResult::new(changed, has_live, missing_mask, live_mask, 0, prune_ready)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn advance_tile_fused_neon_assume_changed_no_track(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
@@ -1794,7 +1905,7 @@ pub unsafe fn advance_tile_fused_neon_assume_changed_no_track(
     idx: usize,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, true, false>(
+        advance_tile_fused_neon_assume_changed_no_track_impl(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1876,7 +1987,7 @@ pub unsafe fn advance_tile_fused_neon_assume_changed_no_track_fast(
     idx: usize,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, true, false>(
+        advance_tile_fused_neon_assume_changed_no_track_impl(
             current_ptr,
             next_ptr,
             meta_ptr,

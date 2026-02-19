@@ -888,7 +888,11 @@ impl WorkerScratch {
     }
 
     #[inline]
-    fn reserve_for_chunk<const EMIT_CHANGED: bool, const TRACK_NEIGHBOR_INFLUENCE: bool>(
+    fn reserve_for_chunk<
+        const EMIT_CHANGED: bool,
+        const TRACK_NEIGHBOR_INFLUENCE: bool,
+        const ALLOW_PRUNE: bool,
+    >(
         &mut self,
         chunk_len: usize,
     ) {
@@ -898,7 +902,9 @@ impl WorkerScratch {
         if EMIT_CHANGED && TRACK_NEIGHBOR_INFLUENCE {
             Self::reserve_total_capacity(&mut self.changed_influence, chunk_len);
         }
-        Self::reserve_total_capacity(&mut self.prune, chunk_len);
+        if ALLOW_PRUNE {
+            Self::reserve_total_capacity(&mut self.prune, chunk_len);
+        }
         let expand_target = chunk_len.saturating_mul(8);
         Self::reserve_total_capacity(&mut self.expand, expand_target);
     }
@@ -907,6 +913,7 @@ impl WorkerScratch {
     fn reserve_for_additional_work<
         const EMIT_CHANGED: bool,
         const TRACK_NEIGHBOR_INFLUENCE: bool,
+        const ALLOW_PRUNE: bool,
     >(
         &mut self,
         work_items: usize,
@@ -917,7 +924,9 @@ impl WorkerScratch {
         if EMIT_CHANGED && TRACK_NEIGHBOR_INFLUENCE {
             Self::reserve_additional_capacity(&mut self.changed_influence, work_items);
         }
-        Self::reserve_additional_capacity(&mut self.prune, work_items);
+        if ALLOW_PRUNE {
+            Self::reserve_additional_capacity(&mut self.prune, work_items);
+        }
         let expand_additional = work_items.saturating_mul(8);
         Self::reserve_additional_capacity(&mut self.expand, expand_additional);
     }
@@ -1517,6 +1526,7 @@ impl TurboLife {
         active_len: usize,
         emit_changed: bool,
         track_neighbor_influence: bool,
+        allow_prune: bool,
     ) {
         if self.worker_scratch.len() < worker_count {
             self.worker_scratch
@@ -1526,28 +1536,27 @@ impl TurboLife {
             return;
         }
         let chunk_len = active_len.div_ceil(worker_count);
-        if emit_changed {
-            if track_neighbor_influence {
+
+        macro_rules! reset_and_reserve_scratch {
+            ($emit_changed:literal, $track_neighbor_influence:literal, $allow_prune:literal) => {{
                 for scratch in self.worker_scratch.iter_mut().take(worker_count) {
                     scratch.clear();
-                    scratch.reserve_for_chunk::<true, true>(chunk_len);
+                    scratch.reserve_for_chunk::<$emit_changed, $track_neighbor_influence, $allow_prune>(
+                        chunk_len,
+                    );
                 }
-            } else {
-                for scratch in self.worker_scratch.iter_mut().take(worker_count) {
-                    scratch.clear();
-                    scratch.reserve_for_chunk::<true, false>(chunk_len);
-                }
-            }
-        } else if track_neighbor_influence {
-            for scratch in self.worker_scratch.iter_mut().take(worker_count) {
-                scratch.clear();
-                scratch.reserve_for_chunk::<false, true>(chunk_len);
-            }
-        } else {
-            for scratch in self.worker_scratch.iter_mut().take(worker_count) {
-                scratch.clear();
-                scratch.reserve_for_chunk::<false, false>(chunk_len);
-            }
+            }};
+        }
+
+        match (emit_changed, track_neighbor_influence, allow_prune) {
+            (true, true, true) => reset_and_reserve_scratch!(true, true, true),
+            (true, true, false) => reset_and_reserve_scratch!(true, true, false),
+            (true, false, true) => reset_and_reserve_scratch!(true, false, true),
+            (true, false, false) => reset_and_reserve_scratch!(true, false, false),
+            (false, true, true) => reset_and_reserve_scratch!(false, true, true),
+            (false, true, false) => reset_and_reserve_scratch!(false, true, false),
+            (false, false, true) => reset_and_reserve_scratch!(false, false, true),
+            (false, false, false) => reset_and_reserve_scratch!(false, false, false),
         }
     }
 
@@ -2464,6 +2473,7 @@ impl TurboLife {
                 active_len,
                 emit_changed,
                 TRACK_NEIGHBOR_INFLUENCE,
+                allow_prune,
             );
             let scratch_ptr = SendPtr::new(self.worker_scratch.as_mut_ptr());
             #[cfg(target_arch = "x86_64")]
@@ -2628,7 +2638,9 @@ impl TurboLife {
                         }
                         let end = start.saturating_add(static_chunk_size).min(active_len);
                         let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
-                        scratch.reserve_for_additional_work::<$emit_changed, $track>(end - start);
+                        scratch.reserve_for_additional_work::<$emit_changed, $track, $allow_prune>(
+                            end - start,
+                        );
                         for i in start..end {
                             process_work_item!(
                                 $advance,
@@ -2679,7 +2691,7 @@ impl TurboLife {
                                     break;
                                 }
                                 let end = start.saturating_add(chunk_size).min(active_len);
-                                scratch.reserve_for_additional_work::<$emit_changed, $track>(
+                                scratch.reserve_for_additional_work::<$emit_changed, $track, $allow_prune>(
                                     end - start,
                                 );
                                 for i in start..end {
@@ -2713,14 +2725,17 @@ impl TurboLife {
             for worker_id in 0..worker_count {
                 let scratch = &self.worker_scratch[worker_id];
                 let expand_len = scratch.expand.len();
-                let prune_len = scratch.prune.len();
                 let changed_len = scratch.changed.len();
 
                 total_expand = total_expand.saturating_add(expand_len);
-                total_prune = total_prune.saturating_add(prune_len);
                 total_changed = total_changed.saturating_add(changed_len);
-                if !scratch.prune_candidates_verified {
-                    all_prune_candidates_verified = false;
+                if allow_prune {
+                    total_prune = total_prune.saturating_add(scratch.prune.len());
+                    if !scratch.prune_candidates_verified {
+                        all_prune_candidates_verified = false;
+                    }
+                } else {
+                    debug_assert!(scratch.prune.is_empty());
                 }
 
                 if TRACK_NEIGHBOR_INFLUENCE {
@@ -2766,7 +2781,11 @@ impl TurboLife {
             }
 
             merge_worker_vectors!(self.arena.expand_buf, expand, total_expand);
-            merge_worker_vectors!(self.arena.prune_buf, prune, total_prune);
+            if allow_prune {
+                merge_worker_vectors!(self.arena.prune_buf, prune, total_prune);
+            } else {
+                self.arena.prune_buf.clear();
+            }
             if emit_changed {
                 merge_worker_vectors!(self.arena.changed_list, changed, total_changed);
                 if TRACK_NEIGHBOR_INFLUENCE {
@@ -3355,10 +3374,10 @@ mod tests {
     #[test]
     fn worker_scratch_reserve_for_chunk_reaches_requested_capacity() {
         let mut scratch = super::WorkerScratch::default();
-        scratch.reserve_for_chunk::<true, true>(8);
+        scratch.reserve_for_chunk::<true, true, true>(8);
 
         let chunk_target = scratch.changed.capacity() + 1;
-        scratch.reserve_for_chunk::<true, true>(chunk_target);
+        scratch.reserve_for_chunk::<true, true, true>(chunk_target);
         assert!(
             scratch.changed.capacity() >= chunk_target,
             "changed capacity {} < chunk target {chunk_target}",
@@ -3377,7 +3396,7 @@ mod tests {
 
         let expand_chunk_target = scratch.expand.capacity().div_ceil(3) + 1;
         let expand_target = expand_chunk_target.saturating_mul(3);
-        scratch.reserve_for_chunk::<false, false>(expand_chunk_target);
+        scratch.reserve_for_chunk::<false, false, false>(expand_chunk_target);
         assert!(
             scratch.expand.capacity() >= expand_target,
             "expand capacity {} < expand target {expand_target}",
