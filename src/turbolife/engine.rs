@@ -118,7 +118,7 @@ const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 1;
 const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE: usize = 2;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const PARALLEL_DYNAMIC_APPLE_DENSE_CHUNK_MIN_ACTIVE: usize = 2_048;
-const ASSUME_CHANGED_PRUNE_STRIDE: u64 = 128;
+const ASSUME_CHANGED_PRUNE_STRIDE: u64 = 512;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 #[cfg(target_arch = "x86_64")]
@@ -1565,8 +1565,23 @@ impl TurboLife {
     }
 
     #[inline(always)]
+    fn changed_scratch_is_dense_contiguous(&self, len: usize) -> bool {
+        len != 0
+            && self.arena.changed_scratch.len() == len
+            && self.arena.changed_scratch.first().map(|idx| idx.0) == Some(1)
+            && self.arena.changed_scratch.last().map(|idx| idx.0) == Some(len as u32)
+    }
+
+    #[inline(always)]
     fn clone_active_into_changed_fast(&mut self) {
         let len = self.arena.active_set.len();
+        if self.changed_scratch_is_dense_contiguous(len) {
+            std::mem::swap(
+                &mut self.arena.changed_list,
+                &mut self.arena.changed_scratch,
+            );
+            return;
+        }
         self.arena.changed_list.clear();
         reserve_additional_capacity(&mut self.arena.changed_list, len);
         unsafe {
