@@ -2247,13 +2247,15 @@ impl TurboLife {
                         }
 
                         let missing = result.missing_mask;
-                        if unlikely(missing != 0) {
+                        let live_mask = result.live_mask;
+                        let expand_mask = missing & live_mask;
+                        if unlikely(expand_mask != 0) {
                             unsafe {
                                 append_expand_candidates_cold(
                                     &mut self.arena.expand_buf,
                                     idx,
-                                    missing,
-                                    result.live_mask,
+                                    expand_mask,
+                                    live_mask,
                                 );
                             }
                         }
@@ -2386,13 +2388,15 @@ impl TurboLife {
                         }
 
                         let missing = result.missing_mask;
-                        if unlikely(missing != 0) {
+                        let live_mask = result.live_mask;
+                        let expand_mask = missing & live_mask;
+                        if unlikely(expand_mask != 0) {
                             unsafe {
                                 append_expand_candidates_cold(
                                     &mut self.arena.expand_buf,
                                     idx,
-                                    missing,
-                                    result.live_mask,
+                                    expand_mask,
+                                    live_mask,
                                 );
                             }
                         }
@@ -2610,13 +2614,15 @@ impl TurboLife {
                     }
 
                     let missing = result.missing_mask;
-                    if unlikely(missing != 0) {
+                    let live_mask = result.live_mask;
+                    let expand_mask = missing & live_mask;
+                    if unlikely(expand_mask != 0) {
                         unsafe {
                             append_expand_candidates_cold(
                                 &mut ($scratch).expand,
                                 idx,
-                                missing,
-                                result.live_mask,
+                                expand_mask,
+                                live_mask,
                             );
                         }
                     }
