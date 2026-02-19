@@ -14,7 +14,7 @@ use super::tilemap::{TileMap, tile_hash};
 const INITIAL_TILE_CAPACITY: usize = 256;
 const MIN_GROW_TILES: usize = 256;
 const ACTIVE_SORT_RADIX_BUCKETS: usize = 1 << 16;
-const COORD_LOOKUP_CACHE_ENABLED: bool = true;
+const COORD_LOOKUP_CACHE_ENABLED: bool = false;
 const COORD_LOOKUP_CACHE_SETS: usize = 1 << 14;
 const COORD_LOOKUP_CACHE_MASK: usize = COORD_LOOKUP_CACHE_SETS - 1;
 const COORD_LOOKUP_CACHE_REPLACEMENT_SHIFT: u32 = 17;
@@ -290,8 +290,11 @@ impl TileArena {
             border_live_masks: [border_live_masks0, border_live_masks1],
             border_phase: 0,
             coord_to_idx: TileMap::with_capacity(INITIAL_TILE_CAPACITY),
-            coord_lookup_cache: vec![CoordLookupCacheSet::EMPTY; COORD_LOOKUP_CACHE_SETS]
-                .into_boxed_slice(),
+            coord_lookup_cache: if COORD_LOOKUP_CACHE_ENABLED {
+                vec![CoordLookupCacheSet::EMPTY; COORD_LOOKUP_CACHE_SETS].into_boxed_slice()
+            } else {
+                vec![CoordLookupCacheSet::EMPTY; 1].into_boxed_slice()
+            },
             free_list: Vec::new(),
             changed_list: Vec::new(),
             changed_influence: Vec::new(),
@@ -369,6 +372,9 @@ impl TileArena {
 
     #[inline(always)]
     fn coord_lookup_cache_get(&self, coord: (i64, i64), hash: u64) -> Option<TileIdx> {
+        if !COORD_LOOKUP_CACHE_ENABLED {
+            return None;
+        }
         let set = unsafe {
             self.coord_lookup_cache
                 .get_unchecked(Self::coord_lookup_cache_slot(hash))
@@ -384,6 +390,9 @@ impl TileArena {
 
     #[inline(always)]
     fn coord_lookup_cache_set(&mut self, coord: (i64, i64), idx: TileIdx, hash: u64) {
+        if !COORD_LOOKUP_CACHE_ENABLED {
+            return;
+        }
         let set = unsafe {
             self.coord_lookup_cache
                 .get_unchecked_mut(Self::coord_lookup_cache_slot(hash))
@@ -421,6 +430,9 @@ impl TileArena {
 
     #[inline(always)]
     fn coord_lookup_cache_clear(&mut self, coord: (i64, i64), idx: TileIdx, hash: u64) {
+        if !COORD_LOOKUP_CACHE_ENABLED {
+            return;
+        }
         let set = unsafe {
             self.coord_lookup_cache
                 .get_unchecked_mut(Self::coord_lookup_cache_slot(hash))
