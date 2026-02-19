@@ -1266,11 +1266,7 @@ unsafe fn advance_tile_fused_impl<
     let meta = unsafe { *meta_slot };
     let missing_mask = meta.missing_mask;
     let tile_has_live = meta.has_live();
-    let force_store = if CORE_BACKEND == CORE_BACKEND_NEON {
-        true
-    } else {
-        meta.alt_phase_dirty()
-    };
+    let force_store = meta.alt_phase_dirty();
     let north_i = nb[0] as usize;
     let south_i = nb[1] as usize;
     let west_i = nb[2] as usize;
