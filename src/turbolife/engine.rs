@@ -114,7 +114,7 @@ const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = Some(8_192);
 const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 1;
 // Throttle assume-changed prune passes while still periodically reclaiming
 // dead tiles so long-running runs do not accumulate stale occupancy.
-const ASSUME_CHANGED_PRUNE_STRIDE: u64 = 512;
+const ASSUME_CHANGED_PRUNE_STRIDE: u64 = 2048;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
@@ -147,6 +147,7 @@ const _: [(); 1] = [(); (PREFETCH_TILE_NEAR_AHEAD_AARCH64 >= 1) as usize];
 const _: [(); 1] =
     [(); (PREFETCH_TILE_FAR_AHEAD_AARCH64 > PREFETCH_TILE_NEAR_AHEAD_AARCH64) as usize];
 const _: [(); 1] = [(); (ASSUME_CHANGED_PRUNE_STRIDE > 0) as usize];
+const _: [(); 1] = [(); ASSUME_CHANGED_PRUNE_STRIDE.is_power_of_two() as usize];
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -1215,7 +1216,8 @@ fn dynamic_parallel_chunk_size(
 
 #[inline(always)]
 fn should_run_prune_pass<const ASSUME_CHANGED_MODE: bool>(generation: u64) -> bool {
-    !ASSUME_CHANGED_MODE || generation.is_multiple_of(ASSUME_CHANGED_PRUNE_STRIDE)
+    !ASSUME_CHANGED_MODE
+        || (generation != 0 && (generation & (ASSUME_CHANGED_PRUNE_STRIDE - 1)) == 0)
 }
 
 #[inline(always)]
@@ -3208,7 +3210,7 @@ mod tests {
     #[test]
     fn assume_changed_mode_prune_pass_follows_generation_stride() {
         let stride = super::ASSUME_CHANGED_PRUNE_STRIDE;
-        assert!(super::should_run_prune_pass::<true>(0));
+        assert!(!super::should_run_prune_pass::<true>(0));
         if stride > 1 {
             assert!(!super::should_run_prune_pass::<true>(1));
             assert!(!super::should_run_prune_pass::<true>(stride - 1));
@@ -3221,9 +3223,21 @@ mod tests {
     }
 
     #[test]
-    fn assume_changed_mode_prunes_extinct_tile_on_generation_zero() {
+    fn assume_changed_mode_skips_prune_on_generation_zero() {
         let mut engine = TurboLife::with_config(TurboLifeConfig::default().thread_count(1));
         engine.set_cell(0, 0, true);
+
+        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true>();
+
+        assert_eq!(engine.population(), 0);
+        assert!(engine.arena.occupied_count > 0);
+    }
+
+    #[test]
+    fn assume_changed_mode_prunes_extinct_tile_on_stride_boundary() {
+        let mut engine = TurboLife::with_config(TurboLifeConfig::default().thread_count(1));
+        engine.set_cell(0, 0, true);
+        engine.generation = super::ASSUME_CHANGED_PRUNE_STRIDE;
 
         engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true>();
 
