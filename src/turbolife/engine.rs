@@ -118,7 +118,7 @@ const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 1;
 const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE: usize = 2;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const PARALLEL_DYNAMIC_APPLE_DENSE_CHUNK_MIN_ACTIVE: usize = 2_048;
-const ASSUME_CHANGED_PRUNE_STRIDE: u64 = 16;
+const ASSUME_CHANGED_PRUNE_STRIDE: u64 = 128;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
 #[cfg(target_arch = "x86_64")]
@@ -3197,12 +3197,17 @@ mod tests {
 
     #[test]
     fn assume_changed_prune_stride_respects_generation_period() {
+        let stride = super::ASSUME_CHANGED_PRUNE_STRIDE;
         assert!(super::should_run_prune_pass::<true>(0));
-        assert!(!super::should_run_prune_pass::<true>(1));
-        assert!(!super::should_run_prune_pass::<true>(15));
-        assert!(super::should_run_prune_pass::<true>(16));
-        assert!(!super::should_run_prune_pass::<true>(31));
-        assert!(super::should_run_prune_pass::<true>(32));
+        if stride > 1 {
+            assert!(!super::should_run_prune_pass::<true>(1));
+            assert!(!super::should_run_prune_pass::<true>(stride - 1));
+        }
+        assert!(super::should_run_prune_pass::<true>(stride));
+        if let Some(next_cycle) = stride.checked_mul(2) {
+            assert!(!super::should_run_prune_pass::<true>(next_cycle - 1));
+            assert!(super::should_run_prune_pass::<true>(next_cycle));
+        }
     }
 
     #[test]
