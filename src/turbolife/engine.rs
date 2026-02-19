@@ -110,21 +110,18 @@ const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = None;
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = Some(8_192);
 // Dynamic scheduler chunking target per worker.
-// Use conservative chunk fan-out by default.
-#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+// Keep one chunk per worker to reduce scheduler cursor traffic.
 const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 1;
-// Apple Silicon benefits from denser chunk fan-out to smooth heterogeneous
-// core tail latency without overloading the lock-free cursor.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 2;
+// Throttle assume-changed prune passes while still periodically reclaiming
+// dead tiles so long-running runs do not accumulate stale occupancy.
 const ASSUME_CHANGED_PRUNE_STRIDE: u64 = 512;
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
-// Keep work packets small on Apple Silicon so lock-free stealing stays
-// granular across perf/efficiency cores.
+// Keep chunks within one L1-friendly packet of tile descriptors on Apple
+// Silicon; larger packets regressed wall-clock on the primary harness.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 112;
+const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 64;
 #[cfg(target_arch = "x86_64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
 #[cfg(target_arch = "aarch64")]
@@ -1197,14 +1194,7 @@ fn churn_below_percent(changed_len: usize, active_len: usize, churn_pct_threshol
     (changed_len as u128) * 100 < (active_len as u128) * (churn_pct_threshold as u128)
 }
 
-#[inline]
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-fn dynamic_target_chunks_per_worker(_active_len: usize, _changed_len: usize) -> usize {
-    PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE
-}
-
-#[inline]
-#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+#[inline(always)]
 fn dynamic_target_chunks_per_worker(_active_len: usize, _changed_len: usize) -> usize {
     PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE
 }
@@ -3157,16 +3147,8 @@ mod tests {
 
     #[test]
     fn dynamic_chunk_targets_follow_platform_frontier_policy() {
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-        let expected = 2;
-        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-        let expected = 1;
-
         for (active_len, changed_len) in [(1, 1), (2_048, 900), (16_384, 16_384)] {
-            assert_eq!(
-                dynamic_target_chunks_per_worker(active_len, changed_len),
-                expected
-            );
+            assert_eq!(dynamic_target_chunks_per_worker(active_len, changed_len), 1);
         }
     }
 
@@ -3189,10 +3171,10 @@ mod tests {
         let large = dynamic_parallel_chunk_size(65_536, 50_000, 4);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            assert_eq!(small, 100);
-            assert_eq!(medium_balanced, 112);
-            assert_eq!(medium_high, 112);
-            assert_eq!(large, 112);
+            assert_eq!(small, 64);
+            assert_eq!(medium_balanced, 64);
+            assert_eq!(medium_high, 64);
+            assert_eq!(large, 64);
         }
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         {
@@ -3217,14 +3199,14 @@ mod tests {
     }
 
     #[test]
-    fn assume_changed_prune_stride_applies_only_to_assume_mode() {
+    fn assume_changed_prune_policy_applies_only_to_non_assume_mode() {
         assert!(super::should_run_prune_pass::<false>(0));
         assert!(super::should_run_prune_pass::<false>(7));
         assert!(super::should_run_prune_pass::<false>(31));
     }
 
     #[test]
-    fn assume_changed_prune_stride_respects_generation_period() {
+    fn assume_changed_mode_prune_pass_follows_generation_stride() {
         let stride = super::ASSUME_CHANGED_PRUNE_STRIDE;
         assert!(super::should_run_prune_pass::<true>(0));
         if stride > 1 {
@@ -3236,6 +3218,18 @@ mod tests {
             assert!(!super::should_run_prune_pass::<true>(next_cycle - 1));
             assert!(super::should_run_prune_pass::<true>(next_cycle));
         }
+    }
+
+    #[test]
+    fn assume_changed_mode_prunes_extinct_tile_on_generation_zero() {
+        let mut engine = TurboLife::with_config(TurboLifeConfig::default().thread_count(1));
+        engine.set_cell(0, 0, true);
+
+        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true>();
+
+        assert_eq!(engine.population(), 0);
+        assert_eq!(engine.arena.occupied_count, 0);
+        assert!(engine.arena.active_set.is_empty());
     }
 
     #[test]
