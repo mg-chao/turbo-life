@@ -14,8 +14,10 @@ use super::tilemap::{TileMap, tile_hash};
 const INITIAL_TILE_CAPACITY: usize = 256;
 const MIN_GROW_TILES: usize = 256;
 const ACTIVE_SORT_RADIX_BUCKETS: usize = 1 << 16;
-const COORD_LOOKUP_CACHE_SIZE: usize = 1 << 12;
-const COORD_LOOKUP_CACHE_MASK: usize = COORD_LOOKUP_CACHE_SIZE - 1;
+const COORD_LOOKUP_CACHE_ENABLED: bool = true;
+const COORD_LOOKUP_CACHE_SETS: usize = 1 << 14;
+const COORD_LOOKUP_CACHE_MASK: usize = COORD_LOOKUP_CACHE_SETS - 1;
+const COORD_LOOKUP_CACHE_REPLACEMENT_SHIFT: u32 = 17;
 pub(crate) const CHANGED_INFLUENCE_ALL: u8 = 0xFF;
 const DIR_OFFSETS: [(i64, i64); 8] = [
     (0, 1),
@@ -82,6 +84,20 @@ struct CoordLookupCacheEntry {
 
 impl CoordLookupCacheEntry {
     const EMPTY: Self = Self { x: 0, y: 0, idx: 0 };
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct CoordLookupCacheSet {
+    a: CoordLookupCacheEntry,
+    b: CoordLookupCacheEntry,
+}
+
+impl CoordLookupCacheSet {
+    const EMPTY: Self = Self {
+        a: CoordLookupCacheEntry::EMPTY,
+        b: CoordLookupCacheEntry::EMPTY,
+    };
 }
 
 #[derive(Clone)]
@@ -208,7 +224,7 @@ pub struct TileArena {
     pub border_live_masks: [Vec<u8>; 2],
     pub border_phase: usize,
     coord_to_idx: TileMap,
-    coord_lookup_cache: Box<[CoordLookupCacheEntry]>,
+    coord_lookup_cache: Box<[CoordLookupCacheSet]>,
     pub free_list: Vec<TileIdx>,
     pub changed_list: Vec<TileIdx>,
     pub changed_influence: Vec<u8>,
@@ -274,7 +290,7 @@ impl TileArena {
             border_live_masks: [border_live_masks0, border_live_masks1],
             border_phase: 0,
             coord_to_idx: TileMap::with_capacity(INITIAL_TILE_CAPACITY),
-            coord_lookup_cache: vec![CoordLookupCacheEntry::EMPTY; COORD_LOOKUP_CACHE_SIZE]
+            coord_lookup_cache: vec![CoordLookupCacheSet::EMPTY; COORD_LOOKUP_CACHE_SETS]
                 .into_boxed_slice(),
             free_list: Vec::new(),
             changed_list: Vec::new(),
@@ -353,36 +369,67 @@ impl TileArena {
 
     #[inline(always)]
     fn coord_lookup_cache_get(&self, coord: (i64, i64), hash: u64) -> Option<TileIdx> {
-        let entry = unsafe {
+        let set = unsafe {
             self.coord_lookup_cache
                 .get_unchecked(Self::coord_lookup_cache_slot(hash))
         };
-        if entry.idx != 0 && entry.x == coord.0 && entry.y == coord.1 {
-            Some(TileIdx(entry.idx))
-        } else {
-            None
+        if set.a.idx != 0 && set.a.x == coord.0 && set.a.y == coord.1 {
+            return Some(TileIdx(set.a.idx));
         }
+        if set.b.idx != 0 && set.b.x == coord.0 && set.b.y == coord.1 {
+            return Some(TileIdx(set.b.idx));
+        }
+        None
     }
 
     #[inline(always)]
     fn coord_lookup_cache_set(&mut self, coord: (i64, i64), idx: TileIdx, hash: u64) {
-        let entry = unsafe {
+        let set = unsafe {
             self.coord_lookup_cache
                 .get_unchecked_mut(Self::coord_lookup_cache_slot(hash))
         };
-        entry.x = coord.0;
-        entry.y = coord.1;
-        entry.idx = idx.0;
+        if set.a.idx != 0 && set.a.x == coord.0 && set.a.y == coord.1 {
+            set.a.idx = idx.0;
+            return;
+        }
+        if set.b.idx != 0 && set.b.x == coord.0 && set.b.y == coord.1 {
+            set.b.idx = idx.0;
+            return;
+        }
+        if set.a.idx == 0 {
+            set.a.x = coord.0;
+            set.a.y = coord.1;
+            set.a.idx = idx.0;
+            return;
+        }
+        if set.b.idx == 0 {
+            set.b.x = coord.0;
+            set.b.y = coord.1;
+            set.b.idx = idx.0;
+            return;
+        }
+        if ((hash >> COORD_LOOKUP_CACHE_REPLACEMENT_SHIFT) & 1) == 0 {
+            set.a.x = coord.0;
+            set.a.y = coord.1;
+            set.a.idx = idx.0;
+        } else {
+            set.b.x = coord.0;
+            set.b.y = coord.1;
+            set.b.idx = idx.0;
+        }
     }
 
     #[inline(always)]
     fn coord_lookup_cache_clear(&mut self, coord: (i64, i64), idx: TileIdx, hash: u64) {
-        let entry = unsafe {
+        let set = unsafe {
             self.coord_lookup_cache
                 .get_unchecked_mut(Self::coord_lookup_cache_slot(hash))
         };
-        if entry.idx == idx.0 && entry.x == coord.0 && entry.y == coord.1 {
-            entry.idx = 0;
+        if set.a.idx == idx.0 && set.a.x == coord.0 && set.a.y == coord.1 {
+            set.a.idx = 0;
+        }
+        if set.b.idx == idx.0 && set.b.x == coord.0 && set.b.y == coord.1 {
+            set.b.idx = 0;
         }
     }
 
@@ -404,22 +451,25 @@ impl TileArena {
 
     #[inline(always)]
     fn idx_at_cached_hashed(&mut self, coord: (i64, i64), hash: u64) -> Option<TileIdx> {
-        if let Some(idx) = self.coord_lookup_cache_get(coord, hash) {
+        if COORD_LOOKUP_CACHE_ENABLED && let Some(idx) = self.coord_lookup_cache_get(coord, hash) {
             if self.idx_matches_live_coord(idx, coord) {
                 return Some(idx);
             }
             self.coord_lookup_cache_clear(coord, idx, hash);
         }
         let idx = self.coord_to_idx.get_hashed(coord.0, coord.1, hash)?;
-        if self.idx_matches_live_coord(idx, coord) {
-            self.coord_lookup_cache_set(coord, idx, hash);
-            Some(idx)
-        } else {
+        if !self.idx_matches_live_coord(idx, coord) {
             // Defensive cleanup in case a stale coordinate mapping survives.
             self.coord_to_idx.remove_hashed(coord.0, coord.1, hash);
-            self.coord_lookup_cache_clear(coord, idx, hash);
-            None
+            if COORD_LOOKUP_CACHE_ENABLED {
+                self.coord_lookup_cache_clear(coord, idx, hash);
+            }
+            return None;
         }
+        if COORD_LOOKUP_CACHE_ENABLED {
+            self.coord_lookup_cache_set(coord, idx, hash);
+        }
+        Some(idx)
     }
 
     #[inline(always)]

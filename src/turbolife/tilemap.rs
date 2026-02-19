@@ -12,17 +12,13 @@ use super::tile::TileIdx;
 
 // ── Hash function ───────────────────────────────────────────────────────
 
-/// Two distinct Fibonacci-derived constants for mixing x and y independently.
-/// This avoids the systematic collisions that a single-constant sequential
-/// hash (like FxHash) produces on grid-aligned coordinate patterns.
+/// Two distinct odd constants for independent x/y lanes.
 const MX: u64 = 0x517c_c1b7_2722_0a95;
-const MY: u64 = 0x6c62_272e_07bb_0142;
+const MY: u64 = 0x6c62_272e_07bb_0143;
 
 #[inline(always)]
 pub(crate) fn tile_hash(x: i64, y: i64) -> u64 {
-    // Throughput-first 2-multiply mix (no final fold). Rotate y's lane so
-    // both axes contribute entropy to low bucket bits.
-    (x as u64).wrapping_mul(MX) ^ (y as u64).wrapping_mul(MY).rotate_right(31)
+    (x as u64).wrapping_mul(MX) ^ (y as u64).wrapping_mul(MY)
 }
 
 // ── Slot layout ─────────────────────────────────────────────────────────
@@ -623,5 +619,35 @@ mod tests {
             ctrl: occupied_ctrl(1, 0),
         };
         slot.set_distance(MAX_DIST + 1);
+    }
+
+    #[test]
+    fn hash_collisions_preserve_distinct_keys() {
+        fn mod_inverse_odd_u64(x: u64) -> u64 {
+            debug_assert_eq!(x & 1, 1);
+            let mut inv = 1u64;
+            for _ in 0..6 {
+                inv = inv.wrapping_mul(2u64.wrapping_sub(x.wrapping_mul(inv)));
+            }
+            inv
+        }
+
+        let inv_mx = mod_inverse_odd_u64(MX);
+        let first = (0i64, 0i64);
+        let second_y = 1i64;
+        let second_x = (tile_hash(first.0, first.1) ^ (second_y as u64).wrapping_mul(MY))
+            .wrapping_mul(inv_mx) as i64;
+        let second = (second_x, second_y);
+        assert_ne!(first, second);
+        assert_eq!(tile_hash(first.0, first.1), tile_hash(second.0, second.1));
+
+        let mut m = TileMap::with_capacity(4);
+        assert_eq!(m.insert(first.0, first.1, TileIdx(1)), None);
+        assert_eq!(m.insert(second.0, second.1, TileIdx(2)), None);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(first.0, first.1), Some(TileIdx(1)));
+        assert_eq!(m.get(second.0, second.1), Some(TileIdx(2)));
+        assert_eq!(m.remove(second.0, second.1), Some(TileIdx(2)));
+        assert_eq!(m.get(first.0, first.1), Some(TileIdx(1)));
     }
 }
