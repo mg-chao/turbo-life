@@ -1314,6 +1314,8 @@ where
     }
 }
 
+// Keep this helper out-of-line so the rare expand-buffer miss path
+// does not inflate the hot tile-advance loop.
 #[cold]
 #[inline(never)]
 unsafe fn append_expand_candidates_cold(

@@ -1149,6 +1149,8 @@ unsafe fn advance_core_const<const CORE_BACKEND: u8, const ASSUME_CHANGED: bool>
     advance_core_scalar(current, next, ghost)
 }
 
+// Keep the empty-tile branch outlined; forcing this into the fused path
+// can exhaust debug worker stacks by ballooning the caller frame.
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
