@@ -45,12 +45,18 @@ fi
 
 HARNESS_ARGS=("$@")
 
-for arg in "${HARNESS_ARGS[@]}"; do
-    if [ "$arg" = "--pgo-train" ]; then
-        echo "error: do not pass --pgo-train explicitly; build_pgo.sh injects it for training runs." >&2
-        exit 2
-    fi
-done
+has_harness_args() {
+    [ "${#HARNESS_ARGS[@]}" -gt 0 ]
+}
+
+if has_harness_args; then
+    for arg in "${HARNESS_ARGS[@]}"; do
+        if [ "$arg" = "--pgo-train" ]; then
+            echo "error: do not pass --pgo-train explicitly; build_pgo.sh injects it for training runs." >&2
+            exit 2
+        fi
+    done
+fi
 
 HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
 SYSROOT="$(rustc --print sysroot)"
@@ -99,6 +105,26 @@ run_benchmark_report() {
     fi
 }
 
+run_benchmark_with_harness_args() {
+    local runs="$1"
+    local bin="$2"
+    if has_harness_args; then
+        run_benchmark_report "$runs" "$bin" "${HARNESS_ARGS[@]}"
+    else
+        run_benchmark_report "$runs" "$bin"
+    fi
+}
+
+run_pgo_training_once() {
+    if has_harness_args; then
+        LLVM_PROFILE_FILE="$PGO_DIR/turbo-life-%p-%m.profraw" \
+            "$GEN_TARGET_DIR/release/turbo-life" --pgo-train "${HARNESS_ARGS[@]}"
+    else
+        LLVM_PROFILE_FILE="$PGO_DIR/turbo-life-%p-%m.profraw" \
+            "$GEN_TARGET_DIR/release/turbo-life" --pgo-train
+    fi
+}
+
 extract_median_ms() {
     awk '/^median_ms:/{print $2; exit}'
 }
@@ -112,7 +138,7 @@ RUSTFLAGS="$BASE_RUSTFLAGS" \
     cargo build --release --bin turbo-life
 
 echo "==> baseline benchmark via main.rs harness (${BENCH_RUNS} runs)"
-BASELINE_REPORT="$(run_benchmark_report "$BENCH_RUNS" "$BASELINE_BIN" "${HARNESS_ARGS[@]}")"
+BASELINE_REPORT="$(run_benchmark_with_harness_args "$BENCH_RUNS" "$BASELINE_BIN")"
 echo "$BASELINE_REPORT"
 BASELINE_MEDIAN="$(printf '%s\n' "$BASELINE_REPORT" | extract_median_ms)"
 if [ -z "$BASELINE_MEDIAN" ]; then
@@ -128,8 +154,7 @@ RUSTFLAGS="$BASE_RUSTFLAGS -Cprofile-generate=$PGO_DIR" \
 echo "==> collecting PGO profiles via main.rs harness (${TRAIN_RUNS} runs)"
 for ((i = 1; i <= TRAIN_RUNS; i++)); do
     echo "  training run $i/$TRAIN_RUNS"
-    LLVM_PROFILE_FILE="$PGO_DIR/turbo-life-%p-%m.profraw" \
-        "$GEN_TARGET_DIR/release/turbo-life" --pgo-train "${HARNESS_ARGS[@]}"
+    run_pgo_training_once
 done
 
 echo "==> merging profile data"
@@ -148,7 +173,7 @@ RUSTFLAGS="$BASE_RUSTFLAGS -Cprofile-use=$PROFDATA_FILE" \
     cargo build --release --bin turbo-life
 
 echo "==> PGO benchmark via main.rs harness (${BENCH_RUNS} runs)"
-PGO_REPORT="$(run_benchmark_report "$BENCH_RUNS" "$PGO_BIN" "${HARNESS_ARGS[@]}")"
+PGO_REPORT="$(run_benchmark_with_harness_args "$BENCH_RUNS" "$PGO_BIN")"
 echo "$PGO_REPORT"
 PGO_MEDIAN="$(printf '%s\n' "$PGO_REPORT" | extract_median_ms)"
 if [ -z "$PGO_MEDIAN" ]; then

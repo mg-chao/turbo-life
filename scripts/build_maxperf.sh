@@ -44,12 +44,19 @@ if [ "$#" -gt 0 ] && [ "${1:-}" = "--" ]; then
 fi
 
 HARNESS_ARGS=("$@")
-for arg in "${HARNESS_ARGS[@]}"; do
-    if [ "$arg" = "--pgo-train" ]; then
-        echo "error: do not pass --pgo-train explicitly; build_maxperf.sh injects it for PGO training runs." >&2
-        exit 2
-    fi
-done
+
+has_harness_args() {
+    [ "${#HARNESS_ARGS[@]}" -gt 0 ]
+}
+
+if has_harness_args; then
+    for arg in "${HARNESS_ARGS[@]}"; do
+        if [ "$arg" = "--pgo-train" ]; then
+            echo "error: do not pass --pgo-train explicitly; build_maxperf.sh injects it for PGO training runs." >&2
+            exit 2
+        fi
+    done
+fi
 
 HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
 SYSROOT="$(rustc --print sysroot)"
@@ -85,10 +92,10 @@ bench_binary() {
     local runs="$1"
     local bin="$2"
     shift 2
-    if [ "${#HARNESS_ARGS[@]}" -eq 0 ]; then
-        "$ROOT_DIR/scripts/bench_main.sh" "$runs" "$bin" --quiet "$@"
-    else
+    if has_harness_args; then
         "$ROOT_DIR/scripts/bench_main.sh" "$runs" "$bin" --quiet -- "${HARNESS_ARGS[@]}" "$@"
+    else
+        "$ROOT_DIR/scripts/bench_main.sh" "$runs" "$bin" --quiet "$@"
     fi
 }
 
@@ -226,16 +233,16 @@ fi
 if [ "$PGO_CANDIDATE_READY" = "1" ]; then
     for ((i = 1; i <= TRAIN_RUNS; i++)); do
         echo "  training run $i/$TRAIN_RUNS"
-        if [ "${#HARNESS_ARGS[@]}" -eq 0 ]; then
+        if has_harness_args; then
             if ! LLVM_PROFILE_FILE="$PGO_DATA_DIR/turbo-life-%p-%m.profraw" \
-                "$PGO_GEN_DIR/release/turbo-life" --pgo-train >/dev/null; then
+                "$PGO_GEN_DIR/release/turbo-life" --pgo-train "${HARNESS_ARGS[@]}" >/dev/null; then
                 echo "warning: skipped PGO candidate (training run $i failed)" >&2
                 PGO_CANDIDATE_READY="0"
                 break
             fi
         else
             if ! LLVM_PROFILE_FILE="$PGO_DATA_DIR/turbo-life-%p-%m.profraw" \
-                "$PGO_GEN_DIR/release/turbo-life" --pgo-train "${HARNESS_ARGS[@]}" >/dev/null; then
+                "$PGO_GEN_DIR/release/turbo-life" --pgo-train >/dev/null; then
                 echo "warning: skipped PGO candidate (training run $i failed)" >&2
                 PGO_CANDIDATE_READY="0"
                 break
