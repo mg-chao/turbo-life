@@ -1,3 +1,4 @@
 /target
 /.worktrees
 .kiro
+/pgo/
