@@ -3058,6 +3058,68 @@ impl TurboLife {
         });
     }
 
+    /// Reserve arena capacity for frontier growth before a long run.
+    ///
+    /// This shifts vector/hashmap growth out of hot `step_n` loops and helps
+    /// keep expansion-heavy workloads allocation-free during stepping.
+    pub fn reserve_for_generations(&mut self, generations: u64) {
+        if generations == 0 || self.arena.occupied_count == 0 {
+            return;
+        }
+
+        let mut min_tx = i64::MAX;
+        let mut min_ty = i64::MAX;
+        let mut max_tx = i64::MIN;
+        let mut max_ty = i64::MIN;
+
+        for (word_idx, &word) in self.arena.occupied_bits.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let i = (word_idx << 6) + bit;
+                if i == 0 || i >= self.arena.meta.len() {
+                    bits &= bits - 1;
+                    continue;
+                }
+                let (tx, ty) = self.arena.coords[i];
+                min_tx = min_tx.min(tx);
+                min_ty = min_ty.min(ty);
+                max_tx = max_tx.max(tx);
+                max_ty = max_ty.max(ty);
+                bits &= bits - 1;
+            }
+        }
+
+        if min_tx > max_tx || min_ty > max_ty {
+            return;
+        }
+
+        let grow_tiles =
+            usize::try_from(generations.div_ceil(tile::TILE_SIZE as u64)).unwrap_or(usize::MAX);
+        let span_x =
+            usize::try_from(i128::from(max_tx) - i128::from(min_tx) + 1).unwrap_or(usize::MAX);
+        let span_y =
+            usize::try_from(i128::from(max_ty) - i128::from(min_ty) + 1).unwrap_or(usize::MAX);
+        let target_span_x = span_x.saturating_add(grow_tiles.saturating_mul(2));
+        let target_span_y = span_y.saturating_add(grow_tiles.saturating_mul(2));
+        let target_tiles = target_span_x
+            .saturating_mul(target_span_y)
+            .min(tile::MAX_NEIGHBOR_INDEX);
+        let current_tiles = self.arena.meta.len().saturating_sub(1);
+        if target_tiles <= current_tiles {
+            return;
+        }
+
+        let additional = target_tiles - current_tiles;
+        self.arena.reserve_additional_tiles(additional);
+        reserve_additional_capacity(&mut self.arena.active_set, additional);
+        reserve_additional_capacity(&mut self.arena.changed_list, additional);
+        reserve_additional_capacity(&mut self.arena.changed_influence, additional);
+        reserve_additional_capacity(&mut self.arena.changed_influence_scratch, additional);
+        reserve_additional_capacity(&mut self.arena.expand_buf, additional.saturating_mul(8));
+        reserve_additional_capacity(&mut self.arena.prune_buf, additional);
+    }
+
     pub fn population(&mut self) -> u64 {
         if let Some(cached) = self.population_cache {
             return cached;

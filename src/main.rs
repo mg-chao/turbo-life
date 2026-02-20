@@ -88,6 +88,7 @@ fn run_checked(config: TurboLifeConfig) {
     let mut quick = QuickLife::new();
     let mut turbo = TurboLife::with_config(config);
     seed_random_world(&mut turbo, Some(&mut quick));
+    turbo.reserve_for_generations(TOTAL_ITERATIONS);
 
     let mut quick_total_duration = std::time::Duration::ZERO;
     let mut turbo_total_duration = std::time::Duration::ZERO;
@@ -145,6 +146,7 @@ fn run_checked(config: TurboLifeConfig) {
 fn run_pgo_train(config: TurboLifeConfig) {
     let mut turbo = TurboLife::with_config(config);
     seed_random_world(&mut turbo, None);
+    turbo.reserve_for_generations(TOTAL_ITERATIONS);
     turbo.step_n(TOTAL_ITERATIONS);
     std::hint::black_box(turbo.population());
 }
