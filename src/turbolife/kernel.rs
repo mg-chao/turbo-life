@@ -707,8 +707,9 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
     ghost_se: u64,
 ) -> (bool, BorderData, bool) {
     use std::arch::aarch64::{
-        vandq_u64, vbicq_u64, vdupq_n_u64, veorq_u64, vget_high_u64, vget_lane_u64, vget_low_u64,
-        vgetq_lane_u64, vld1q_u64, vorr_u64, vorrq_u64, vshlq_n_u64, vshrq_n_u64, vst1q_u64,
+        vandq_u64, vbicq_u64, vdupq_n_u64, veorq_u64, vextq_u64, vget_high_u64, vget_lane_u64,
+        vget_low_u64, vgetq_lane_u64, vld1q_u64, vorr_u64, vorrq_u64, vshlq_n_u64, vshrq_n_u64,
+        vst1q_u64,
     };
 
     let mut changed = !TRACK_DIFF;
@@ -846,7 +847,8 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
 
         let row_below_0 = prev_above;
         let row_self_0 = unsafe { vld1q_u64(current_ptr.add(row_base)) };
-        let row_above_0 = unsafe { vld1q_u64(current_ptr.add(row_base + 1)) };
+        let row_block_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 2)) };
+        let row_above_0 = vextq_u64(row_self_0, row_block_1, 1);
         let _ = process_pair!(
             row_base,
             row_above_0,
@@ -861,8 +863,9 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
         );
 
         let row_below_1 = row_above_0;
-        let row_self_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 2)) };
-        let row_above_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 3)) };
+        let row_self_1 = row_block_1;
+        let row_block_2 = unsafe { vld1q_u64(current_ptr.add(row_base + 4)) };
+        let row_above_1 = vextq_u64(row_self_1, row_block_2, 1);
         let _ = process_pair!(
             row_base + 2,
             row_above_1,
@@ -877,8 +880,9 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
         );
 
         let row_below_2 = row_above_1;
-        let row_self_2 = unsafe { vld1q_u64(current_ptr.add(row_base + 4)) };
-        let row_above_2 = unsafe { vld1q_u64(current_ptr.add(row_base + 5)) };
+        let row_self_2 = row_block_2;
+        let row_block_3 = unsafe { vld1q_u64(current_ptr.add(row_base + 6)) };
+        let row_above_2 = vextq_u64(row_self_2, row_block_3, 1);
         let _ = process_pair!(
             row_base + 4,
             row_above_2,
@@ -893,8 +897,9 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
         );
 
         let row_below_3 = row_above_2;
-        let row_self_3 = unsafe { vld1q_u64(current_ptr.add(row_base + 6)) };
-        let row_above_3 = unsafe { vld1q_u64(current_ptr.add(row_base + 7)) };
+        let row_self_3 = row_block_3;
+        let row_block_4 = unsafe { vld1q_u64(current_ptr.add(row_base + 8)) };
+        let row_above_3 = vextq_u64(row_self_3, row_block_4, 1);
         let _ = process_pair!(
             row_base + 6,
             row_above_3,
@@ -928,7 +933,8 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
 
         let row_below_0 = prev_above;
         let row_self_0 = unsafe { vld1q_u64(current_ptr.add(row_base)) };
-        let row_above_0 = unsafe { vld1q_u64(current_ptr.add(row_base + 1)) };
+        let row_block_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 2)) };
+        let row_above_0 = vextq_u64(row_self_0, row_block_1, 1);
         let _ = process_pair!(
             row_base,
             row_above_0,
@@ -943,8 +949,9 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
         );
 
         let row_below_1 = row_above_0;
-        let row_self_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 2)) };
-        let row_above_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 3)) };
+        let row_self_1 = row_block_1;
+        let row_block_2 = unsafe { vld1q_u64(current_ptr.add(row_base + 4)) };
+        let row_above_1 = vextq_u64(row_self_1, row_block_2, 1);
         let _ = process_pair!(
             row_base + 2,
             row_above_1,
