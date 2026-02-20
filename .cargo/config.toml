@@ -1,3 +1,8 @@
+# Route rustc through a tiny wrapper so release builds can inject repo-local
+# PGO profiles with absolute paths (stable across dependency build CWDs).
+[build]
+rustc-wrapper = "scripts/rustc_wrapper.sh"
+
 # Host-tuned codegen on mainstream desktop/server CPUs.
 [target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))']
 rustflags = [
