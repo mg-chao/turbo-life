@@ -244,8 +244,8 @@ pub fn advance_core_scalar(
     next: &mut [u64; TILE_SIZE],
     ghost: &GhostZone,
 ) -> (bool, BorderData, bool) {
-    let mut changed = false;
-    let mut has_live = false;
+    let mut diff_acc = 0u64;
+    let mut live_acc = 0u64;
     let mut border_west = 0u64;
     let mut border_east = 0u64;
     let mut west_window =
@@ -260,8 +260,8 @@ pub fn advance_core_scalar(
             let next_row = advance_row_scalar($row_above, $row_self, $row_below, ghost);
 
             next[$row] = next_row;
-            changed |= next_row != $row_self;
-            has_live |= next_row != 0;
+            diff_acc |= next_row ^ $row_self;
+            live_acc |= next_row;
             border_west |= (next_row & 1) << $row;
             border_east |= ((next_row >> 63) & 1) << $row;
         }};
@@ -293,6 +293,8 @@ pub fn advance_core_scalar(
     let north_row = next[TILE_SIZE - 1];
     let south_row = next[0];
     let border = BorderData::from_edges(north_row, south_row, border_west, border_east);
+    let changed = diff_acc != 0;
+    let has_live = live_acc != 0;
 
     (changed, border, has_live)
 }
