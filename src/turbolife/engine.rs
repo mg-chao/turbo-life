@@ -1680,6 +1680,69 @@ impl TurboLife {
         }
     }
 
+    #[inline]
+    fn finalize_parallel_expand_from_worker_scratch(
+        &mut self,
+        worker_count: usize,
+        total_expand: usize,
+    ) {
+        debug_assert!(worker_count <= self.worker_scratch.len());
+        if total_expand == 0 {
+            for worker_id in 0..worker_count {
+                self.worker_scratch[worker_id].expand.clear();
+            }
+            return;
+        }
+
+        self.arena.reserve_additional_tiles(total_expand);
+        let mut keep_dense_contiguous_active = self.arena.active_set_dense_contiguous
+            && self.arena.free_list.is_empty()
+            && self.arena.active_set.len() == self.arena.occupied_count
+            && self.arena.occupied_count + 1 == self.arena.meta.len()
+            && self.arena.active_set.first().map(|idx| idx.0) == Some(1)
+            && self.arena.active_set.last().map(|idx| idx.0)
+                == Some(self.arena.occupied_count as u32);
+        if keep_dense_contiguous_active {
+            self.arena.active_set.reserve(total_expand);
+        }
+
+        for worker_id in 0..worker_count {
+            let mut expand = std::mem::take(&mut self.worker_scratch[worker_id].expand);
+            for candidate in expand.iter().copied() {
+                let src_i = (candidate >> 3) as usize;
+                let dir = (candidate & 0b111) as usize;
+                debug_assert!(self.arena.meta[src_i].occupied());
+                let src_idx = TileIdx(src_i as u32);
+                let (idx, was_allocated) = self.arena.allocate_absent_neighbor_from(src_idx, dir);
+                if !was_allocated {
+                    continue;
+                }
+                if keep_dense_contiguous_active {
+                    let expected_idx = self.arena.active_set.len() + 1;
+                    if idx.index() == expected_idx {
+                        self.arena.active_set.push(idx);
+                    } else {
+                        keep_dense_contiguous_active = false;
+                    }
+                }
+                self.arena.mark_changed_new_unique(idx);
+            }
+            expand.clear();
+            self.worker_scratch[worker_id].expand = expand;
+        }
+
+        if keep_dense_contiguous_active
+            && self.arena.free_list.is_empty()
+            && self.arena.active_set.len() == self.arena.occupied_count
+            && self.arena.occupied_count + 1 == self.arena.meta.len()
+            && self.arena.active_set.first().map(|idx| idx.0) == Some(1)
+            && self.arena.active_set.last().map(|idx| idx.0)
+                == Some(self.arena.occupied_count as u32)
+        {
+            self.arena.active_set_dense_contiguous = true;
+        }
+    }
+
     #[inline(always)]
     fn ensure_frontier_neighbors(
         &mut self,
@@ -2019,6 +2082,8 @@ impl TurboLife {
         const TRACK_NEIGHBOR_INFLUENCE: bool = false;
         let emit_changed = !ASSUME_CHANGED_MODE;
         self.arena.prune_candidates_verified = allow_prune && !run_parallel;
+        let mut deferred_parallel_expand_worker_count = 0usize;
+        let mut deferred_parallel_expand_total = 0usize;
 
         let (cb_lo, cb_hi) = self.arena.cell_bufs.split_at_mut(1);
         let (current_vec, next_vec) = if cp == 0 {
@@ -2737,15 +2802,34 @@ impl TurboLife {
             let mut total_prune = 0usize;
             let mut total_changed = 0usize;
             let mut all_prune_candidates_verified = allow_prune;
+            let mut max_expand_len = 0usize;
+            let mut max_expand_worker = 0usize;
+            let mut max_prune_len = 0usize;
+            let mut max_prune_worker = 0usize;
+            let mut max_changed_len = 0usize;
+            let mut max_changed_worker = 0usize;
             for worker_id in 0..worker_count {
                 let scratch = &self.worker_scratch[worker_id];
                 let expand_len = scratch.expand.len();
                 let changed_len = scratch.changed.len();
 
                 total_expand = total_expand.saturating_add(expand_len);
+                if expand_len > max_expand_len {
+                    max_expand_len = expand_len;
+                    max_expand_worker = worker_id;
+                }
                 total_changed = total_changed.saturating_add(changed_len);
+                if changed_len > max_changed_len {
+                    max_changed_len = changed_len;
+                    max_changed_worker = worker_id;
+                }
                 if allow_prune {
-                    total_prune = total_prune.saturating_add(scratch.prune.len());
+                    let prune_len = scratch.prune.len();
+                    total_prune = total_prune.saturating_add(prune_len);
+                    if prune_len > max_prune_len {
+                        max_prune_len = prune_len;
+                        max_prune_worker = worker_id;
+                    }
                     if !scratch.prune_candidates_verified {
                         all_prune_candidates_verified = false;
                     }
@@ -2759,16 +2843,31 @@ impl TurboLife {
             }
 
             macro_rules! merge_worker_vectors {
-                ($dst:expr, $field:ident, $total:expr) => {{
+                (
+                    $dst:expr,
+                    $field:ident,
+                    $total:expr,
+                    $anchor_worker:expr,
+                    $anchor_len:expr
+                ) => {{
                     if $total == 0 {
                         $dst.clear();
                     } else {
-                        $dst.clear();
-                        reserve_additional_capacity(&mut $dst, $total);
+                        let anchor_worker = $anchor_worker;
+                        let anchor_len = $anchor_len;
+                        debug_assert!(anchor_worker < worker_count);
+                        debug_assert!(anchor_len > 0);
+                        std::mem::swap(&mut $dst, &mut self.worker_scratch[anchor_worker].$field);
+                        self.worker_scratch[anchor_worker].$field.clear();
+                        debug_assert_eq!($dst.len(), anchor_len);
+                        reserve_additional_capacity(&mut $dst, $total.saturating_sub(anchor_len));
                         debug_assert!($dst.capacity() >= $total);
                         let dst_ptr = $dst.as_mut_ptr();
-                        let mut write = 0usize;
+                        let mut write = anchor_len;
                         for worker_id in 0..worker_count {
+                            if worker_id == anchor_worker {
+                                continue;
+                            }
                             let src = &mut self.worker_scratch[worker_id].$field;
                             let len = src.len();
                             if len != 0 {
@@ -2788,26 +2887,50 @@ impl TurboLife {
                             }
                         }
                         debug_assert_eq!(write, $total);
-                        unsafe {
-                            $dst.set_len(write);
-                        }
+                        unsafe { $dst.set_len(write) };
                     }
                 }};
             }
 
-            merge_worker_vectors!(self.arena.expand_buf, expand, total_expand);
             if allow_prune {
-                merge_worker_vectors!(self.arena.prune_buf, prune, total_prune);
+                merge_worker_vectors!(
+                    self.arena.expand_buf,
+                    expand,
+                    total_expand,
+                    max_expand_worker,
+                    max_expand_len
+                );
+            } else {
+                deferred_parallel_expand_worker_count = worker_count;
+                deferred_parallel_expand_total = total_expand;
+                self.arena.expand_buf.clear();
+            }
+            if allow_prune {
+                merge_worker_vectors!(
+                    self.arena.prune_buf,
+                    prune,
+                    total_prune,
+                    max_prune_worker,
+                    max_prune_len
+                );
             } else {
                 self.arena.prune_buf.clear();
             }
             if emit_changed {
-                merge_worker_vectors!(self.arena.changed_list, changed, total_changed);
+                merge_worker_vectors!(
+                    self.arena.changed_list,
+                    changed,
+                    total_changed,
+                    max_changed_worker,
+                    max_changed_len
+                );
                 if TRACK_NEIGHBOR_INFLUENCE {
                     merge_worker_vectors!(
                         self.arena.changed_influence,
                         changed_influence,
-                        total_changed
+                        total_changed,
+                        max_changed_worker,
+                        max_changed_len
                     );
                 } else {
                     self.arena.changed_influence.clear();
@@ -2838,6 +2961,12 @@ impl TurboLife {
 
         self.arena.flip_borders();
         self.arena.flip_cells();
+        if deferred_parallel_expand_worker_count != 0 {
+            self.finalize_parallel_expand_from_worker_scratch(
+                deferred_parallel_expand_worker_count,
+                deferred_parallel_expand_total,
+            );
+        }
 
         finalize_prune_and_expand(&mut self.arena);
 
