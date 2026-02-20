@@ -3,6 +3,7 @@
 rustflags = [
     "-C", "target-cpu=native",
     "-C", "llvm-args=-unroll-threshold=300",
+    "-C", "llvm-args=-inline-threshold=275",
 ]
 
 # Apple Silicon (macOS): let the linker strip unreachable sections/dylibs.
