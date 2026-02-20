@@ -110,8 +110,9 @@ const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = None;
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = Some(8_192);
 // Dynamic scheduler chunking target per worker.
-// Keep one chunk per worker to reduce scheduler cursor traffic.
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 1;
+// Two chunks per worker reduces lock-free tail imbalance on the primary
+// main.rs harness without materially increasing cursor contention.
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 2;
 // Throttle assume-changed prune passes while still periodically reclaiming
 // dead tiles so long-running runs do not accumulate stale occupancy.
 const ASSUME_CHANGED_PRUNE_STRIDE: u64 = 2048;
@@ -3212,9 +3213,12 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_chunk_targets_follow_platform_frontier_policy() {
+    fn dynamic_chunk_targets_follow_base_policy() {
         for (active_len, changed_len) in [(1, 1), (2_048, 900), (16_384, 16_384)] {
-            assert_eq!(dynamic_target_chunks_per_worker(active_len, changed_len), 1);
+            assert_eq!(
+                dynamic_target_chunks_per_worker(active_len, changed_len),
+                super::PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE
+            );
         }
     }
 
@@ -3244,9 +3248,9 @@ mod tests {
         }
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         {
-            assert_eq!(small, 200);
-            assert_eq!(medium_balanced, 1_024);
-            assert_eq!(medium_high, 1_024);
+            assert_eq!(small, 100);
+            assert_eq!(medium_balanced, 512);
+            assert_eq!(medium_high, 512);
             assert_eq!(large, 2_048);
         }
     }
