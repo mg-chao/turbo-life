@@ -95,7 +95,7 @@ impl CacheAlignedAtomicUsize {
 }
 
 const TILE_SIZE_I64: i64 = 64;
-const PARALLEL_KERNEL_MIN_ACTIVE: usize = 128;
+const PARALLEL_KERNEL_MIN_ACTIVE: usize = 512;
 const PARALLEL_KERNEL_TILES_PER_THREAD: usize = 16;
 const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
@@ -3033,14 +3033,25 @@ mod tests {
         parse_env_bool, run_parallel_workers,
     };
 
-    const PARALLEL_TEST_TILE_GRID: i64 = 12;
     const PARALLEL_TEST_CELLS_PER_TILE: usize = 16;
+    const PARALLEL_TEST_ACTIVE_TILE_MARGIN: usize = 64;
+
+    fn parallel_test_tile_grid() -> i64 {
+        let target_tiles =
+            PARALLEL_KERNEL_MIN_ACTIVE.saturating_add(PARALLEL_TEST_ACTIVE_TILE_MARGIN);
+        let mut side = 1usize;
+        while side.saturating_mul(side) < target_tiles {
+            side += 1;
+        }
+        i64::try_from(side).expect("parallel test tile grid should fit in i64")
+    }
 
     fn seed_parallel_scheduler_fixture(engine: &mut TurboLife) {
+        let tile_grid = parallel_test_tile_grid();
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xA55A_CE11_1234_5678);
         let mut cells = Vec::new();
-        for ty in 0..PARALLEL_TEST_TILE_GRID {
-            for tx in 0..PARALLEL_TEST_TILE_GRID {
+        for ty in 0..tile_grid {
+            for tx in 0..tile_grid {
                 let base_x = tx * TILE_SIZE_I64;
                 let base_y = ty * TILE_SIZE_I64;
                 for _ in 0..PARALLEL_TEST_CELLS_PER_TILE {
