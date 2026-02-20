@@ -39,8 +39,12 @@ if ! [[ "$TRAIN_RUNS" =~ ^[0-9]+$ ]] || [ "$TRAIN_RUNS" -eq 0 ]; then
     exit 2
 fi
 
+if [ "$#" -gt 0 ] && [ "${1:-}" = "--" ]; then
+    shift
+fi
+
 HARNESS_ARGS=("$@")
-for arg in "$@"; do
+for arg in "${HARNESS_ARGS[@]}"; do
     if [ "$arg" = "--pgo-train" ]; then
         echo "error: do not pass --pgo-train explicitly; build_maxperf.sh injects it for PGO training runs." >&2
         exit 2
@@ -50,10 +54,22 @@ done
 HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
 SYSROOT="$(rustc --print sysroot)"
 PROFDATA_BIN="$SYSROOT/lib/rustlib/$HOST_TRIPLE/bin/llvm-profdata"
+NATIVE_RUSTFLAGS="-Ctarget-cpu=native"
+case "$HOST_TRIPLE" in
+    aarch64-apple-darwin)
+        NATIVE_RUSTFLAGS+=" -Clink-arg=-Wl,-dead_strip -Clink-arg=-Wl,-dead_strip_dylibs"
+        ;;
+    x86_64-pc-windows-msvc)
+        NATIVE_RUSTFLAGS+=" -Clink-arg=/OPT:REF -Clink-arg=/OPT:ICF"
+        ;;
+esac
 if [ ! -x "$PROFDATA_BIN" ]; then
     if command -v llvm-profdata >/dev/null 2>&1; then
         PROFDATA_BIN="$(command -v llvm-profdata)"
         echo "note: using llvm-profdata from PATH: $PROFDATA_BIN" >&2
+    elif command -v xcrun >/dev/null 2>&1 && xcrun --find llvm-profdata >/dev/null 2>&1; then
+        PROFDATA_BIN="$(xcrun --find llvm-profdata)"
+        echo "note: using llvm-profdata from xcrun: $PROFDATA_BIN" >&2
     else
         echo "missing llvm-profdata at $PROFDATA_BIN" >&2
         echo "install it with: rustup component add llvm-tools-$HOST_TRIPLE" >&2
@@ -176,8 +192,8 @@ BEST_FEATURES=""
 # Build-config candidates
 run_candidate "lto-thin" "" "thin" ""
 run_candidate "lto-off" "" "off" ""
-run_candidate "llvm-unroll300" "-Ctarget-cpu=native -Cllvm-args=-unroll-threshold=300" "" ""
-run_candidate "llvm-inline275" "-Ctarget-cpu=native -Cllvm-args=-inline-threshold=275" "" ""
+run_candidate "llvm-unroll300" "$NATIVE_RUSTFLAGS -Cllvm-args=-unroll-threshold=300" "" ""
+run_candidate "llvm-inline275" "$NATIVE_RUSTFLAGS -Cllvm-args=-inline-threshold=275" "" ""
 
 if [[ "$HOST_TRIPLE" == aarch64-* || "$HOST_TRIPLE" == arm64-* ]]; then
     run_candidate "feat-prefetch" "" "" "aggressive-prefetch-aarch64"

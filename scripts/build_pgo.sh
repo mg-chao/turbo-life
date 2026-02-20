@@ -39,7 +39,13 @@ if ! [[ "$BENCH_RUNS" =~ ^[0-9]+$ ]] || [ "$BENCH_RUNS" -eq 0 ]; then
     exit 2
 fi
 
-for arg in "$@"; do
+if [ "$#" -gt 0 ] && [ "${1:-}" = "--" ]; then
+    shift
+fi
+
+HARNESS_ARGS=("$@")
+
+for arg in "${HARNESS_ARGS[@]}"; do
     if [ "$arg" = "--pgo-train" ]; then
         echo "error: do not pass --pgo-train explicitly; build_pgo.sh injects it for training runs." >&2
         exit 2
@@ -49,11 +55,23 @@ done
 HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
 SYSROOT="$(rustc --print sysroot)"
 PROFDATA_BIN="$SYSROOT/lib/rustlib/$HOST_TRIPLE/bin/llvm-profdata"
+BASE_RUSTFLAGS="-Ctarget-cpu=native -Cllvm-args=-unroll-threshold=300"
+case "$HOST_TRIPLE" in
+    aarch64-apple-darwin)
+        BASE_RUSTFLAGS+=" -Clink-arg=-Wl,-dead_strip -Clink-arg=-Wl,-dead_strip_dylibs"
+        ;;
+    x86_64-pc-windows-msvc)
+        BASE_RUSTFLAGS+=" -Clink-arg=/OPT:REF -Clink-arg=/OPT:ICF"
+        ;;
+esac
 
 if [ ! -x "$PROFDATA_BIN" ]; then
     if command -v llvm-profdata >/dev/null 2>&1; then
         PROFDATA_BIN="$(command -v llvm-profdata)"
         echo "note: using llvm-profdata from PATH: $PROFDATA_BIN" >&2
+    elif command -v xcrun >/dev/null 2>&1 && xcrun --find llvm-profdata >/dev/null 2>&1; then
+        PROFDATA_BIN="$(xcrun --find llvm-profdata)"
+        echo "note: using llvm-profdata from xcrun: $PROFDATA_BIN" >&2
     else
         echo "missing llvm-profdata at $PROFDATA_BIN" >&2
         echo "install it with: rustup component add llvm-tools-$HOST_TRIPLE" >&2
@@ -74,7 +92,11 @@ run_benchmark_report() {
     local runs="$1"
     local bin="$2"
     shift 2
-    "$ROOT_DIR/scripts/bench_main.sh" "$runs" "$bin" "$@"
+    if [ "$#" -eq 0 ]; then
+        "$ROOT_DIR/scripts/bench_main.sh" "$runs" "$bin"
+    else
+        "$ROOT_DIR/scripts/bench_main.sh" "$runs" "$bin" -- "$@"
+    fi
 }
 
 extract_median_ms() {
@@ -85,12 +107,12 @@ echo "==> building baseline release binary"
 rm -rf -- "$PGO_DIR" "$GEN_TARGET_DIR" "$USE_TARGET_DIR" "$BASELINE_TARGET_DIR"
 mkdir -p "$PGO_DIR"
 
-RUSTFLAGS="-Ctarget-cpu=native" \
+RUSTFLAGS="$BASE_RUSTFLAGS" \
     CARGO_TARGET_DIR="$BASELINE_TARGET_DIR" \
     cargo build --release --bin turbo-life
 
 echo "==> baseline benchmark via main.rs harness (${BENCH_RUNS} runs)"
-BASELINE_REPORT="$(run_benchmark_report "$BENCH_RUNS" "$BASELINE_BIN" "$@")"
+BASELINE_REPORT="$(run_benchmark_report "$BENCH_RUNS" "$BASELINE_BIN" "${HARNESS_ARGS[@]}")"
 echo "$BASELINE_REPORT"
 BASELINE_MEDIAN="$(printf '%s\n' "$BASELINE_REPORT" | extract_median_ms)"
 if [ -z "$BASELINE_MEDIAN" ]; then
@@ -99,7 +121,7 @@ if [ -z "$BASELINE_MEDIAN" ]; then
 fi
 
 echo "==> building instrumented binary"
-RUSTFLAGS="-Cprofile-generate=$PGO_DIR -Ctarget-cpu=native" \
+RUSTFLAGS="$BASE_RUSTFLAGS -Cprofile-generate=$PGO_DIR" \
     CARGO_TARGET_DIR="$GEN_TARGET_DIR" \
     cargo build --release --bin turbo-life
 
@@ -107,7 +129,7 @@ echo "==> collecting PGO profiles via main.rs harness (${TRAIN_RUNS} runs)"
 for ((i = 1; i <= TRAIN_RUNS; i++)); do
     echo "  training run $i/$TRAIN_RUNS"
     LLVM_PROFILE_FILE="$PGO_DIR/turbo-life-%p-%m.profraw" \
-        "$GEN_TARGET_DIR/release/turbo-life" --pgo-train "$@"
+        "$GEN_TARGET_DIR/release/turbo-life" --pgo-train "${HARNESS_ARGS[@]}"
 done
 
 echo "==> merging profile data"
@@ -121,12 +143,12 @@ fi
 "$PROFDATA_BIN" merge -o "$PROFDATA_FILE" "${PROFRAW_FILES[@]}"
 
 echo "==> building PGO-optimized binary"
-RUSTFLAGS="-Cprofile-use=$PROFDATA_FILE -Ctarget-cpu=native" \
+RUSTFLAGS="$BASE_RUSTFLAGS -Cprofile-use=$PROFDATA_FILE" \
     CARGO_TARGET_DIR="$USE_TARGET_DIR" \
     cargo build --release --bin turbo-life
 
 echo "==> PGO benchmark via main.rs harness (${BENCH_RUNS} runs)"
-PGO_REPORT="$(run_benchmark_report "$BENCH_RUNS" "$PGO_BIN" "$@")"
+PGO_REPORT="$(run_benchmark_report "$BENCH_RUNS" "$PGO_BIN" "${HARNESS_ARGS[@]}")"
 echo "$PGO_REPORT"
 PGO_MEDIAN="$(printf '%s\n' "$PGO_REPORT" | extract_median_ms)"
 if [ -z "$PGO_MEDIAN" ]; then
