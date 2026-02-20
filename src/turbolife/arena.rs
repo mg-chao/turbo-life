@@ -9,7 +9,9 @@ use super::tile::{
     BorderData, CellBuf, EMPTY_NEIGHBORS, MAX_NEIGHBOR_INDEX, NO_NEIGHBOR, NeighborIdx, Neighbors,
     TILE_SIZE, TileIdx, TileMeta,
 };
-use super::tilemap::{TileMap, tile_hash};
+use super::tilemap::{
+    TILE_HASH_X_STEP, TILE_HASH_Y_STEP, TileMap, tile_hash, tile_hash_from_lanes, tile_hash_lanes,
+};
 
 const INITIAL_TILE_CAPACITY: usize = 256;
 const MIN_GROW_TILES: usize = 256;
@@ -30,6 +32,26 @@ const DIR_OFFSETS: [(i64, i64); 8] = [
     (1, -1),
 ];
 const DIR_REVERSE: [usize; 8] = [1, 0, 3, 2, 7, 6, 5, 4];
+const DIR_HASH_X_OFFSETS: [u64; 8] = [
+    0,
+    0,
+    TILE_HASH_X_STEP.wrapping_neg(),
+    TILE_HASH_X_STEP,
+    TILE_HASH_X_STEP.wrapping_neg(),
+    TILE_HASH_X_STEP,
+    TILE_HASH_X_STEP.wrapping_neg(),
+    TILE_HASH_X_STEP,
+];
+const DIR_HASH_Y_OFFSETS: [u64; 8] = [
+    TILE_HASH_Y_STEP,
+    TILE_HASH_Y_STEP.wrapping_neg(),
+    0,
+    0,
+    TILE_HASH_Y_STEP,
+    TILE_HASH_Y_STEP,
+    TILE_HASH_Y_STEP.wrapping_neg(),
+    TILE_HASH_Y_STEP.wrapping_neg(),
+];
 const UNKNOWN_HINT: i8 = -1;
 
 const fn direction_index_from_offset(dx: i64, dy: i64) -> i8 {
@@ -63,6 +85,46 @@ const fn build_expand_neighbor_hints() -> [[i8; 8]; 8] {
 }
 
 const EXPAND_NEIGHBOR_HINTS: [[i8; 8]; 8] = build_expand_neighbor_hints();
+const UNKNOWN_TWO_HOP_HINT: [i8; 2] = [UNKNOWN_HINT, UNKNOWN_HINT];
+
+const fn build_expand_neighbor_two_hop_hints() -> [[[i8; 2]; 8]; 8] {
+    let mut table = [[UNKNOWN_TWO_HOP_HINT; 8]; 8];
+    let mut expand_dir = 0usize;
+    while expand_dir < 8 {
+        let mut target_neighbor_dir = 0usize;
+        while target_neighbor_dir < 8 {
+            if EXPAND_NEIGHBOR_HINTS[expand_dir][target_neighbor_dir] == UNKNOWN_HINT {
+                let (ex, ey) = DIR_OFFSETS[expand_dir];
+                let (tx, ty) = DIR_OFFSETS[target_neighbor_dir];
+                let want_x = ex + tx;
+                let want_y = ey + ty;
+                let mut via_dir = 0usize;
+                while via_dir < 8 {
+                    if via_dir != expand_dir {
+                        let (vx, vy) = DIR_OFFSETS[via_dir];
+                        let mut via_neighbor_dir = 0usize;
+                        while via_neighbor_dir < 8 {
+                            let (nx, ny) = DIR_OFFSETS[via_neighbor_dir];
+                            if vx + nx == want_x && vy + ny == want_y {
+                                table[expand_dir][target_neighbor_dir] =
+                                    [via_dir as i8, via_neighbor_dir as i8];
+                                via_dir = 8;
+                                break;
+                            }
+                            via_neighbor_dir += 1;
+                        }
+                    }
+                    via_dir += 1;
+                }
+            }
+            target_neighbor_dir += 1;
+        }
+        expand_dir += 1;
+    }
+    table
+}
+
+const EXPAND_NEIGHBOR_TWO_HOP_HINTS: [[[i8; 2]; 8]; 8] = build_expand_neighbor_two_hop_hints();
 
 #[inline(always)]
 fn encode_neighbor_idx(idx: TileIdx) -> NeighborIdx {
@@ -448,10 +510,17 @@ impl TileArena {
     #[inline(always)]
     pub fn idx_at(&self, coord: (i64, i64)) -> Option<TileIdx> {
         let idx = self.coord_to_idx.get(coord.0, coord.1)?;
-        if self.idx_matches_live_coord(idx, coord) {
+        #[cfg(any(test, debug_assertions))]
+        {
+            if self.idx_matches_live_coord(idx, coord) {
+                Some(idx)
+            } else {
+                None
+            }
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
             Some(idx)
-        } else {
-            None
         }
     }
 
@@ -463,27 +532,47 @@ impl TileArena {
 
     #[inline(always)]
     fn idx_at_cached_hashed(&mut self, coord: (i64, i64), hash: u64) -> Option<TileIdx> {
-        if COORD_LOOKUP_CACHE_ENABLED && let Some(idx) = self.coord_lookup_cache_get(coord, hash) {
-            if self.idx_matches_live_coord(idx, coord) {
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            if COORD_LOOKUP_CACHE_ENABLED
+                && let Some(idx) = self.coord_lookup_cache_get(coord, hash)
+            {
                 return Some(idx);
             }
-            self.coord_lookup_cache_clear(coord, idx, hash);
-        }
-        let idx = self.coord_to_idx.get_hashed(coord.0, coord.1, hash)?;
-        if !self.idx_matches_live_coord(idx, coord) {
-            // Defensive cleanup in case a stale coordinate mapping survives.
-            self.coord_to_idx.remove_hashed(coord.0, coord.1, hash);
+            let idx = self.coord_to_idx.get_hashed(coord.0, coord.1, hash)?;
             if COORD_LOOKUP_CACHE_ENABLED {
+                self.coord_lookup_cache_set(coord, idx, hash);
+            }
+            return Some(idx);
+        }
+
+        #[cfg(any(test, debug_assertions))]
+        {
+            if COORD_LOOKUP_CACHE_ENABLED
+                && let Some(idx) = self.coord_lookup_cache_get(coord, hash)
+            {
+                if self.idx_matches_live_coord(idx, coord) {
+                    return Some(idx);
+                }
                 self.coord_lookup_cache_clear(coord, idx, hash);
             }
-            return None;
+            let idx = self.coord_to_idx.get_hashed(coord.0, coord.1, hash)?;
+            if !self.idx_matches_live_coord(idx, coord) {
+                // Defensive cleanup in case a stale coordinate mapping survives.
+                self.coord_to_idx.remove_hashed(coord.0, coord.1, hash);
+                if COORD_LOOKUP_CACHE_ENABLED {
+                    self.coord_lookup_cache_clear(coord, idx, hash);
+                }
+                return None;
+            }
+            if COORD_LOOKUP_CACHE_ENABLED {
+                self.coord_lookup_cache_set(coord, idx, hash);
+            }
+            Some(idx)
         }
-        if COORD_LOOKUP_CACHE_ENABLED {
-            self.coord_lookup_cache_set(coord, idx, hash);
-        }
-        Some(idx)
     }
 
+    #[cfg(any(test, debug_assertions))]
     #[inline(always)]
     fn idx_matches_live_coord(&self, idx: TileIdx, coord: (i64, i64)) -> bool {
         let i = idx.index();
@@ -845,6 +934,18 @@ impl TileArena {
         }
     }
 
+    #[inline(always)]
+    fn recycle_uncommitted_slot(&mut self, idx: TileIdx) {
+        let i = idx.index();
+        self.neighbors[i] = EMPTY_NEIGHBORS;
+        self.meta[i] = TileMeta::released();
+        self.clear_occupied_bit(i);
+        self.clear_changed_mark(i);
+        self.ensure_active_tag_capacity(i);
+        self.active_tags[i] = 0;
+        self.free_list.push(idx);
+    }
+
     #[inline]
     unsafe fn link_neighbor_pair_raw(
         neighbors_ptr: *mut Neighbors,
@@ -867,14 +968,18 @@ impl TileArena {
     #[inline]
     fn link_neighbors(&mut self, idx: TileIdx, coord: (i64, i64)) {
         let (cx, cy) = coord;
+        let (center_hash_x, center_hash_y) = tile_hash_lanes(cx, cy);
         let i = idx.index();
         let neighbors_ptr = self.neighbors.as_mut_ptr();
         let meta_ptr = self.meta.as_mut_ptr();
 
         for (dir_idx, (dx, dy)) in DIR_OFFSETS.iter().copied().enumerate() {
             let neighbor_coord = (cx + dx, cy + dy);
-            let hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
-            if let Some(neighbor_idx) = self.idx_at_cached_hashed(neighbor_coord, hash) {
+            let neighbor_hash = tile_hash_from_lanes(
+                center_hash_x.wrapping_add(DIR_HASH_X_OFFSETS[dir_idx]),
+                center_hash_y.wrapping_add(DIR_HASH_Y_OFFSETS[dir_idx]),
+            );
+            if let Some(neighbor_idx) = self.idx_at_cached_hashed(neighbor_coord, neighbor_hash) {
                 let ni = neighbor_idx.index();
                 // SAFETY: idx and neighbor_idx are valid arena indices.
                 unsafe {
@@ -911,9 +1016,14 @@ impl TileArena {
         }
 
         let (sx, sy) = self.coords[src_i];
+        let (src_hash_x, src_hash_y) = tile_hash_lanes(sx, sy);
         let (dx, dy) = DIR_OFFSETS[dir_idx];
         let coord = (sx + dx, sy + dy);
-        let hash = tile_hash(coord.0, coord.1);
+        let coord_hash_x = src_hash_x.wrapping_add(DIR_HASH_X_OFFSETS[dir_idx]);
+        let coord_hash_y = src_hash_y.wrapping_add(DIR_HASH_Y_OFFSETS[dir_idx]);
+        let hash = tile_hash_from_lanes(coord_hash_x, coord_hash_y);
+
+        #[cfg(any(test, debug_assertions))]
         if let Some(existing_idx) = self.idx_at_cached_hashed(coord, hash) {
             unsafe {
                 Self::link_neighbor_pair_raw(
@@ -928,7 +1038,22 @@ impl TileArena {
         }
 
         let idx = self.allocate_slot(coord);
-        self.coord_to_idx.insert_hashed(coord.0, coord.1, idx, hash);
+        if let Some(existing_idx) = self.coord_to_idx.insert_hashed(coord.0, coord.1, idx, hash) {
+            self.coord_to_idx
+                .insert_hashed(coord.0, coord.1, existing_idx, hash);
+            self.coord_lookup_cache_set(coord, existing_idx, hash);
+            self.recycle_uncommitted_slot(idx);
+            unsafe {
+                Self::link_neighbor_pair_raw(
+                    self.neighbors.as_mut_ptr(),
+                    self.meta.as_mut_ptr(),
+                    src_i,
+                    dir_idx,
+                    existing_idx.index(),
+                );
+            }
+            return (existing_idx, false);
+        }
         self.coord_lookup_cache_set(coord, idx, hash);
         self.occupied_count += 1;
 
@@ -969,7 +1094,10 @@ impl TileArena {
                         {
                             hinted_raw
                         } else {
-                            let neighbor_hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
+                            let neighbor_hash = tile_hash_from_lanes(
+                                coord_hash_x.wrapping_add(DIR_HASH_X_OFFSETS[target_neighbor_dir]),
+                                coord_hash_y.wrapping_add(DIR_HASH_Y_OFFSETS[target_neighbor_dir]),
+                            );
                             self.idx_at_cached_hashed(neighbor_coord, neighbor_hash)
                                 .map_or(NO_NEIGHBOR, encode_neighbor_idx)
                         }
@@ -983,7 +1111,10 @@ impl TileArena {
                     {
                         let (ndx, ndy) = DIR_OFFSETS[target_neighbor_dir];
                         let neighbor_coord = (coord.0 + ndx, coord.1 + ndy);
-                        let neighbor_hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
+                        let neighbor_hash = tile_hash_from_lanes(
+                            coord_hash_x.wrapping_add(DIR_HASH_X_OFFSETS[target_neighbor_dir]),
+                            coord_hash_y.wrapping_add(DIR_HASH_Y_OFFSETS[target_neighbor_dir]),
+                        );
                         self.idx_at_cached_hashed(neighbor_coord, neighbor_hash)
                             .map_or(NO_NEIGHBOR, encode_neighbor_idx)
                     }
@@ -995,11 +1126,43 @@ impl TileArena {
                     }
                 }
             } else {
-                let (ndx, ndy) = DIR_OFFSETS[target_neighbor_dir];
-                let neighbor_coord = (coord.0 + ndx, coord.1 + ndy);
-                let neighbor_hash = tile_hash(neighbor_coord.0, neighbor_coord.1);
-                self.idx_at_cached_hashed(neighbor_coord, neighbor_hash)
-                    .map_or(NO_NEIGHBOR, encode_neighbor_idx)
+                let mut candidate = NO_NEIGHBOR;
+                let two_hop = EXPAND_NEIGHBOR_TWO_HOP_HINTS[dir_idx][target_neighbor_dir];
+                if two_hop[0] != UNKNOWN_HINT {
+                    let via_raw = src_neighbors[two_hop[0] as usize];
+                    if via_raw != NO_NEIGHBOR {
+                        let via_neighbor_raw =
+                            self.neighbors[via_raw as usize][two_hop[1] as usize];
+                        if via_neighbor_raw != NO_NEIGHBOR {
+                            candidate = via_neighbor_raw;
+                        }
+                    }
+                }
+
+                #[cfg(any(test, debug_assertions))]
+                if candidate != NO_NEIGHBOR {
+                    let (ndx, ndy) = DIR_OFFSETS[target_neighbor_dir];
+                    let expected_coord = (coord.0 + ndx, coord.1 + ndy);
+                    let candidate_i = candidate as usize;
+                    if !self.meta[candidate_i].occupied()
+                        || self.coords[candidate_i] != expected_coord
+                    {
+                        candidate = NO_NEIGHBOR;
+                    }
+                }
+
+                if candidate != NO_NEIGHBOR {
+                    candidate
+                } else {
+                    let (ndx, ndy) = DIR_OFFSETS[target_neighbor_dir];
+                    let neighbor_coord = (coord.0 + ndx, coord.1 + ndy);
+                    let neighbor_hash = tile_hash_from_lanes(
+                        coord_hash_x.wrapping_add(DIR_HASH_X_OFFSETS[target_neighbor_dir]),
+                        coord_hash_y.wrapping_add(DIR_HASH_Y_OFFSETS[target_neighbor_dir]),
+                    );
+                    self.idx_at_cached_hashed(neighbor_coord, neighbor_hash)
+                        .map_or(NO_NEIGHBOR, encode_neighbor_idx)
+                }
             };
 
             if neighbor_raw == NO_NEIGHBOR {

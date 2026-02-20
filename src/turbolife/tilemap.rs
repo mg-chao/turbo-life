@@ -16,9 +16,26 @@ use super::tile::TileIdx;
 const MX: u64 = 0x517c_c1b7_2722_0a95;
 const MY: u64 = 0x6c62_272e_07bb_0143;
 
+pub(crate) const TILE_HASH_X_STEP: u64 = MX;
+pub(crate) const TILE_HASH_Y_STEP: u64 = MY;
+
+#[inline(always)]
+pub(crate) fn tile_hash_lanes(x: i64, y: i64) -> (u64, u64) {
+    (
+        (x as u64).wrapping_mul(TILE_HASH_X_STEP),
+        (y as u64).wrapping_mul(TILE_HASH_Y_STEP),
+    )
+}
+
+#[inline(always)]
+pub(crate) fn tile_hash_from_lanes(x_lane: u64, y_lane: u64) -> u64 {
+    x_lane ^ y_lane
+}
+
 #[inline(always)]
 pub(crate) fn tile_hash(x: i64, y: i64) -> u64 {
-    (x as u64).wrapping_mul(MX) ^ (y as u64).wrapping_mul(MY)
+    let (x_lane, y_lane) = tile_hash_lanes(x, y);
+    tile_hash_from_lanes(x_lane, y_lane)
 }
 
 // ── Slot layout ─────────────────────────────────────────────────────────
