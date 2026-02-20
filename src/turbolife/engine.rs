@@ -116,6 +116,12 @@ const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 2;
 // Throttle assume-changed prune passes while still periodically reclaiming
 // dead tiles so long-running runs do not accumulate stale occupancy.
 const ASSUME_CHANGED_PRUNE_STRIDE: u64 = 2048;
+// Apple hybrid cores benefit from finer tail granularity in the dynamic
+// scheduler: 1-tile tail chunks let fast P-cores drain stragglers from
+// slower workers with negligible extra cursor contention on this harness.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 1;
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
@@ -151,6 +157,8 @@ const _: [(); 1] = [(); (PREFETCH_TILE_NEAR_AHEAD_AARCH64 >= 1) as usize];
 #[cfg(target_arch = "aarch64")]
 const _: [(); 1] =
     [(); (PREFETCH_TILE_FAR_AHEAD_AARCH64 > PREFETCH_TILE_NEAR_AHEAD_AARCH64) as usize];
+const _: [(); 1] = [(); (PARALLEL_DYNAMIC_CHUNK_MIN > 0) as usize];
+const _: [(); 1] = [(); (PARALLEL_DYNAMIC_CHUNK_MIN <= PARALLEL_DYNAMIC_CHUNK_MAX) as usize];
 const _: [(); 1] = [(); (ASSUME_CHANGED_PRUNE_STRIDE > 0) as usize];
 const _: [(); 1] = [(); ASSUME_CHANGED_PRUNE_STRIDE.is_power_of_two() as usize];
 
