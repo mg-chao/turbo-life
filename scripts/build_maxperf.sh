@@ -62,6 +62,7 @@ HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
 SYSROOT="$(rustc --print sysroot)"
 PROFDATA_BIN="$SYSROOT/lib/rustlib/$HOST_TRIPLE/bin/llvm-profdata"
 NATIVE_RUSTFLAGS="-Ctarget-cpu=native"
+REPO_PROFDATA="$ROOT_DIR/pgo/turbo-life-main.profdata"
 case "$HOST_TRIPLE" in
     aarch64-apple-darwin)
         NATIVE_RUSTFLAGS+=" -Clink-arg=-Wl,-dead_strip -Clink-arg=-Wl,-dead_strip_dylibs"
@@ -206,7 +207,17 @@ if [[ "$HOST_TRIPLE" == aarch64-* || "$HOST_TRIPLE" == arm64-* ]]; then
     run_candidate "feat-prefetch" "" "" "aggressive-prefetch-aarch64"
 fi
 
-# Optional PGO over the current best non-PGO config.
+# Snapshot the strongest non-PGO configuration before trying any profile-use seed.
+BEST_NON_PGO_NAME="$BEST_NAME"
+BEST_NON_PGO_RUSTFLAGS="$BEST_RUSTFLAGS"
+BEST_NON_PGO_LTO="$BEST_LTO"
+BEST_NON_PGO_FEATURES="$BEST_FEATURES"
+
+if [ -f "$REPO_PROFDATA" ]; then
+    run_candidate "repo-profdata" "-Cprofile-use=$REPO_PROFDATA" "" ""
+fi
+
+# Optional fresh PGO over the best non-PGO config.
 PGO_DATA_DIR="$ROOT_DIR/target/maxperf/pgo-data"
 PGO_GEN_DIR="$ROOT_DIR/target/maxperf/pgo-gen"
 PGO_USE_DIR="$ROOT_DIR/target/maxperf/pgo-use"
@@ -216,16 +227,16 @@ rm -rf -- "$PGO_DATA_DIR"
 mkdir -p "$PGO_DATA_DIR"
 
 echo ""
-echo "==> candidate: pgo-on-${BEST_NAME}"
+echo "==> candidate: pgo-on-${BEST_NON_PGO_NAME}"
 
-pgo_gen_rustflags="${BEST_RUSTFLAGS}"
+pgo_gen_rustflags="${BEST_NON_PGO_RUSTFLAGS}"
 if [ -n "$pgo_gen_rustflags" ]; then
     pgo_gen_rustflags+=" "
 fi
 pgo_gen_rustflags+="-Cprofile-generate=$PGO_DATA_DIR"
 
 PGO_CANDIDATE_READY="1"
-if ! build_bin "$PGO_GEN_DIR" "$pgo_gen_rustflags" "$BEST_LTO" "$BEST_FEATURES"; then
+if ! build_bin "$PGO_GEN_DIR" "$pgo_gen_rustflags" "$BEST_NON_PGO_LTO" "$BEST_NON_PGO_FEATURES"; then
     echo "warning: skipped PGO candidate (instrumented build failed)" >&2
     PGO_CANDIDATE_READY="0"
 fi
@@ -265,13 +276,13 @@ if [ "$PGO_CANDIDATE_READY" = "1" ]; then
 fi
 
 if [ "$PGO_CANDIDATE_READY" = "1" ]; then
-    pgo_use_rustflags="${BEST_RUSTFLAGS}"
+    pgo_use_rustflags="${BEST_NON_PGO_RUSTFLAGS}"
     if [ -n "$pgo_use_rustflags" ]; then
         pgo_use_rustflags+=" "
     fi
     pgo_use_rustflags+="-Cprofile-use=$PGO_PROFDATA"
 
-    if ! build_bin "$PGO_USE_DIR" "$pgo_use_rustflags" "$BEST_LTO" "$BEST_FEATURES"; then
+    if ! build_bin "$PGO_USE_DIR" "$pgo_use_rustflags" "$BEST_NON_PGO_LTO" "$BEST_NON_PGO_FEATURES"; then
         echo "warning: skipped PGO candidate (optimized build failed)" >&2
         PGO_CANDIDATE_READY="0"
     fi
@@ -282,8 +293,8 @@ if [ "$PGO_CANDIDATE_READY" = "1" ]; then
     if ! PGO_MEDIAN="$(bench_binary "$BENCH_RUNS" "$PGO_BIN")"; then
         echo "warning: skipped PGO candidate (benchmark failed)" >&2
     else
-        printf '%s\t%s\t%s\t%s\t%s\n' "pgo-on-$BEST_NAME" "$PGO_MEDIAN" "$pgo_use_rustflags" "$BEST_LTO" "$BEST_FEATURES" >> "$RESULTS_FILE"
-        accept_if_faster "pgo-on-$BEST_NAME" "$PGO_MEDIAN" "$PGO_BIN" "$pgo_use_rustflags" "$BEST_LTO" "$BEST_FEATURES"
+        printf '%s\t%s\t%s\t%s\t%s\n' "pgo-on-$BEST_NON_PGO_NAME" "$PGO_MEDIAN" "$pgo_use_rustflags" "$BEST_NON_PGO_LTO" "$BEST_NON_PGO_FEATURES" >> "$RESULTS_FILE"
+        accept_if_faster "pgo-on-$BEST_NON_PGO_NAME" "$PGO_MEDIAN" "$PGO_BIN" "$pgo_use_rustflags" "$BEST_NON_PGO_LTO" "$BEST_NON_PGO_FEATURES"
     fi
 fi
 

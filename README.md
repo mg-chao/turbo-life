@@ -73,6 +73,8 @@ Arguments:
 - Second positional: PGO training runs (default `3`).
 - Remaining args are passed through to `src/main.rs` for both candidate benchmarking and PGO training.
 
+When `pgo/turbo-life-main.profdata` is present, `build_maxperf.sh` now benchmarks a `repo-profdata` candidate before fresh training. Fresh PGO instrumentation still starts from the best non-PGO candidate, so the seeded profile can improve winner selection without changing the fresh-training baseline.
+
 Output binary:
 
 ```
