@@ -117,10 +117,10 @@ const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 2;
 // dead tiles so long-running runs do not accumulate stale occupancy.
 const ASSUME_CHANGED_PRUNE_STRIDE: u64 = 2048;
 // Apple hybrid cores benefit from finer tail granularity in the dynamic
-// scheduler: 3-tile tail chunks still let fast P-cores drain stragglers
+// scheduler: 4-tile tail chunks still let fast P-cores drain stragglers
 // while reducing cursor contention on this harness.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 3;
+const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 4;
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
