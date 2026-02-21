@@ -69,6 +69,18 @@ fn east_neighbor_plane(word: u64, ghost_e: u64) -> u64 {
     (word >> 1) | (ghost_e << 63)
 }
 
+#[cold]
+#[inline(never)]
+fn branch_hint_cold() {}
+
+#[inline(always)]
+fn unlikely(cond: bool) -> bool {
+    if cond {
+        branch_hint_cold();
+    }
+    cond
+}
+
 const LIVE_N: u8 = 1 << 0;
 const LIVE_S: u8 = 1 << 1;
 const LIVE_W: u8 = 1 << 2;
@@ -1158,10 +1170,11 @@ unsafe fn advance_core_const<const CORE_BACKEND: u8, const ASSUME_CHANGED: bool>
     advance_core_scalar(current, next, ghost)
 }
 
-// Keep the empty-tile branch outlined; forcing this into the fused path
-// can exhaust debug worker stacks by ballooning the caller frame.
-#[cold]
-#[inline(never)]
+// Keep this outlined in debug builds to avoid blowing worker stack frames,
+// but inline it in release where it sits on the hot path.
+#[cfg_attr(debug_assertions, cold)]
+#[cfg_attr(debug_assertions, inline(never))]
+#[cfg_attr(not(debug_assertions), inline(always))]
 #[allow(clippy::too_many_arguments)]
 unsafe fn advance_tile_fused_empty_tile<
     const TRACK_NEIGHBOR_INFLUENCE: bool,
@@ -1192,7 +1205,7 @@ unsafe fn advance_tile_fused_empty_tile<
     sw_i: usize,
     se_i: usize,
 ) -> TileAdvanceResult {
-    if missing_mask == MISSING_ALL_NEIGHBORS {
+    if unlikely(missing_mask == MISSING_ALL_NEIGHBORS) {
         debug_assert!(tile_is_empty(current));
         if force_store {
             unsafe {
@@ -1241,7 +1254,7 @@ unsafe fn advance_tile_fused_empty_tile<
         | (se_live & LIVE_NW))
         == 0;
 
-    if ghost_empty {
+    if unlikely(ghost_empty) {
         debug_assert!(tile_is_empty(current));
         if force_store {
             unsafe {
