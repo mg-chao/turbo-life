@@ -1787,24 +1787,37 @@ impl TurboLife {
 
         for worker_id in 0..worker_count {
             let mut expand = std::mem::take(&mut self.worker_scratch[worker_id].expand);
-            for candidate in expand.iter().copied() {
+            let mut i = 0usize;
+            while i < expand.len() {
+                let candidate = expand[i];
                 let src_i = (candidate >> 3) as usize;
-                let dir = (candidate & 0b111) as usize;
                 debug_assert!(self.arena.meta[src_i].occupied());
                 let src_idx = TileIdx(src_i as u32);
-                let (idx, was_allocated) = self.arena.allocate_absent_neighbor_from(src_idx, dir);
-                if !was_allocated {
-                    continue;
-                }
-                if keep_dense_contiguous_active {
-                    let expected_idx = self.arena.active_set.len() + 1;
-                    if idx.index() == expected_idx {
-                        self.arena.active_set.push(idx);
-                    } else {
-                        keep_dense_contiguous_active = false;
+                let src_coord = self.arena.coords[src_i];
+                let (src_hash_x, src_hash_y) =
+                    super::tilemap::tile_hash_lanes(src_coord.0, src_coord.1);
+
+                loop {
+                    let dir = (expand[i] & 0b111) as usize;
+                    let (idx, was_allocated) = self.arena.allocate_absent_neighbor_from_prehashed(
+                        src_idx, src_coord, src_hash_x, src_hash_y, dir,
+                    );
+                    if was_allocated {
+                        if keep_dense_contiguous_active {
+                            let expected_idx = self.arena.active_set.len() + 1;
+                            if idx.index() == expected_idx {
+                                self.arena.active_set.push(idx);
+                            } else {
+                                keep_dense_contiguous_active = false;
+                            }
+                        }
+                        self.arena.mark_changed_new_unique(idx);
+                    }
+                    i += 1;
+                    if i >= expand.len() || ((expand[i] >> 3) as usize) != src_i {
+                        break;
                     }
                 }
-                self.arena.mark_changed_new_unique(idx);
             }
             expand.clear();
             self.worker_scratch[worker_id].expand = expand;

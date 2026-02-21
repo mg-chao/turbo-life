@@ -1036,27 +1036,40 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
         if keep_dense_contiguous_active {
             arena.active_set.reserve(arena.expand_buf.len());
         }
-        for i in 0..arena.expand_buf.len() {
+        let mut i = 0usize;
+        let expand_len = arena.expand_buf.len();
+        while i < expand_len {
             let candidate = arena.expand_buf[i];
             let src_i = (candidate >> 3) as usize;
-            let dir = (candidate & 0b111) as usize;
             debug_assert!(arena.meta[src_i].occupied());
             let src_idx = TileIdx(src_i as u32);
-            let (idx, was_allocated) = arena.allocate_absent_neighbor_from(src_idx, dir);
-            if !was_allocated {
-                continue;
-            }
-            if keep_dense_contiguous_active {
-                let expected_idx = arena.active_set.len() + 1;
-                if idx.index() == expected_idx {
-                    unsafe {
-                        vec_push_unchecked(&mut arena.active_set, idx);
+            let src_coord = arena.coords[src_i];
+            let (src_hash_x, src_hash_y) =
+                super::tilemap::tile_hash_lanes(src_coord.0, src_coord.1);
+
+            loop {
+                let dir = (arena.expand_buf[i] & 0b111) as usize;
+                let (idx, was_allocated) = arena.allocate_absent_neighbor_from_prehashed(
+                    src_idx, src_coord, src_hash_x, src_hash_y, dir,
+                );
+                if was_allocated {
+                    if keep_dense_contiguous_active {
+                        let expected_idx = arena.active_set.len() + 1;
+                        if idx.index() == expected_idx {
+                            unsafe {
+                                vec_push_unchecked(&mut arena.active_set, idx);
+                            }
+                        } else {
+                            keep_dense_contiguous_active = false;
+                        }
                     }
-                } else {
-                    keep_dense_contiguous_active = false;
+                    arena.mark_changed_new_unique(idx);
+                }
+                i += 1;
+                if i >= expand_len || ((arena.expand_buf[i] >> 3) as usize) != src_i {
+                    break;
                 }
             }
-            arena.mark_changed_new_unique(idx);
         }
         if keep_dense_contiguous_active
             && arena.free_list.is_empty()

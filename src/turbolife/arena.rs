@@ -703,6 +703,12 @@ impl TileArena {
 
     #[inline(always)]
     pub(crate) fn mark_changed_bitmap_unsynced_uniform_all(&mut self) {
+        if !self.changed_bitmap_synced
+            && self.changed_influence_uniform_all
+            && self.changed_influence.is_empty()
+        {
+            return;
+        }
         self.changed_bitmap_synced = false;
         self.changed_influence_uniform_all = true;
         self.changed_influence.clear();
@@ -1002,10 +1008,45 @@ impl TileArena {
         idx
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn allocate_absent_neighbor_from(
         &mut self,
         src: TileIdx,
+        dir_idx: usize,
+    ) -> (TileIdx, bool) {
+        let src_coord = self.coords[src.index()];
+        let (src_hash_x, src_hash_y) = tile_hash_lanes(src_coord.0, src_coord.1);
+        self.allocate_absent_neighbor_from_impl(src, src_coord, src_hash_x, src_hash_y, dir_idx)
+    }
+
+    #[inline(always)]
+    pub(super) fn allocate_absent_neighbor_from_prehashed(
+        &mut self,
+        src: TileIdx,
+        src_coord: (i64, i64),
+        src_hash_x: u64,
+        src_hash_y: u64,
+        dir_idx: usize,
+    ) -> (TileIdx, bool) {
+        #[cfg(any(test, debug_assertions))]
+        {
+            debug_assert_eq!(self.coords[src.index()], src_coord);
+            debug_assert_eq!(
+                tile_hash_lanes(src_coord.0, src_coord.1),
+                (src_hash_x, src_hash_y)
+            );
+        }
+        self.allocate_absent_neighbor_from_impl(src, src_coord, src_hash_x, src_hash_y, dir_idx)
+    }
+
+    #[inline(always)]
+    fn allocate_absent_neighbor_from_impl(
+        &mut self,
+        src: TileIdx,
+        src_coord: (i64, i64),
+        src_hash_x: u64,
+        src_hash_y: u64,
         dir_idx: usize,
     ) -> (TileIdx, bool) {
         debug_assert!(dir_idx < 8);
@@ -1015,8 +1056,7 @@ impl TileArena {
             return (TileIdx(existing_neighbor as u32), false);
         }
 
-        let (sx, sy) = self.coords[src_i];
-        let (src_hash_x, src_hash_y) = tile_hash_lanes(sx, sy);
+        let (sx, sy) = src_coord;
         let (dx, dy) = DIR_OFFSETS[dir_idx];
         let coord = (sx + dx, sy + dy);
         let coord_hash_x = src_hash_x.wrapping_add(DIR_HASH_X_OFFSETS[dir_idx]);
