@@ -61,6 +61,12 @@ To pass CLI args through to both training and benchmarking harness runs, append 
 
 `build_pgo.sh` (and the PGO phase in `build_maxperf.sh`) now trains with `--pgo-train`, a TurboLife-only execution mode in `src/main.rs` that removes QuickLife/checkpoint I/O from profile collection so LLVM profile data stays focused on hot TurboLife kernels.
 
+Repo-local PGO override controls (handled by `scripts/rustc_wrapper.sh`):
+
+- `TURBOLIFE_PROFILE_USE=/absolute/or/repo/relative/path.profdata` — force a specific profile for the `turbo_life` crate only (dependencies stay untouched).
+- `TURBOLIFE_PROFILE_USE=off` — disable wrapper-injected profile use.
+- `TURBOLIFE_DISABLE_WRAPPER_PGO=1` — hard-disable wrapper auto-PGO.
+
 Max-performance auto-tuner (builds multiple compiler/feature variants, benchmarks each with `src/main.rs`, rejects regressions, then optionally tests PGO on top of the best non-PGO candidate):
 
 ```

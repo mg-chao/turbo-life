@@ -131,9 +131,14 @@ extract_median_ms() {
 build_release_bin() {
     local target_dir="$1"
     local rustflags="$2"
+    local wrapper_profile_use="${3:-}"
 
     rm -rf -- "$target_dir"
-    RUSTFLAGS="$rustflags" CARGO_TARGET_DIR="$target_dir" cargo build --release --bin turbo-life
+    if [ -n "$wrapper_profile_use" ]; then
+        RUSTFLAGS="$rustflags" TURBOLIFE_PROFILE_USE="$wrapper_profile_use" CARGO_TARGET_DIR="$target_dir" cargo build --release --bin turbo-life
+    else
+        RUSTFLAGS="$rustflags" CARGO_TARGET_DIR="$target_dir" cargo build --release --bin turbo-life
+    fi
 }
 
 run_training_once() {
@@ -246,7 +251,7 @@ evaluate_mode() {
     merge_training_profile "$data_dir" "$profdata_file"
 
     echo "==> building PGO-optimized binary (${mode})"
-    build_release_bin "$use_target_dir" "$BASE_RUSTFLAGS -Cprofile-use=$profdata_file"
+    build_release_bin "$use_target_dir" "$BASE_RUSTFLAGS" "$profdata_file"
 
     echo "==> ${mode} PGO benchmark via main.rs harness (${BENCH_RUNS} runs)"
     local report
