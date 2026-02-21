@@ -1222,7 +1222,6 @@ fn dynamic_target_chunks_per_worker(_active_len: usize, _changed_len: usize) -> 
     PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE
 }
 
-#[cfg(test)]
 #[inline(always)]
 fn div_ceil_dispatch_small(n: usize, d: usize) -> usize {
     macro_rules! dispatch_const_div_ceil {
@@ -1262,8 +1261,7 @@ fn dynamic_parallel_chunk_size(
 
 #[inline(always)]
 fn dynamic_parallel_chunk_size_for_target(active_len: usize, target_chunks: usize) -> usize {
-    active_len
-        .div_ceil(target_chunks.max(1))
+    div_ceil_dispatch_small(active_len, target_chunks.max(1))
         .clamp(PARALLEL_DYNAMIC_CHUNK_MIN, PARALLEL_DYNAMIC_CHUNK_MAX)
 }
 
