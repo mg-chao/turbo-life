@@ -1222,6 +1222,7 @@ fn dynamic_target_chunks_per_worker(_active_len: usize, _changed_len: usize) -> 
     PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE
 }
 
+#[cfg(test)]
 #[inline(always)]
 fn div_ceil_dispatch_small(n: usize, d: usize) -> usize {
     macro_rules! dispatch_const_div_ceil {
@@ -1245,6 +1246,7 @@ fn div_ceil_dispatch_small(n: usize, d: usize) -> usize {
     )
 }
 
+#[cfg(test)]
 #[inline]
 fn dynamic_parallel_chunk_size(
     active_len: usize,
@@ -1255,8 +1257,14 @@ fn dynamic_parallel_chunk_size(
     let target_chunks = workers
         .saturating_mul(dynamic_target_chunks_per_worker(active_len, changed_len))
         .max(workers);
-    let size = div_ceil_dispatch_small(active_len, target_chunks);
-    size.clamp(PARALLEL_DYNAMIC_CHUNK_MIN, PARALLEL_DYNAMIC_CHUNK_MAX)
+    dynamic_parallel_chunk_size_for_target(active_len, target_chunks)
+}
+
+#[inline(always)]
+fn dynamic_parallel_chunk_size_for_target(active_len: usize, target_chunks: usize) -> usize {
+    active_len
+        .div_ceil(target_chunks.max(1))
+        .clamp(PARALLEL_DYNAMIC_CHUNK_MIN, PARALLEL_DYNAMIC_CHUNK_MAX)
 }
 
 #[inline(always)]
@@ -2870,6 +2878,9 @@ impl TurboLife {
                 }
             } else {
                 let cursor = CacheAlignedAtomicUsize::new(0);
+                let dynamic_target_chunks = active_workers
+                    .saturating_mul(dynamic_target_chunks_per_worker(active_len, changed_len))
+                    .max(active_workers);
                 macro_rules! parallel_kernel_lockfree {
                     (
                         $advance:path,
@@ -2886,10 +2897,9 @@ impl TurboLife {
                                 if observed >= active_len {
                                     break;
                                 }
-                                let chunk_size = dynamic_parallel_chunk_size(
+                                let chunk_size = dynamic_parallel_chunk_size_for_target(
                                     active_len - observed,
-                                    changed_len,
-                                    active_workers,
+                                    dynamic_target_chunks,
                                 );
                                 let start = cursor_ref.fetch_add(chunk_size, Ordering::Relaxed);
                                 if start >= active_len {
