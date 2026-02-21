@@ -1222,6 +1222,29 @@ fn dynamic_target_chunks_per_worker(_active_len: usize, _changed_len: usize) -> 
     PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE
 }
 
+#[inline(always)]
+fn div_ceil_dispatch_small(n: usize, d: usize) -> usize {
+    macro_rules! dispatch_const_div_ceil {
+        ($n:expr, $d:expr, [$($k:literal),*]) => {{
+            match $d {
+                $(
+                    $k => $n.div_ceil($k),
+                )*
+                _ => $n.div_ceil($d),
+            }
+        }};
+    }
+
+    dispatch_const_div_ceil!(
+        n,
+        d,
+        [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32
+        ]
+    )
+}
+
 #[inline]
 fn dynamic_parallel_chunk_size(
     active_len: usize,
@@ -1232,7 +1255,7 @@ fn dynamic_parallel_chunk_size(
     let target_chunks = workers
         .saturating_mul(dynamic_target_chunks_per_worker(active_len, changed_len))
         .max(workers);
-    let size = active_len.div_ceil(target_chunks);
+    let size = div_ceil_dispatch_small(active_len, target_chunks);
     size.clamp(PARALLEL_DYNAMIC_CHUNK_MIN, PARALLEL_DYNAMIC_CHUNK_MAX)
 }
 
@@ -3571,6 +3594,29 @@ mod tests {
             assert_eq!(medium_balanced, 512);
             assert_eq!(medium_high, 512);
             assert_eq!(large, 2_048);
+        }
+    }
+
+    #[test]
+    fn div_ceil_dispatch_small_matches_builtin_div_ceil() {
+        let numerators = [
+            0usize,
+            1,
+            2,
+            3,
+            7,
+            31,
+            64,
+            255,
+            1_024,
+            4_096,
+            usize::MAX / 2,
+            usize::MAX / 2 + 1,
+        ];
+        for d in 1..=64usize {
+            for &n in &numerators {
+                assert_eq!(super::div_ceil_dispatch_small(n, d), n.div_ceil(d));
+            }
         }
     }
 
