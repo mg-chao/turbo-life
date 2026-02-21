@@ -219,6 +219,23 @@ impl TileMap {
         self.insert_no_grow(x, y, value, hash)
     }
 
+    /// Insert only if key is absent. Returns `Err(existing)` when the key is
+    /// already present and leaves the existing value untouched.
+    #[inline]
+    pub(crate) fn insert_unique_hashed(
+        &mut self,
+        x: i64,
+        y: i64,
+        value: TileIdx,
+        hash: u64,
+    ) -> Result<(), TileIdx> {
+        debug_assert_eq!(hash, tile_hash(x, y));
+        if self.needs_grow() {
+            self.grow();
+        }
+        self.insert_unique_no_grow(x, y, value, hash)
+    }
+
     /// Insert without checking capacity — caller must ensure space.
     #[inline]
     fn insert_no_grow(&mut self, x: i64, y: i64, value: TileIdx, hash: u64) -> Option<TileIdx> {
@@ -254,6 +271,73 @@ impl TileMap {
                 let old = TileIdx(slot.value);
                 slot.value = value.0;
                 return Some(old);
+            }
+
+            // Robin Hood: if the existing entry is closer to home, steal its spot.
+            let existing_dist = distance_from_ctrl(ctrl);
+            if ins_dist > existing_dist {
+                let displaced_fp = ctrl & FP_MASK;
+                let displaced_key_x = slot.key_x;
+                let displaced_key_y = slot.key_y;
+                let displaced_value = slot.value;
+
+                debug_assert!(ins_dist <= MAX_DIST);
+                slot.key_x = ins_key_x;
+                slot.key_y = ins_key_y;
+                slot.value = ins_value;
+                slot.ctrl = occupied_ctrl(ins_fp, ins_dist);
+
+                ins_key_x = displaced_key_x;
+                ins_key_y = displaced_key_y;
+                ins_value = displaced_value;
+                ins_fp = displaced_fp;
+                ins_dist = existing_dist;
+            }
+
+            ins_dist += 1;
+            pos = (pos + 1) & mask;
+        }
+    }
+
+    /// Insert without checking capacity and without overwriting existing keys.
+    #[inline]
+    fn insert_unique_no_grow(
+        &mut self,
+        x: i64,
+        y: i64,
+        value: TileIdx,
+        hash: u64,
+    ) -> Result<(), TileIdx> {
+        let target_ctrl = match_ctrl_of(hash);
+        let mask = self.mask;
+        let mut pos = hash as usize & mask;
+        let slots_ptr = self.slots.as_mut_ptr();
+        let mut ins_key_x = x;
+        let mut ins_key_y = y;
+        let mut ins_value = value.0;
+        let mut ins_fp = fingerprint_of(hash);
+        let mut ins_dist = 0usize;
+
+        loop {
+            // SAFETY: pos is always & mask which is < slots.len().
+            let slot = unsafe { &mut *slots_ptr.add(pos) };
+            let ctrl = slot.ctrl;
+
+            if ctrl == EMPTY {
+                debug_assert!(ins_dist <= MAX_DIST);
+                *slot = Slot {
+                    key_x: ins_key_x,
+                    key_y: ins_key_y,
+                    value: ins_value,
+                    ctrl: occupied_ctrl(ins_fp, ins_dist),
+                };
+                self.len += 1;
+                return Ok(());
+            }
+
+            // Exact match — preserve existing value.
+            if (ctrl & MATCH_MASK) == target_ctrl && slot.key_x == x && slot.key_y == y {
+                return Err(TileIdx(slot.value));
             }
 
             // Robin Hood: if the existing entry is closer to home, steal its spot.
@@ -537,6 +621,18 @@ mod tests {
         for i in 0..1000i64 {
             assert_eq!(m.get(i, i * 3), Some(TileIdx(i as u32)));
         }
+    }
+
+    #[test]
+    fn insert_unique_preserves_existing_value() {
+        let mut m = TileMap::with_capacity(16);
+        let hash = tile_hash(3, 7);
+        assert_eq!(m.insert_unique_hashed(3, 7, TileIdx(11), hash), Ok(()));
+        assert_eq!(
+            m.insert_unique_hashed(3, 7, TileIdx(99), hash),
+            Err(TileIdx(11))
+        );
+        assert_eq!(m.get_hashed(3, 7, hash), Some(TileIdx(11)));
     }
 
     #[test]

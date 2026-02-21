@@ -1489,6 +1489,33 @@ pub struct TurboLife {
     worker_scratch: Vec<WorkerScratch>,
     /// Reusable touched-tile list for `set_cells`.
     set_cells_scratch: Vec<TileIdx>,
+    /// Last tile touched by public mutation APIs.
+    hot_tile_cache: HotTileCache,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct HotTileCache {
+    coord_x: i64,
+    coord_y: i64,
+    idx: TileIdx,
+}
+
+impl HotTileCache {
+    const EMPTY: Self = Self {
+        coord_x: 0,
+        coord_y: 0,
+        idx: TileIdx(0),
+    };
+
+    #[inline(always)]
+    fn get(self, coord: (i64, i64)) -> Option<TileIdx> {
+        if self.idx.0 != 0 && self.coord_x == coord.0 && self.coord_y == coord.1 {
+            Some(self.idx)
+        } else {
+            None
+        }
+    }
 }
 
 impl Default for TurboLife {
@@ -1525,7 +1552,37 @@ impl TurboLife {
                 .map(|_| WorkerScratch::default())
                 .collect(),
             set_cells_scratch: Vec::new(),
+            hot_tile_cache: HotTileCache::EMPTY,
         }
+    }
+
+    #[inline(always)]
+    fn hot_tile_lookup(&mut self, coord: (i64, i64)) -> Option<TileIdx> {
+        let cached = self.hot_tile_cache.get(coord)?;
+        let i = cached.index();
+        let valid = i < self.arena.meta.len()
+            && self.arena.meta[i].occupied()
+            && self.arena.coords[i] == coord;
+        if valid {
+            Some(cached)
+        } else {
+            self.hot_tile_clear();
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn hot_tile_store(&mut self, coord: (i64, i64), idx: TileIdx) {
+        self.hot_tile_cache = HotTileCache {
+            coord_x: coord.0,
+            coord_y: coord.1,
+            idx,
+        };
+    }
+
+    #[inline(always)]
+    fn hot_tile_clear(&mut self) {
+        self.hot_tile_cache = HotTileCache::EMPTY;
     }
 
     #[inline]
@@ -1837,10 +1894,16 @@ impl TurboLife {
         let local_x = x.rem_euclid(TILE_SIZE_I64) as usize;
         let local_y = y.rem_euclid(TILE_SIZE_I64) as usize;
 
-        let idx = self
-            .arena
-            .idx_at_cached(tile_coord)
-            .unwrap_or_else(|| self.arena.allocate_absent(tile_coord));
+        let idx = if let Some(cached) = self.hot_tile_lookup(tile_coord) {
+            cached
+        } else {
+            let resolved = self
+                .arena
+                .idx_at_cached(tile_coord)
+                .unwrap_or_else(|| self.arena.allocate_absent(tile_coord));
+            self.hot_tile_store(tile_coord, resolved);
+            resolved
+        };
 
         let row_after: u64;
         {
@@ -1882,8 +1945,14 @@ impl TurboLife {
         let local_x = x.rem_euclid(TILE_SIZE_I64) as usize;
         let local_y = y.rem_euclid(TILE_SIZE_I64) as usize;
 
-        let Some(idx) = self.arena.idx_at_cached(tile_coord) else {
-            return;
+        let idx = if let Some(cached) = self.hot_tile_lookup(tile_coord) {
+            cached
+        } else {
+            let Some(found) = self.arena.idx_at_cached(tile_coord) else {
+                return;
+            };
+            self.hot_tile_store(tile_coord, found);
+            found
         };
 
         let row_after: u64;
@@ -1934,10 +2003,21 @@ impl TurboLife {
             let local_x = x.rem_euclid(TILE_SIZE_I64) as usize;
             let local_y = y.rem_euclid(TILE_SIZE_I64) as usize;
 
-            let idx = match self.arena.idx_at_cached(tile_coord) {
-                Some(existing) => existing,
-                None if alive => self.arena.allocate_absent(tile_coord),
-                None => continue,
+            let idx = if let Some(cached) = self.hot_tile_lookup(tile_coord) {
+                cached
+            } else {
+                match self.arena.idx_at_cached(tile_coord) {
+                    Some(existing) => {
+                        self.hot_tile_store(tile_coord, existing);
+                        existing
+                    }
+                    None if alive => {
+                        let allocated = self.arena.allocate_absent(tile_coord);
+                        self.hot_tile_store(tile_coord, allocated);
+                        allocated
+                    }
+                    None => continue,
+                }
             };
 
             let changed = {
@@ -3035,6 +3115,7 @@ impl TurboLife {
     }
 
     pub fn step(&mut self) {
+        self.hot_tile_clear();
         // Split borrow: take a shared ref to the pool before mutably borrowing self.
         let pool = &self.pool as *const rayon::ThreadPool;
         // SAFETY: `pool` is not modified during `install`, and step logic only
@@ -3048,6 +3129,7 @@ impl TurboLife {
         if n == 0 {
             return;
         }
+        self.hot_tile_clear();
 
         // Split borrow: take a shared ref to the pool before mutably borrowing self.
         let pool = &self.pool as *const rayon::ThreadPool;
@@ -3788,6 +3870,34 @@ mod tests {
         let changed_before = engine.arena.changed_list.len();
         engine.set_cell_alive(63, 5);
         assert_eq!(engine.arena.changed_list.len(), changed_before);
+    }
+
+    #[test]
+    fn hot_tile_cache_rejects_stale_recycled_slot() {
+        let mut engine = TurboLife::new();
+        engine.set_cell_alive(0, 0);
+        let stale_idx = engine
+            .arena
+            .idx_at_cached((0, 0))
+            .expect("tile should exist after mutation");
+
+        engine.arena.release(stale_idx);
+        assert!(engine.arena.idx_at((0, 0)).is_none());
+
+        let reused_idx = engine.arena.allocate_absent((1, 0));
+        assert_eq!(reused_idx, stale_idx);
+
+        engine.set_cell_alive(0, 0);
+        assert!(engine.get_cell(0, 0));
+        assert!(
+            !engine.get_cell(64, 0),
+            "stale cache must not redirect writes into the recycled slot"
+        );
+        assert_eq!(
+            engine.arena.idx_at((1, 0)),
+            Some(reused_idx),
+            "reused slot must stay mapped to its new coordinate"
+        );
     }
 
     #[test]

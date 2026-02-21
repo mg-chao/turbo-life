@@ -1038,9 +1038,10 @@ impl TileArena {
         }
 
         let idx = self.allocate_slot(coord);
-        if let Some(existing_idx) = self.coord_to_idx.insert_hashed(coord.0, coord.1, idx, hash) {
-            self.coord_to_idx
-                .insert_hashed(coord.0, coord.1, existing_idx, hash);
+        if let Err(existing_idx) = self
+            .coord_to_idx
+            .insert_unique_hashed(coord.0, coord.1, idx, hash)
+        {
             self.coord_lookup_cache_set(coord, existing_idx, hash);
             self.recycle_uncommitted_slot(idx);
             unsafe {
