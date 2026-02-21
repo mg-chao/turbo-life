@@ -12,6 +12,14 @@ const SEED_SIDE: i32 = 4096;
 const LIVE_DENSITY: f64 = 0.42;
 const TOTAL_ITERATIONS: u64 = 2000;
 const CHECK_INTERVAL: u64 = 1000;
+const _: () = assert!(
+    TOTAL_ITERATIONS > 0,
+    "TOTAL_ITERATIONS must be greater than zero"
+);
+const _: () = assert!(
+    CHECK_INTERVAL > 0,
+    "CHECK_INTERVAL must be greater than zero"
+);
 
 struct MainArgs {
     config: TurboLifeConfig,
@@ -95,15 +103,19 @@ fn run_checked(config: TurboLifeConfig) {
     let mut quick_prev_duration = std::time::Duration::ZERO;
     let mut turbo_prev_duration = std::time::Duration::ZERO;
 
-    for checkpoint in 1..=(TOTAL_ITERATIONS / CHECK_INTERVAL) {
-        let iteration = checkpoint * CHECK_INTERVAL;
+    let mut iteration = 0_u64;
+    let mut remaining = TOTAL_ITERATIONS;
+    while remaining != 0 {
+        let chunk = remaining.min(CHECK_INTERVAL);
+        iteration += chunk;
+        remaining -= chunk;
 
         let start = Instant::now();
-        quick.step(CHECK_INTERVAL);
+        quick.step(chunk);
         quick_total_duration += start.elapsed();
 
         let start = Instant::now();
-        turbo.step_n(CHECK_INTERVAL);
+        turbo.step_n(chunk);
         turbo_total_duration += start.elapsed();
 
         let quick_phase = quick_total_duration - quick_prev_duration;
@@ -113,8 +125,8 @@ fn run_checked(config: TurboLifeConfig) {
 
         let quick_ms = quick_phase.as_secs_f64() * 1000.0;
         let turbo_ms = turbo_phase.as_secs_f64() * 1000.0;
-        let quick_avg_ms = quick_ms / CHECK_INTERVAL as f64;
-        let turbo_avg_ms = turbo_ms / CHECK_INTERVAL as f64;
+        let quick_avg_ms = quick_ms / chunk as f64;
+        let turbo_avg_ms = turbo_ms / chunk as f64;
 
         let quick_population = quick.population();
         let turbo_population = turbo.population();
@@ -147,8 +159,13 @@ fn run_pgo_train(config: TurboLifeConfig) {
     let mut turbo = TurboLife::with_config(config);
     seed_random_world(&mut turbo, None);
     turbo.reserve_for_generations(TOTAL_ITERATIONS);
-    turbo.step_n(TOTAL_ITERATIONS);
-    std::hint::black_box(turbo.population());
+    let mut remaining = TOTAL_ITERATIONS;
+    while remaining != 0 {
+        let chunk = remaining.min(CHECK_INTERVAL);
+        turbo.step_n(chunk);
+        remaining -= chunk;
+        std::hint::black_box(turbo.population());
+    }
 }
 
 fn main() {
