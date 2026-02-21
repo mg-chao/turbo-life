@@ -1563,12 +1563,11 @@ impl TurboLife {
         let valid = i < self.arena.meta.len()
             && self.arena.meta[i].occupied()
             && self.arena.coords[i] == coord;
-        if valid {
-            Some(cached)
-        } else {
+        if !valid {
             self.hot_tile_clear();
-            None
+            return None;
         }
+        Some(cached)
     }
 
     #[inline(always)]
@@ -2878,150 +2877,178 @@ impl TurboLife {
                 }
             }
 
-            let mut total_expand = 0usize;
-            let mut total_prune = 0usize;
-            let mut total_changed = 0usize;
-            let mut all_prune_candidates_verified = allow_prune;
-            let mut max_expand_len = 0usize;
-            let mut max_expand_worker = 0usize;
-            let mut max_prune_len = 0usize;
-            let mut max_prune_worker = 0usize;
-            let mut max_changed_len = 0usize;
-            let mut max_changed_worker = 0usize;
-            for worker_id in 0..worker_count {
-                let scratch = &self.worker_scratch[worker_id];
-                let expand_len = scratch.expand.len();
-                let changed_len = scratch.changed.len();
-
-                total_expand = total_expand.saturating_add(expand_len);
-                if expand_len > max_expand_len {
-                    max_expand_len = expand_len;
-                    max_expand_worker = worker_id;
-                }
-                total_changed = total_changed.saturating_add(changed_len);
-                if changed_len > max_changed_len {
-                    max_changed_len = changed_len;
-                    max_changed_worker = worker_id;
-                }
-                if allow_prune {
-                    let prune_len = scratch.prune.len();
-                    total_prune = total_prune.saturating_add(prune_len);
-                    if prune_len > max_prune_len {
-                        max_prune_len = prune_len;
-                        max_prune_worker = worker_id;
-                    }
-                    if !scratch.prune_candidates_verified {
-                        all_prune_candidates_verified = false;
-                    }
-                } else {
+            if !allow_prune && !emit_changed {
+                let mut total_expand = 0usize;
+                for worker_id in 0..worker_count {
+                    let scratch = &self.worker_scratch[worker_id];
+                    total_expand = total_expand.saturating_add(scratch.expand.len());
+                    debug_assert!(scratch.changed.is_empty());
                     debug_assert!(scratch.prune.is_empty());
-                }
-
-                if TRACK_NEIGHBOR_INFLUENCE {
-                    debug_assert_eq!(changed_len, scratch.changed_influence.len());
-                }
-            }
-
-            macro_rules! merge_worker_vectors {
-                (
-                    $dst:expr,
-                    $field:ident,
-                    $total:expr,
-                    $anchor_worker:expr,
-                    $anchor_len:expr
-                ) => {{
-                    if $total == 0 {
-                        $dst.clear();
-                    } else {
-                        let anchor_worker = $anchor_worker;
-                        let anchor_len = $anchor_len;
-                        debug_assert!(anchor_worker < worker_count);
-                        debug_assert!(anchor_len > 0);
-                        std::mem::swap(&mut $dst, &mut self.worker_scratch[anchor_worker].$field);
-                        self.worker_scratch[anchor_worker].$field.clear();
-                        debug_assert_eq!($dst.len(), anchor_len);
-                        reserve_additional_capacity(&mut $dst, $total.saturating_sub(anchor_len));
-                        debug_assert!($dst.capacity() >= $total);
-                        let dst_ptr = $dst.as_mut_ptr();
-                        let mut write = anchor_len;
-                        for worker_id in 0..worker_count {
-                            if worker_id == anchor_worker {
-                                continue;
-                            }
-                            let src = &mut self.worker_scratch[worker_id].$field;
-                            let len = src.len();
-                            if len != 0 {
-                                let end = write
-                                    .checked_add(len)
-                                    .expect("worker merge length overflowed usize");
-                                debug_assert!(end <= $total);
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        src.as_ptr(),
-                                        dst_ptr.add(write),
-                                        len,
-                                    );
-                                    src.set_len(0);
-                                }
-                                write = end;
-                            }
-                        }
-                        debug_assert_eq!(write, $total);
-                        unsafe { $dst.set_len(write) };
+                    if TRACK_NEIGHBOR_INFLUENCE {
+                        debug_assert!(scratch.changed_influence.is_empty());
                     }
-                }};
-            }
-
-            if allow_prune {
-                merge_worker_vectors!(
-                    self.arena.expand_buf,
-                    expand,
-                    total_expand,
-                    max_expand_worker,
-                    max_expand_len
-                );
-            } else {
+                }
                 deferred_parallel_expand_worker_count = worker_count;
                 deferred_parallel_expand_total = total_expand;
                 self.arena.expand_buf.clear();
-            }
-            if allow_prune {
-                merge_worker_vectors!(
-                    self.arena.prune_buf,
-                    prune,
-                    total_prune,
-                    max_prune_worker,
-                    max_prune_len
-                );
-            } else {
                 self.arena.prune_buf.clear();
-            }
-            if emit_changed {
-                merge_worker_vectors!(
-                    self.arena.changed_list,
-                    changed,
-                    total_changed,
-                    max_changed_worker,
-                    max_changed_len
-                );
-                if TRACK_NEIGHBOR_INFLUENCE {
-                    merge_worker_vectors!(
-                        self.arena.changed_influence,
-                        changed_influence,
-                        total_changed,
-                        max_changed_worker,
-                        max_changed_len
-                    );
-                } else {
-                    self.arena.changed_influence.clear();
-                }
-            } else {
                 if !skip_rebuild_assume_no_prune {
                     self.arena.changed_list.clear();
                 }
                 self.arena.changed_influence.clear();
+                self.arena.prune_candidates_verified = false;
+            } else {
+                let mut total_expand = 0usize;
+                let mut total_prune = 0usize;
+                let mut total_changed = 0usize;
+                let mut all_prune_candidates_verified = allow_prune;
+                let mut max_expand_len = 0usize;
+                let mut max_expand_worker = 0usize;
+                let mut max_prune_len = 0usize;
+                let mut max_prune_worker = 0usize;
+                let mut max_changed_len = 0usize;
+                let mut max_changed_worker = 0usize;
+                for worker_id in 0..worker_count {
+                    let scratch = &self.worker_scratch[worker_id];
+                    let expand_len = scratch.expand.len();
+                    let changed_len = scratch.changed.len();
+
+                    total_expand = total_expand.saturating_add(expand_len);
+                    if expand_len > max_expand_len {
+                        max_expand_len = expand_len;
+                        max_expand_worker = worker_id;
+                    }
+                    total_changed = total_changed.saturating_add(changed_len);
+                    if changed_len > max_changed_len {
+                        max_changed_len = changed_len;
+                        max_changed_worker = worker_id;
+                    }
+                    if allow_prune {
+                        let prune_len = scratch.prune.len();
+                        total_prune = total_prune.saturating_add(prune_len);
+                        if prune_len > max_prune_len {
+                            max_prune_len = prune_len;
+                            max_prune_worker = worker_id;
+                        }
+                        if !scratch.prune_candidates_verified {
+                            all_prune_candidates_verified = false;
+                        }
+                    } else {
+                        debug_assert!(scratch.prune.is_empty());
+                    }
+
+                    if TRACK_NEIGHBOR_INFLUENCE {
+                        debug_assert_eq!(changed_len, scratch.changed_influence.len());
+                    }
+                }
+
+                macro_rules! merge_worker_vectors {
+                    (
+                        $dst:expr,
+                        $field:ident,
+                        $total:expr,
+                        $anchor_worker:expr,
+                        $anchor_len:expr
+                    ) => {{
+                        if $total == 0 {
+                            $dst.clear();
+                        } else {
+                            let anchor_worker = $anchor_worker;
+                            let anchor_len = $anchor_len;
+                            debug_assert!(anchor_worker < worker_count);
+                            debug_assert!(anchor_len > 0);
+                            std::mem::swap(
+                                &mut $dst,
+                                &mut self.worker_scratch[anchor_worker].$field,
+                            );
+                            self.worker_scratch[anchor_worker].$field.clear();
+                            debug_assert_eq!($dst.len(), anchor_len);
+                            reserve_additional_capacity(
+                                &mut $dst,
+                                $total.saturating_sub(anchor_len),
+                            );
+                            debug_assert!($dst.capacity() >= $total);
+                            let dst_ptr = $dst.as_mut_ptr();
+                            let mut write = anchor_len;
+                            for worker_id in 0..worker_count {
+                                if worker_id == anchor_worker {
+                                    continue;
+                                }
+                                let src = &mut self.worker_scratch[worker_id].$field;
+                                let len = src.len();
+                                if len != 0 {
+                                    let end = write
+                                        .checked_add(len)
+                                        .expect("worker merge length overflowed usize");
+                                    debug_assert!(end <= $total);
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            src.as_ptr(),
+                                            dst_ptr.add(write),
+                                            len,
+                                        );
+                                        src.set_len(0);
+                                    }
+                                    write = end;
+                                }
+                            }
+                            debug_assert_eq!(write, $total);
+                            unsafe { $dst.set_len(write) };
+                        }
+                    }};
+                }
+
+                if allow_prune {
+                    merge_worker_vectors!(
+                        self.arena.expand_buf,
+                        expand,
+                        total_expand,
+                        max_expand_worker,
+                        max_expand_len
+                    );
+                } else {
+                    deferred_parallel_expand_worker_count = worker_count;
+                    deferred_parallel_expand_total = total_expand;
+                    self.arena.expand_buf.clear();
+                }
+                if allow_prune {
+                    merge_worker_vectors!(
+                        self.arena.prune_buf,
+                        prune,
+                        total_prune,
+                        max_prune_worker,
+                        max_prune_len
+                    );
+                } else {
+                    self.arena.prune_buf.clear();
+                }
+                if emit_changed {
+                    merge_worker_vectors!(
+                        self.arena.changed_list,
+                        changed,
+                        total_changed,
+                        max_changed_worker,
+                        max_changed_len
+                    );
+                    if TRACK_NEIGHBOR_INFLUENCE {
+                        merge_worker_vectors!(
+                            self.arena.changed_influence,
+                            changed_influence,
+                            total_changed,
+                            max_changed_worker,
+                            max_changed_len
+                        );
+                    } else {
+                        self.arena.changed_influence.clear();
+                    }
+                } else {
+                    if !skip_rebuild_assume_no_prune {
+                        self.arena.changed_list.clear();
+                    }
+                    self.arena.changed_influence.clear();
+                }
+                self.arena.prune_candidates_verified = all_prune_candidates_verified;
             }
-            self.arena.prune_candidates_verified = all_prune_candidates_verified;
         }
         if ASSUME_CHANGED_MODE && !skip_rebuild_assume_no_prune {
             self.derive_changed_from_active_minus_prune();
