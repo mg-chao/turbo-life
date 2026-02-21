@@ -2126,13 +2126,23 @@ impl TurboLife {
     }
 
     #[inline(always)]
-    fn step_impl_backend<const CORE_BACKEND: u8, const ASSUME_CHANGED_MODE: bool>(&mut self) {
+    fn step_impl_backend<
+        const CORE_BACKEND: u8,
+        const ASSUME_CHANGED_MODE: bool,
+        const ALLOW_PRUNE: bool,
+    >(
+        &mut self,
+    ) {
         debug_assert!(
             !ASSUME_CHANGED_MODE || CORE_BACKEND == CORE_BACKEND_NEON,
             "assume-changed mode is only valid for the NEON backend"
         );
+        debug_assert!(
+            ASSUME_CHANGED_MODE || ALLOW_PRUNE,
+            "non-assume mode must always run prune bookkeeping"
+        );
 
-        let allow_prune = should_run_prune_pass::<ASSUME_CHANGED_MODE>(self.generation);
+        let allow_prune = ALLOW_PRUNE;
         let skip_rebuild_assume_no_prune = ASSUME_CHANGED_MODE
             && !allow_prune
             && self.arena.active_set_dense_contiguous
@@ -3105,31 +3115,60 @@ impl TurboLife {
     }
 
     #[inline(always)]
-    fn step_n_impl_backend<const CORE_BACKEND: u8, const ASSUME_CHANGED_MODE: bool>(
+    fn step_n_impl_backend_with_prune<
+        const CORE_BACKEND: u8,
+        const ASSUME_CHANGED_MODE: bool,
+        const ALLOW_PRUNE: bool,
+    >(
         &mut self,
         mut remaining: u64,
     ) {
         while remaining >= 8 {
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
             remaining -= 8;
         }
         while remaining >= 4 {
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
             remaining -= 4;
         }
         while remaining != 0 {
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
             remaining -= 1;
+        }
+    }
+
+    #[inline(always)]
+    fn step_n_impl_backend<const CORE_BACKEND: u8, const ASSUME_CHANGED_MODE: bool>(
+        &mut self,
+        mut remaining: u64,
+    ) {
+        if !ASSUME_CHANGED_MODE {
+            self.step_n_impl_backend_with_prune::<CORE_BACKEND, false, true>(remaining);
+            return;
+        }
+
+        while remaining != 0 {
+            if should_run_prune_pass::<true>(self.generation) {
+                self.step_impl_backend::<CORE_BACKEND, true, true>();
+                remaining -= 1;
+                continue;
+            }
+
+            let generation_mod = self.generation & (ASSUME_CHANGED_PRUNE_STRIDE - 1);
+            let until_prune = ASSUME_CHANGED_PRUNE_STRIDE - generation_mod;
+            let batch = remaining.min(until_prune);
+            self.step_n_impl_backend_with_prune::<CORE_BACKEND, true, false>(batch);
+            remaining -= batch;
         }
     }
 
@@ -3660,7 +3699,7 @@ mod tests {
         let mut engine = TurboLife::with_config(TurboLifeConfig::default().thread_count(1));
         engine.set_cell(0, 0, true);
 
-        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true>();
+        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true, false>();
 
         assert_eq!(engine.population(), 0);
         assert!(engine.arena.occupied_count > 0);
@@ -3672,7 +3711,7 @@ mod tests {
         engine.set_cell(0, 0, true);
         engine.generation = super::ASSUME_CHANGED_PRUNE_STRIDE;
 
-        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true>();
+        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true, true>();
 
         assert_eq!(engine.population(), 0);
         assert_eq!(engine.arena.occupied_count, 0);
@@ -3703,7 +3742,7 @@ mod tests {
         let sentinel = TileIdx(u32::MAX);
         engine.arena.changed_scratch = vec![sentinel];
 
-        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true>();
+        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true, false>();
 
         assert_eq!(engine.arena.changed_scratch, vec![sentinel]);
         assert_eq!(engine.arena.changed_list, expected_changed);
@@ -3721,7 +3760,7 @@ mod tests {
         let sentinel = TileIdx(u32::MAX);
         engine.arena.changed_scratch = vec![sentinel];
 
-        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true>();
+        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true, false>();
 
         assert_eq!(engine.arena.changed_scratch, vec![sentinel]);
         assert_eq!(engine.arena.changed_list, expected_changed);
