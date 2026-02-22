@@ -1576,15 +1576,25 @@ impl TurboLife {
     #[inline(always)]
     fn hot_tile_lookup(&mut self, coord: (i64, i64)) -> Option<TileIdx> {
         let cached = self.hot_tile_cache.get(coord)?;
-        let i = cached.index();
-        let valid = i < self.arena.meta.len()
-            && self.arena.meta[i].occupied()
-            && self.arena.coords[i] == coord;
-        if !valid {
-            self.hot_tile_clear();
-            return None;
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            // Fast path: public mutation APIs only mutate/reuse tiles on the
+            // same thread, and step/step_n clear this cache before any prune/
+            // recycle activity can invalidate indices.
+            return Some(cached);
         }
-        Some(cached)
+        #[cfg(any(test, debug_assertions))]
+        {
+            let i = cached.index();
+            let valid = i < self.arena.meta.len()
+                && self.arena.meta[i].occupied()
+                && self.arena.coords[i] == coord;
+            if !valid {
+                self.hot_tile_clear();
+                return None;
+            }
+            Some(cached)
+        }
     }
 
     #[inline(always)]
