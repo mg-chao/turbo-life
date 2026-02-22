@@ -69,18 +69,6 @@ fn east_neighbor_plane(word: u64, ghost_e: u64) -> u64 {
     (word >> 1) | (ghost_e << 63)
 }
 
-#[cold]
-#[inline(never)]
-fn branch_hint_cold() {}
-
-#[inline(always)]
-fn unlikely(cond: bool) -> bool {
-    if cond {
-        branch_hint_cold();
-    }
-    cond
-}
-
 const LIVE_N: u8 = 1 << 0;
 const LIVE_S: u8 = 1 << 1;
 const LIVE_W: u8 = 1 << 2;
@@ -1205,7 +1193,7 @@ unsafe fn advance_tile_fused_empty_tile<
     sw_i: usize,
     se_i: usize,
 ) -> TileAdvanceResult {
-    if unlikely(missing_mask == MISSING_ALL_NEIGHBORS) {
+    if missing_mask == MISSING_ALL_NEIGHBORS {
         debug_assert!(tile_is_empty(current));
         if force_store {
             unsafe {
@@ -1254,7 +1242,7 @@ unsafe fn advance_tile_fused_empty_tile<
         | (se_live & LIVE_NW))
         == 0;
 
-    if unlikely(ghost_empty) {
+    if ghost_empty {
         debug_assert!(tile_is_empty(current));
         if force_store {
             unsafe {

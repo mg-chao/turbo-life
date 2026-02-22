@@ -1276,18 +1276,6 @@ fn should_queue_prune<const EMIT_CHANGED: bool>(has_live: bool, changed: bool) -
     !has_live && (!EMIT_CHANGED || !changed)
 }
 
-#[cold]
-#[inline(never)]
-fn branch_hint_cold() {}
-
-#[inline(always)]
-fn unlikely(cond: bool) -> bool {
-    if cond {
-        branch_hint_cold();
-    }
-    cond
-}
-
 #[inline(always)]
 fn run_parallel_workers<F>(worker_count: usize, worker_fn: &F)
 where
@@ -2442,7 +2430,7 @@ impl TurboLife {
                         }
                         if $allow_prune {
                             let queue_prune =
-                                unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
+                                should_queue_prune::<$emit_changed>(has_live, changed);
                             unsafe {
                                 vec_push_if_unchecked(&mut self.arena.prune_buf, idx, queue_prune);
                             }
@@ -2454,7 +2442,7 @@ impl TurboLife {
                         let missing = result.missing_mask;
                         let live_mask = result.live_mask;
                         let expand_mask = missing & live_mask;
-                        if unlikely(expand_mask != 0) {
+                        if expand_mask != 0 {
                             unsafe {
                                 append_expand_candidates_cold(
                                     &mut self.arena.expand_buf,
@@ -2583,7 +2571,7 @@ impl TurboLife {
                         }
                         if $allow_prune {
                             let queue_prune =
-                                unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
+                                should_queue_prune::<$emit_changed>(has_live, changed);
                             unsafe {
                                 vec_push_if_unchecked(&mut self.arena.prune_buf, idx, queue_prune);
                             }
@@ -2595,7 +2583,7 @@ impl TurboLife {
                         let missing = result.missing_mask;
                         let live_mask = result.live_mask;
                         let expand_mask = missing & live_mask;
-                        if unlikely(expand_mask != 0) {
+                        if expand_mask != 0 {
                             unsafe {
                                 append_expand_candidates_cold(
                                     &mut self.arena.expand_buf,
@@ -2808,8 +2796,7 @@ impl TurboLife {
                         }
                     }
                     if $allow_prune {
-                        let queue_prune =
-                            unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
+                        let queue_prune = should_queue_prune::<$emit_changed>(has_live, changed);
                         unsafe {
                             vec_push_if_unchecked(&mut ($scratch).prune, idx, queue_prune);
                         }
@@ -2821,7 +2808,7 @@ impl TurboLife {
                     let missing = result.missing_mask;
                     let live_mask = result.live_mask;
                     let expand_mask = missing & live_mask;
-                    if unlikely(expand_mask != 0) {
+                    if expand_mask != 0 {
                         unsafe {
                             append_expand_candidates_cold(
                                 &mut ($scratch).expand,
