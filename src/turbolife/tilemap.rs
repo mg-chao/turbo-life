@@ -12,17 +12,30 @@ use super::tile::TileIdx;
 
 // ── Hash function ───────────────────────────────────────────────────────
 
-/// Two distinct Fibonacci-derived constants for mixing x and y independently.
-/// This avoids the systematic collisions that a single-constant sequential
-/// hash (like FxHash) produces on grid-aligned coordinate patterns.
+/// Two distinct odd constants for independent x/y lanes.
 const MX: u64 = 0x517c_c1b7_2722_0a95;
-const MY: u64 = 0x6c62_272e_07bb_0142;
+const MY: u64 = 0x6c62_272e_07bb_0143;
+
+pub(crate) const TILE_HASH_X_STEP: u64 = MX;
+pub(crate) const TILE_HASH_Y_STEP: u64 = MY;
+
+#[inline(always)]
+pub(crate) fn tile_hash_lanes(x: i64, y: i64) -> (u64, u64) {
+    (
+        (x as u64).wrapping_mul(TILE_HASH_X_STEP),
+        (y as u64).wrapping_mul(TILE_HASH_Y_STEP),
+    )
+}
+
+#[inline(always)]
+pub(crate) fn tile_hash_from_lanes(x_lane: u64, y_lane: u64) -> u64 {
+    x_lane ^ y_lane
+}
 
 #[inline(always)]
 pub(crate) fn tile_hash(x: i64, y: i64) -> u64 {
-    // Throughput-first 2-multiply mix (no final fold). Rotate y's lane so
-    // both axes contribute entropy to low bucket bits.
-    (x as u64).wrapping_mul(MX) ^ (y as u64).wrapping_mul(MY).rotate_right(31)
+    let (x_lane, y_lane) = tile_hash_lanes(x, y);
+    tile_hash_from_lanes(x_lane, y_lane)
 }
 
 // ── Slot layout ─────────────────────────────────────────────────────────
@@ -206,6 +219,23 @@ impl TileMap {
         self.insert_no_grow(x, y, value, hash)
     }
 
+    /// Insert only if key is absent. Returns `Err(existing)` when the key is
+    /// already present and leaves the existing value untouched.
+    #[inline]
+    pub(crate) fn insert_unique_hashed(
+        &mut self,
+        x: i64,
+        y: i64,
+        value: TileIdx,
+        hash: u64,
+    ) -> Result<(), TileIdx> {
+        debug_assert_eq!(hash, tile_hash(x, y));
+        if self.needs_grow() {
+            self.grow();
+        }
+        self.insert_unique_no_grow(x, y, value, hash)
+    }
+
     /// Insert without checking capacity — caller must ensure space.
     #[inline]
     fn insert_no_grow(&mut self, x: i64, y: i64, value: TileIdx, hash: u64) -> Option<TileIdx> {
@@ -241,6 +271,73 @@ impl TileMap {
                 let old = TileIdx(slot.value);
                 slot.value = value.0;
                 return Some(old);
+            }
+
+            // Robin Hood: if the existing entry is closer to home, steal its spot.
+            let existing_dist = distance_from_ctrl(ctrl);
+            if ins_dist > existing_dist {
+                let displaced_fp = ctrl & FP_MASK;
+                let displaced_key_x = slot.key_x;
+                let displaced_key_y = slot.key_y;
+                let displaced_value = slot.value;
+
+                debug_assert!(ins_dist <= MAX_DIST);
+                slot.key_x = ins_key_x;
+                slot.key_y = ins_key_y;
+                slot.value = ins_value;
+                slot.ctrl = occupied_ctrl(ins_fp, ins_dist);
+
+                ins_key_x = displaced_key_x;
+                ins_key_y = displaced_key_y;
+                ins_value = displaced_value;
+                ins_fp = displaced_fp;
+                ins_dist = existing_dist;
+            }
+
+            ins_dist += 1;
+            pos = (pos + 1) & mask;
+        }
+    }
+
+    /// Insert without checking capacity and without overwriting existing keys.
+    #[inline]
+    fn insert_unique_no_grow(
+        &mut self,
+        x: i64,
+        y: i64,
+        value: TileIdx,
+        hash: u64,
+    ) -> Result<(), TileIdx> {
+        let target_ctrl = match_ctrl_of(hash);
+        let mask = self.mask;
+        let mut pos = hash as usize & mask;
+        let slots_ptr = self.slots.as_mut_ptr();
+        let mut ins_key_x = x;
+        let mut ins_key_y = y;
+        let mut ins_value = value.0;
+        let mut ins_fp = fingerprint_of(hash);
+        let mut ins_dist = 0usize;
+
+        loop {
+            // SAFETY: pos is always & mask which is < slots.len().
+            let slot = unsafe { &mut *slots_ptr.add(pos) };
+            let ctrl = slot.ctrl;
+
+            if ctrl == EMPTY {
+                debug_assert!(ins_dist <= MAX_DIST);
+                *slot = Slot {
+                    key_x: ins_key_x,
+                    key_y: ins_key_y,
+                    value: ins_value,
+                    ctrl: occupied_ctrl(ins_fp, ins_dist),
+                };
+                self.len += 1;
+                return Ok(());
+            }
+
+            // Exact match — preserve existing value.
+            if (ctrl & MATCH_MASK) == target_ctrl && slot.key_x == x && slot.key_y == y {
+                return Err(TileIdx(slot.value));
             }
 
             // Robin Hood: if the existing entry is closer to home, steal its spot.
@@ -527,6 +624,18 @@ mod tests {
     }
 
     #[test]
+    fn insert_unique_preserves_existing_value() {
+        let mut m = TileMap::with_capacity(16);
+        let hash = tile_hash(3, 7);
+        assert_eq!(m.insert_unique_hashed(3, 7, TileIdx(11), hash), Ok(()));
+        assert_eq!(
+            m.insert_unique_hashed(3, 7, TileIdx(99), hash),
+            Err(TileIdx(11))
+        );
+        assert_eq!(m.get_hashed(3, 7, hash), Some(TileIdx(11)));
+    }
+
+    #[test]
     fn remove_does_not_break_chains() {
         let mut m = TileMap::with_capacity(64);
         // Insert entries that are likely to form a probe chain.
@@ -623,5 +732,35 @@ mod tests {
             ctrl: occupied_ctrl(1, 0),
         };
         slot.set_distance(MAX_DIST + 1);
+    }
+
+    #[test]
+    fn hash_collisions_preserve_distinct_keys() {
+        fn mod_inverse_odd_u64(x: u64) -> u64 {
+            debug_assert_eq!(x & 1, 1);
+            let mut inv = 1u64;
+            for _ in 0..6 {
+                inv = inv.wrapping_mul(2u64.wrapping_sub(x.wrapping_mul(inv)));
+            }
+            inv
+        }
+
+        let inv_mx = mod_inverse_odd_u64(MX);
+        let first = (0i64, 0i64);
+        let second_y = 1i64;
+        let second_x = (tile_hash(first.0, first.1) ^ (second_y as u64).wrapping_mul(MY))
+            .wrapping_mul(inv_mx) as i64;
+        let second = (second_x, second_y);
+        assert_ne!(first, second);
+        assert_eq!(tile_hash(first.0, first.1), tile_hash(second.0, second.1));
+
+        let mut m = TileMap::with_capacity(4);
+        assert_eq!(m.insert(first.0, first.1, TileIdx(1)), None);
+        assert_eq!(m.insert(second.0, second.1, TileIdx(2)), None);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(first.0, first.1), Some(TileIdx(1)));
+        assert_eq!(m.get(second.0, second.1), Some(TileIdx(2)));
+        assert_eq!(m.remove(second.0, second.1), Some(TileIdx(2)));
+        assert_eq!(m.get(first.0, first.1), Some(TileIdx(1)));
     }
 }

@@ -39,15 +39,45 @@ if ! [[ "$TRAIN_RUNS" =~ ^[0-9]+$ ]] || [ "$TRAIN_RUNS" -eq 0 ]; then
     exit 2
 fi
 
+if [ "$#" -gt 0 ] && [ "${1:-}" = "--" ]; then
+    shift
+fi
+
 HARNESS_ARGS=("$@")
+
+has_harness_args() {
+    [ "${#HARNESS_ARGS[@]}" -gt 0 ]
+}
+
+if has_harness_args; then
+    for arg in "${HARNESS_ARGS[@]}"; do
+        if [ "$arg" = "--pgo-train" ]; then
+            echo "error: do not pass --pgo-train explicitly; build_maxperf.sh injects it for PGO training runs." >&2
+            exit 2
+        fi
+    done
+fi
 
 HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
 SYSROOT="$(rustc --print sysroot)"
 PROFDATA_BIN="$SYSROOT/lib/rustlib/$HOST_TRIPLE/bin/llvm-profdata"
+NATIVE_RUSTFLAGS="-Ctarget-cpu=native"
+REPO_PROFDATA="$ROOT_DIR/pgo/turbo-life-main.profdata"
+case "$HOST_TRIPLE" in
+    aarch64-apple-darwin)
+        NATIVE_RUSTFLAGS+=" -Clink-arg=-Wl,-dead_strip -Clink-arg=-Wl,-dead_strip_dylibs"
+        ;;
+    x86_64-pc-windows-msvc)
+        NATIVE_RUSTFLAGS+=" -Clink-arg=/OPT:REF -Clink-arg=/OPT:ICF"
+        ;;
+esac
 if [ ! -x "$PROFDATA_BIN" ]; then
     if command -v llvm-profdata >/dev/null 2>&1; then
         PROFDATA_BIN="$(command -v llvm-profdata)"
         echo "note: using llvm-profdata from PATH: $PROFDATA_BIN" >&2
+    elif command -v xcrun >/dev/null 2>&1 && xcrun --find llvm-profdata >/dev/null 2>&1; then
+        PROFDATA_BIN="$(xcrun --find llvm-profdata)"
+        echo "note: using llvm-profdata from xcrun: $PROFDATA_BIN" >&2
     else
         echo "missing llvm-profdata at $PROFDATA_BIN" >&2
         echo "install it with: rustup component add llvm-tools-$HOST_TRIPLE" >&2
@@ -63,10 +93,10 @@ bench_binary() {
     local runs="$1"
     local bin="$2"
     shift 2
-    if [ "${#HARNESS_ARGS[@]}" -eq 0 ]; then
-        "$ROOT_DIR/scripts/bench_main.sh" "$runs" "$bin" --quiet "$@"
-    else
+    if has_harness_args; then
         "$ROOT_DIR/scripts/bench_main.sh" "$runs" "$bin" --quiet -- "${HARNESS_ARGS[@]}" "$@"
+    else
+        "$ROOT_DIR/scripts/bench_main.sh" "$runs" "$bin" --quiet "$@"
     fi
 }
 
@@ -75,6 +105,7 @@ build_bin() {
     local rustflags="$2"
     local lto="$3"
     local features="$4"
+    local wrapper_profile_use="${5:-}"
 
     rm -rf -- "$target_dir"
 
@@ -83,15 +114,18 @@ build_bin() {
         cmd+=(--features "$features")
     fi
 
-    if [ -n "$rustflags" ] && [ -n "$lto" ]; then
-        RUSTFLAGS="$rustflags" CARGO_PROFILE_RELEASE_LTO="$lto" CARGO_TARGET_DIR="$target_dir" "${cmd[@]}"
-    elif [ -n "$rustflags" ]; then
-        RUSTFLAGS="$rustflags" CARGO_TARGET_DIR="$target_dir" "${cmd[@]}"
-    elif [ -n "$lto" ]; then
-        CARGO_PROFILE_RELEASE_LTO="$lto" CARGO_TARGET_DIR="$target_dir" "${cmd[@]}"
-    else
-        CARGO_TARGET_DIR="$target_dir" "${cmd[@]}"
+    local -a env_vars=("CARGO_TARGET_DIR=$target_dir")
+    if [ -n "$rustflags" ]; then
+        env_vars+=("RUSTFLAGS=$rustflags")
     fi
+    if [ -n "$lto" ]; then
+        env_vars+=("CARGO_PROFILE_RELEASE_LTO=$lto")
+    fi
+    if [ -n "$wrapper_profile_use" ]; then
+        env_vars+=("TURBOLIFE_PROFILE_USE=$wrapper_profile_use")
+    fi
+
+    env "${env_vars[@]}" "${cmd[@]}"
 }
 
 accept_if_faster() {
@@ -129,13 +163,21 @@ run_candidate() {
     local rustflags="$2"
     local lto="$3"
     local features="$4"
+    local wrapper_profile_use="${5:-}"
 
     local target_dir="$ROOT_DIR/target/maxperf/$name"
     local bin="$target_dir/release/turbo-life"
+    local display_rustflags="$rustflags"
+    if [ -n "$wrapper_profile_use" ]; then
+        if [ -n "$display_rustflags" ]; then
+            display_rustflags+=" "
+        fi
+        display_rustflags+="wrapper-pgo=$wrapper_profile_use"
+    fi
 
     echo ""
     echo "==> candidate: $name"
-    if ! build_bin "$target_dir" "$rustflags" "$lto" "$features"; then
+    if ! build_bin "$target_dir" "$rustflags" "$lto" "$features" "$wrapper_profile_use"; then
         echo "warning: skipped candidate '$name' (build failed)" >&2
         return 0
     fi
@@ -144,7 +186,7 @@ run_candidate() {
         echo "warning: skipped candidate '$name' (benchmark failed)" >&2
         return 0
     fi
-    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$median" "$rustflags" "$lto" "$features" >> "$RESULTS_FILE"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$median" "$display_rustflags" "$lto" "$features" >> "$RESULTS_FILE"
     accept_if_faster "$name" "$median" "$bin" "$rustflags" "$lto" "$features"
 }
 
@@ -154,7 +196,7 @@ BASE_TARGET_DIR="$ROOT_DIR/target/maxperf/$BASE_NAME"
 BASE_BIN="$BASE_TARGET_DIR/release/turbo-life"
 
 echo "==> baseline build"
-build_bin "$BASE_TARGET_DIR" "" "" ""
+build_bin "$BASE_TARGET_DIR" "" "" "" ""
 BASE_MEDIAN="$(bench_binary "$BENCH_RUNS" "$BASE_BIN")"
 printf '%s\t%s\t%s\t%s\t%s\n' "$BASE_NAME" "$BASE_MEDIAN" "" "" "" >> "$RESULTS_FILE"
 
@@ -168,16 +210,27 @@ BEST_LTO=""
 BEST_FEATURES=""
 
 # Build-config candidates
-run_candidate "lto-thin" "" "thin" ""
-run_candidate "lto-off" "" "off" ""
-run_candidate "llvm-unroll300" "-Ctarget-cpu=native -Cllvm-args=-unroll-threshold=300" "" ""
-run_candidate "llvm-inline275" "-Ctarget-cpu=native -Cllvm-args=-inline-threshold=275" "" ""
+run_candidate "lto-thin" "" "thin" "" ""
+run_candidate "lto-off" "" "off" "" ""
+run_candidate "llvm-unroll300" "$NATIVE_RUSTFLAGS -Cllvm-args=-unroll-threshold=300" "" "" ""
+run_candidate "llvm-inline275" "$NATIVE_RUSTFLAGS -Cllvm-args=-inline-threshold=275" "" "" ""
+run_candidate "no-wrapper-pgo" "" "" "" "off"
 
 if [[ "$HOST_TRIPLE" == aarch64-* || "$HOST_TRIPLE" == arm64-* ]]; then
-    run_candidate "feat-prefetch" "" "" "aggressive-prefetch-aarch64"
+    run_candidate "feat-prefetch" "" "" "aggressive-prefetch-aarch64" ""
 fi
 
-# Optional PGO over the current best non-PGO config.
+# Snapshot the strongest non-PGO configuration before trying any profile-use seed.
+BEST_NON_PGO_NAME="$BEST_NAME"
+BEST_NON_PGO_RUSTFLAGS="$BEST_RUSTFLAGS"
+BEST_NON_PGO_LTO="$BEST_LTO"
+BEST_NON_PGO_FEATURES="$BEST_FEATURES"
+
+if [ -f "$REPO_PROFDATA" ]; then
+    run_candidate "repo-profdata" "" "" "" "$REPO_PROFDATA"
+fi
+
+# Optional fresh PGO over the best non-PGO config.
 PGO_DATA_DIR="$ROOT_DIR/target/maxperf/pgo-data"
 PGO_GEN_DIR="$ROOT_DIR/target/maxperf/pgo-gen"
 PGO_USE_DIR="$ROOT_DIR/target/maxperf/pgo-use"
@@ -187,16 +240,16 @@ rm -rf -- "$PGO_DATA_DIR"
 mkdir -p "$PGO_DATA_DIR"
 
 echo ""
-echo "==> candidate: pgo-on-${BEST_NAME}"
+echo "==> candidate: pgo-on-${BEST_NON_PGO_NAME}"
 
-pgo_gen_rustflags="${BEST_RUSTFLAGS}"
+pgo_gen_rustflags="${BEST_NON_PGO_RUSTFLAGS}"
 if [ -n "$pgo_gen_rustflags" ]; then
     pgo_gen_rustflags+=" "
 fi
 pgo_gen_rustflags+="-Cprofile-generate=$PGO_DATA_DIR"
 
 PGO_CANDIDATE_READY="1"
-if ! build_bin "$PGO_GEN_DIR" "$pgo_gen_rustflags" "$BEST_LTO" "$BEST_FEATURES"; then
+if ! build_bin "$PGO_GEN_DIR" "$pgo_gen_rustflags" "$BEST_NON_PGO_LTO" "$BEST_NON_PGO_FEATURES"; then
     echo "warning: skipped PGO candidate (instrumented build failed)" >&2
     PGO_CANDIDATE_READY="0"
 fi
@@ -204,16 +257,16 @@ fi
 if [ "$PGO_CANDIDATE_READY" = "1" ]; then
     for ((i = 1; i <= TRAIN_RUNS; i++)); do
         echo "  training run $i/$TRAIN_RUNS"
-        if [ "${#HARNESS_ARGS[@]}" -eq 0 ]; then
+        if has_harness_args; then
             if ! LLVM_PROFILE_FILE="$PGO_DATA_DIR/turbo-life-%p-%m.profraw" \
-                "$PGO_GEN_DIR/release/turbo-life" >/dev/null; then
+                "$PGO_GEN_DIR/release/turbo-life" --pgo-train "${HARNESS_ARGS[@]}" >/dev/null; then
                 echo "warning: skipped PGO candidate (training run $i failed)" >&2
                 PGO_CANDIDATE_READY="0"
                 break
             fi
         else
             if ! LLVM_PROFILE_FILE="$PGO_DATA_DIR/turbo-life-%p-%m.profraw" \
-                "$PGO_GEN_DIR/release/turbo-life" "${HARNESS_ARGS[@]}" >/dev/null; then
+                "$PGO_GEN_DIR/release/turbo-life" --pgo-train >/dev/null; then
                 echo "warning: skipped PGO candidate (training run $i failed)" >&2
                 PGO_CANDIDATE_READY="0"
                 break
@@ -236,13 +289,14 @@ if [ "$PGO_CANDIDATE_READY" = "1" ]; then
 fi
 
 if [ "$PGO_CANDIDATE_READY" = "1" ]; then
-    pgo_use_rustflags="${BEST_RUSTFLAGS}"
-    if [ -n "$pgo_use_rustflags" ]; then
-        pgo_use_rustflags+=" "
+    pgo_use_rustflags="${BEST_NON_PGO_RUSTFLAGS}"
+    pgo_use_display_rustflags="$pgo_use_rustflags"
+    if [ -n "$pgo_use_display_rustflags" ]; then
+        pgo_use_display_rustflags+=" "
     fi
-    pgo_use_rustflags+="-Cprofile-use=$PGO_PROFDATA"
+    pgo_use_display_rustflags+="wrapper-pgo=$PGO_PROFDATA"
 
-    if ! build_bin "$PGO_USE_DIR" "$pgo_use_rustflags" "$BEST_LTO" "$BEST_FEATURES"; then
+    if ! build_bin "$PGO_USE_DIR" "$pgo_use_rustflags" "$BEST_NON_PGO_LTO" "$BEST_NON_PGO_FEATURES" "$PGO_PROFDATA"; then
         echo "warning: skipped PGO candidate (optimized build failed)" >&2
         PGO_CANDIDATE_READY="0"
     fi
@@ -253,8 +307,8 @@ if [ "$PGO_CANDIDATE_READY" = "1" ]; then
     if ! PGO_MEDIAN="$(bench_binary "$BENCH_RUNS" "$PGO_BIN")"; then
         echo "warning: skipped PGO candidate (benchmark failed)" >&2
     else
-        printf '%s\t%s\t%s\t%s\t%s\n' "pgo-on-$BEST_NAME" "$PGO_MEDIAN" "$pgo_use_rustflags" "$BEST_LTO" "$BEST_FEATURES" >> "$RESULTS_FILE"
-        accept_if_faster "pgo-on-$BEST_NAME" "$PGO_MEDIAN" "$PGO_BIN" "$pgo_use_rustflags" "$BEST_LTO" "$BEST_FEATURES"
+        printf '%s\t%s\t%s\t%s\t%s\n' "pgo-on-$BEST_NON_PGO_NAME" "$PGO_MEDIAN" "$pgo_use_display_rustflags" "$BEST_NON_PGO_LTO" "$BEST_NON_PGO_FEATURES" >> "$RESULTS_FILE"
+        accept_if_faster "pgo-on-$BEST_NON_PGO_NAME" "$PGO_MEDIAN" "$PGO_BIN" "$pgo_use_rustflags" "$BEST_NON_PGO_LTO" "$BEST_NON_PGO_FEATURES"
     fi
 fi
 

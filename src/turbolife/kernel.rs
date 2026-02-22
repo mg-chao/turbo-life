@@ -49,8 +49,10 @@ impl TileAdvanceResult {
 
 #[inline(always)]
 fn full_add(a: u64, b: u64, c: u64) -> (u64, u64) {
-    let sum = a ^ b ^ c;
-    let carry = (a & b) | (b & c) | (a & c);
+    let ab_xor = a ^ b;
+    let sum = ab_xor ^ c;
+    // Equivalent to (a & b) | (b & c) | (a & c), with fewer logic ops.
+    let carry = (a & b) | (c & ab_xor);
     (sum, carry)
 }
 
@@ -244,8 +246,8 @@ pub fn advance_core_scalar(
     next: &mut [u64; TILE_SIZE],
     ghost: &GhostZone,
 ) -> (bool, BorderData, bool) {
-    let mut changed = false;
-    let mut has_live = false;
+    let mut diff_acc = 0u64;
+    let mut live_acc = 0u64;
     let mut border_west = 0u64;
     let mut border_east = 0u64;
     let mut west_window =
@@ -260,8 +262,8 @@ pub fn advance_core_scalar(
             let next_row = advance_row_scalar($row_above, $row_self, $row_below, ghost);
 
             next[$row] = next_row;
-            changed |= next_row != $row_self;
-            has_live |= next_row != 0;
+            diff_acc |= next_row ^ $row_self;
+            live_acc |= next_row;
             border_west |= (next_row & 1) << $row;
             border_east |= ((next_row >> 63) & 1) << $row;
         }};
@@ -293,6 +295,8 @@ pub fn advance_core_scalar(
     let north_row = next[TILE_SIZE - 1];
     let south_row = next[0];
     let border = BorderData::from_edges(north_row, south_row, border_west, border_east);
+    let changed = diff_acc != 0;
+    let has_live = live_acc != 0;
 
     (changed, border, has_live)
 }
@@ -410,11 +414,9 @@ unsafe fn avx2_full_add(
 ) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i) {
     use std::arch::x86_64::{_mm256_and_si256, _mm256_or_si256, _mm256_xor_si256};
     unsafe {
-        let sum = _mm256_xor_si256(_mm256_xor_si256(a, b), c);
-        let carry = _mm256_or_si256(
-            _mm256_or_si256(_mm256_and_si256(a, b), _mm256_and_si256(b, c)),
-            _mm256_and_si256(a, c),
-        );
+        let ab_xor = _mm256_xor_si256(a, b);
+        let sum = _mm256_xor_si256(ab_xor, c);
+        let carry = _mm256_or_si256(_mm256_and_si256(a, b), _mm256_and_si256(c, ab_xor));
         (sum, carry)
     }
 }
@@ -672,8 +674,9 @@ unsafe fn neon_full_add(
 ) {
     use std::arch::aarch64::{vandq_u64, veorq_u64, vorrq_u64};
     unsafe {
-        let sum = veorq_u64(veorq_u64(a, b), c);
-        let carry = vorrq_u64(vorrq_u64(vandq_u64(a, b), vandq_u64(b, c)), vandq_u64(a, c));
+        let ab_xor = veorq_u64(a, b);
+        let sum = veorq_u64(ab_xor, c);
+        let carry = vorrq_u64(vandq_u64(a, b), vandq_u64(c, ab_xor));
         (sum, carry)
     }
 }
@@ -707,13 +710,14 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
     ghost_se: u64,
 ) -> (bool, BorderData, bool) {
     use std::arch::aarch64::{
-        vandq_u64, vbicq_u64, vdupq_n_u64, veorq_u64, vget_high_u64, vget_lane_u64, vget_low_u64,
-        vgetq_lane_u64, vld1q_u64, vorr_u64, vorrq_u64, vshlq_n_u64, vshrq_n_u64, vst1q_u64,
+        vandq_u64, vbicq_u64, vdupq_n_u64, veorq_u64, vextq_u64, vget_high_u64, vget_lane_u64,
+        vget_low_u64, vgetq_lane_u64, vld1q_u64, vorr_u64, vorrq_u64, vshlq_n_u64, vshrq_n_u64,
+        vst1q_u64,
     };
 
     let mut changed = !TRACK_DIFF;
     let mut diff_acc = vdupq_n_u64(0);
-    let mut has_live = false;
+    let mut live_acc_scalar = 0u64;
     let mut border_west = 0u64;
     let mut border_east = 0u64;
     let current_ptr = current.as_ptr();
@@ -802,7 +806,7 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
             }
             let row0 = vgetq_lane_u64(next_rows, 0);
             let row1 = vgetq_lane_u64(next_rows, 1);
-            has_live |= (row0 | row1) != 0;
+            live_acc_scalar |= row0 | row1;
             let west_bits = (row0 & 1) | ((row1 & 1) << 1);
             let east_bits = ((row0 >> 63) & 1) | (((row1 >> 63) & 1) << 1);
             border_west |= west_bits << $row_base;
@@ -835,6 +839,93 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
 
     let mut prev_above = row_above_0;
     let mut row_base = 2usize;
+    // Process 8 rows (4 pairs) per iteration to reduce loop-control overhead.
+    while row_base < TILE_SIZE - 8 {
+        let byte_w_self = west_self_bits & 0xFF;
+        let byte_e_self = east_self_bits & 0xFF;
+        let byte_w_above = west_above_bits & 0xFF;
+        let byte_e_above = east_above_bits & 0xFF;
+        let byte_w_below = west_below_bits & 0xFF;
+        let byte_e_below = east_below_bits & 0xFF;
+
+        let row_below_0 = prev_above;
+        let row_self_0 = unsafe { vld1q_u64(current_ptr.add(row_base)) };
+        let row_block_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 2)) };
+        let row_above_0 = vextq_u64(row_self_0, row_block_1, 1);
+        let _ = process_pair!(
+            row_base,
+            row_above_0,
+            row_self_0,
+            row_below_0,
+            byte_w_above & 0b11,
+            byte_e_above & 0b11,
+            byte_w_self & 0b11,
+            byte_e_self & 0b11,
+            byte_w_below & 0b11,
+            byte_e_below & 0b11
+        );
+
+        let row_below_1 = row_above_0;
+        let row_self_1 = row_block_1;
+        let row_block_2 = unsafe { vld1q_u64(current_ptr.add(row_base + 4)) };
+        let row_above_1 = vextq_u64(row_self_1, row_block_2, 1);
+        let _ = process_pair!(
+            row_base + 2,
+            row_above_1,
+            row_self_1,
+            row_below_1,
+            (byte_w_above >> 2) & 0b11,
+            (byte_e_above >> 2) & 0b11,
+            (byte_w_self >> 2) & 0b11,
+            (byte_e_self >> 2) & 0b11,
+            (byte_w_below >> 2) & 0b11,
+            (byte_e_below >> 2) & 0b11
+        );
+
+        let row_below_2 = row_above_1;
+        let row_self_2 = row_block_2;
+        let row_block_3 = unsafe { vld1q_u64(current_ptr.add(row_base + 6)) };
+        let row_above_2 = vextq_u64(row_self_2, row_block_3, 1);
+        let _ = process_pair!(
+            row_base + 4,
+            row_above_2,
+            row_self_2,
+            row_below_2,
+            (byte_w_above >> 4) & 0b11,
+            (byte_e_above >> 4) & 0b11,
+            (byte_w_self >> 4) & 0b11,
+            (byte_e_self >> 4) & 0b11,
+            (byte_w_below >> 4) & 0b11,
+            (byte_e_below >> 4) & 0b11
+        );
+
+        let row_below_3 = row_above_2;
+        let row_self_3 = row_block_3;
+        let row_block_4 = unsafe { vld1q_u64(current_ptr.add(row_base + 8)) };
+        let row_above_3 = vextq_u64(row_self_3, row_block_4, 1);
+        let _ = process_pair!(
+            row_base + 6,
+            row_above_3,
+            row_self_3,
+            row_below_3,
+            (byte_w_above >> 6) & 0b11,
+            (byte_e_above >> 6) & 0b11,
+            (byte_w_self >> 6) & 0b11,
+            (byte_e_self >> 6) & 0b11,
+            (byte_w_below >> 6) & 0b11,
+            (byte_e_below >> 6) & 0b11
+        );
+
+        prev_above = row_above_3;
+        west_self_bits >>= 8;
+        east_self_bits >>= 8;
+        west_above_bits >>= 8;
+        east_above_bits >>= 8;
+        west_below_bits >>= 8;
+        east_below_bits >>= 8;
+        row_base += 8;
+    }
+
     while row_base < TILE_SIZE - 4 {
         let nib_w_self = west_self_bits & 0b1111;
         let nib_e_self = east_self_bits & 0b1111;
@@ -845,7 +936,8 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
 
         let row_below_0 = prev_above;
         let row_self_0 = unsafe { vld1q_u64(current_ptr.add(row_base)) };
-        let row_above_0 = unsafe { vld1q_u64(current_ptr.add(row_base + 1)) };
+        let row_block_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 2)) };
+        let row_above_0 = vextq_u64(row_self_0, row_block_1, 1);
         let _ = process_pair!(
             row_base,
             row_above_0,
@@ -860,8 +952,9 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
         );
 
         let row_below_1 = row_above_0;
-        let row_self_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 2)) };
-        let row_above_1 = unsafe { vld1q_u64(current_ptr.add(row_base + 3)) };
+        let row_self_1 = row_block_1;
+        let row_block_2 = unsafe { vld1q_u64(current_ptr.add(row_base + 4)) };
+        let row_above_1 = vextq_u64(row_self_1, row_block_2, 1);
         let _ = process_pair!(
             row_base + 2,
             row_above_1,
@@ -930,6 +1023,7 @@ unsafe fn advance_core_neon_impl_raw<const TRACK_DIFF: bool, const FORCE_STORE: 
         changed = vget_lane_u64(vorr_u64(vget_low_u64(diff_acc), vget_high_u64(diff_acc)), 0) != 0;
     }
 
+    let has_live = live_acc_scalar != 0;
     let border = BorderData::from_edges(border_north, border_south, border_west, border_east);
     (changed, border, has_live)
 }
@@ -1065,10 +1159,16 @@ unsafe fn advance_core_const<const CORE_BACKEND: u8, const ASSUME_CHANGED: bool>
     advance_core_scalar(current, next, ghost)
 }
 
-#[cold]
-#[inline(never)]
+// Keep this outlined in debug builds to avoid blowing worker stack frames,
+// but inline it in release where it sits on the hot path.
+#[cfg_attr(debug_assertions, cold)]
+#[cfg_attr(debug_assertions, inline(never))]
+#[cfg_attr(not(debug_assertions), inline(always))]
 #[allow(clippy::too_many_arguments)]
-unsafe fn advance_tile_fused_empty_tile<const TRACK_NEIGHBOR_INFLUENCE: bool>(
+unsafe fn advance_tile_fused_empty_tile<
+    const TRACK_NEIGHBOR_INFLUENCE: bool,
+    const ASSUME_CHANGED: bool,
+>(
     current: &[u64; TILE_SIZE],
     next: &mut [u64; TILE_SIZE],
     meta_slot: *mut TileMeta,
@@ -1110,7 +1210,7 @@ unsafe fn advance_tile_fused_empty_tile<const TRACK_NEIGHBOR_INFLUENCE: bool>(
             (*meta_slot).update_after_step(false, false);
         }
         debug_assert!(force_store || tile_is_empty(next));
-        let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
+        let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE || ASSUME_CHANGED {
             0
         } else {
             no_track_hint(false, true)
@@ -1159,10 +1259,11 @@ unsafe fn advance_tile_fused_empty_tile<const TRACK_NEIGHBOR_INFLUENCE: bool>(
             (*meta_slot).update_after_step(false, false);
         }
         debug_assert!(force_store || tile_is_empty(next));
-        let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE {
+        let prune_ready = false;
+        let neighbor_influence_mask = if TRACK_NEIGHBOR_INFLUENCE || ASSUME_CHANGED {
             0
         } else {
-            no_track_hint(false, false)
+            no_track_hint(false, prune_ready)
         };
         return TileAdvanceResult::new(
             false,
@@ -1170,7 +1271,7 @@ unsafe fn advance_tile_fused_empty_tile<const TRACK_NEIGHBOR_INFLUENCE: bool>(
             missing_mask,
             0,
             neighbor_influence_mask,
-            false,
+            prune_ready,
         );
     }
 
@@ -1208,6 +1309,8 @@ unsafe fn advance_tile_fused_empty_tile<const TRACK_NEIGHBOR_INFLUENCE: bool>(
         } else {
             0
         }
+    } else if ASSUME_CHANGED {
+        0
     } else {
         no_track_hint(changed, false)
     };
@@ -1259,6 +1362,15 @@ unsafe fn advance_tile_fused_impl<
     next_live_masks_ptr: *mut u8,
     idx: usize,
 ) -> TileAdvanceResult {
+    debug_assert!(
+        !ASSUME_CHANGED || CORE_BACKEND == CORE_BACKEND_NEON,
+        "ASSUME_CHANGED is only supported for the NEON backend"
+    );
+    debug_assert!(
+        !ASSUME_CHANGED || !TRACK_NEIGHBOR_INFLUENCE,
+        "ASSUME_CHANGED mode does not emit neighbor influence"
+    );
+
     let nb = unsafe { *neighbors_ptr.add(idx) };
     let current = unsafe { &(*current_ptr.add(idx)).0 };
     let next = unsafe { &mut (*next_ptr.add(idx)).0 };
@@ -1266,11 +1378,7 @@ unsafe fn advance_tile_fused_impl<
     let meta = unsafe { *meta_slot };
     let missing_mask = meta.missing_mask;
     let tile_has_live = meta.has_live();
-    let force_store = if CORE_BACKEND == CORE_BACKEND_NEON {
-        true
-    } else {
-        meta.alt_phase_dirty()
-    };
+    let force_store = meta.alt_phase_dirty();
     let north_i = nb[0] as usize;
     let south_i = nb[1] as usize;
     let west_i = nb[2] as usize;
@@ -1282,7 +1390,7 @@ unsafe fn advance_tile_fused_impl<
 
     if !tile_has_live {
         return unsafe {
-            advance_tile_fused_empty_tile::<TRACK_NEIGHBOR_INFLUENCE>(
+            advance_tile_fused_empty_tile::<TRACK_NEIGHBOR_INFLUENCE, ASSUME_CHANGED>(
                 current,
                 next,
                 meta_slot,
@@ -1387,7 +1495,7 @@ unsafe fn advance_tile_fused_impl<
             (changed, border, has_live)
         }
     };
-    let prune_ready = false;
+    let prune_ready = !has_live && missing_mask == MISSING_ALL_NEIGHBORS;
     let live_mask = border.live_mask();
 
     unsafe {
@@ -1410,6 +1518,8 @@ unsafe fn advance_tile_fused_impl<
         } else {
             0
         }
+    } else if ASSUME_CHANGED {
+        0
     } else {
         no_track_hint(changed, prune_ready)
     };
@@ -1677,6 +1787,117 @@ pub unsafe fn advance_tile_fused_neon_no_track(
 #[inline(always)]
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
+unsafe fn advance_tile_fused_neon_assume_changed_no_track_impl(
+    current_ptr: *const CellBuf,
+    next_ptr: *mut CellBuf,
+    meta_ptr: *mut TileMeta,
+    next_borders_north_ptr: *mut u64,
+    next_borders_south_ptr: *mut u64,
+    next_borders_west_ptr: *mut u64,
+    next_borders_east_ptr: *mut u64,
+    borders_north_read_ptr: *const u64,
+    borders_south_read_ptr: *const u64,
+    borders_west_read_ptr: *const u64,
+    borders_east_read_ptr: *const u64,
+    neighbors_ptr: *const [NeighborIdx; 8],
+    live_masks_read_ptr: *const u8,
+    next_live_masks_ptr: *mut u8,
+    idx: usize,
+) -> TileAdvanceResult {
+    let nb = unsafe { *neighbors_ptr.add(idx) };
+    let current = unsafe { &(*current_ptr.add(idx)).0 };
+    let next = unsafe { &mut (*next_ptr.add(idx)).0 };
+    let meta_slot = unsafe { meta_ptr.add(idx) };
+    let meta = unsafe { *meta_slot };
+    let missing_mask = meta.missing_mask;
+    let tile_has_live = meta.has_live();
+    let north_i = nb[0] as usize;
+    let south_i = nb[1] as usize;
+    let west_i = nb[2] as usize;
+    let east_i = nb[3] as usize;
+    let nw_i = nb[4] as usize;
+    let ne_i = nb[5] as usize;
+    let sw_i = nb[6] as usize;
+    let se_i = nb[7] as usize;
+
+    if !tile_has_live {
+        let force_store = meta.alt_phase_dirty();
+        return unsafe {
+            advance_tile_fused_empty_tile::<false, true>(
+                current,
+                next,
+                meta_slot,
+                missing_mask,
+                force_store,
+                next_borders_north_ptr,
+                next_borders_south_ptr,
+                next_borders_west_ptr,
+                next_borders_east_ptr,
+                borders_north_read_ptr,
+                borders_south_read_ptr,
+                borders_west_read_ptr,
+                borders_east_read_ptr,
+                live_masks_read_ptr,
+                next_live_masks_ptr,
+                idx,
+                north_i,
+                south_i,
+                west_i,
+                east_i,
+                nw_i,
+                ne_i,
+                sw_i,
+                se_i,
+            )
+        };
+    }
+
+    let ghost_north = unsafe { *borders_south_read_ptr.add(north_i) };
+    let ghost_south = unsafe { *borders_north_read_ptr.add(south_i) };
+    let ghost_west = unsafe { *borders_east_read_ptr.add(west_i) };
+    let ghost_east = unsafe { *borders_west_read_ptr.add(east_i) };
+    let nw_live = unsafe { *live_masks_read_ptr.add(nw_i) };
+    let ne_live = unsafe { *live_masks_read_ptr.add(ne_i) };
+    let sw_live = unsafe { *live_masks_read_ptr.add(sw_i) };
+    let se_live = unsafe { *live_masks_read_ptr.add(se_i) };
+    let ghost_nw = (nw_live & LIVE_SE) != 0;
+    let ghost_ne = (ne_live & LIVE_SW) != 0;
+    let ghost_sw = (sw_live & LIVE_NE) != 0;
+    let ghost_se = (se_live & LIVE_NW) != 0;
+
+    let (changed, border, has_live) = unsafe {
+        advance_core_neon_impl_raw::<false, true>(
+            current,
+            next,
+            ghost_north,
+            ghost_south,
+            ghost_west,
+            ghost_east,
+            ghost_nw as u64,
+            ghost_ne as u64,
+            ghost_sw as u64,
+            ghost_se as u64,
+        )
+    };
+    let prune_ready = !has_live && missing_mask == MISSING_ALL_NEIGHBORS;
+    let live_mask = border.live_mask();
+
+    unsafe {
+        *next_borders_north_ptr.add(idx) = border.north;
+        *next_borders_south_ptr.add(idx) = border.south;
+        *next_borders_west_ptr.add(idx) = border.west;
+        *next_borders_east_ptr.add(idx) = border.east;
+        *next_live_masks_ptr.add(idx) = live_mask;
+        (*meta_slot).update_after_step(changed, has_live);
+    }
+
+    TileAdvanceResult::new(changed, has_live, missing_mask, live_mask, 0, prune_ready)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn advance_tile_fused_neon_assume_changed_no_track(
     current_ptr: *const CellBuf,
     next_ptr: *mut CellBuf,
@@ -1695,7 +1916,7 @@ pub unsafe fn advance_tile_fused_neon_assume_changed_no_track(
     idx: usize,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, true, false>(
+        advance_tile_fused_neon_assume_changed_no_track_impl(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1777,7 +1998,7 @@ pub unsafe fn advance_tile_fused_neon_assume_changed_no_track_fast(
     idx: usize,
 ) -> TileAdvanceResult {
     unsafe {
-        advance_tile_fused_impl::<{ CORE_BACKEND_NEON }, true, false>(
+        advance_tile_fused_neon_assume_changed_no_track_impl(
             current_ptr,
             next_ptr,
             meta_ptr,
@@ -1838,10 +2059,10 @@ pub unsafe fn advance_tile_split(
 mod tests {
     use super::{
         BorderData, CellBuf, GhostZone, TILE_SIZE, TileMeta, advance_core_empty,
-        advance_core_scalar, ghost_bit, ghost_is_empty, ghost_is_empty_from_live_masks,
-        ghost_is_empty_from_live_masks_ptr, tile_is_empty,
+        advance_core_scalar, advance_tile_fused_scalar_no_track, ghost_bit, ghost_is_empty,
+        ghost_is_empty_from_live_masks, ghost_is_empty_from_live_masks_ptr, tile_is_empty,
     };
-    use crate::turbolife::tile::NeighborIdx;
+    use crate::turbolife::tile::{MISSING_ALL_NEIGHBORS, NeighborIdx};
 
     #[cfg(target_arch = "x86_64")]
     use super::advance_core_avx2;
@@ -1908,6 +2129,236 @@ mod tests {
         assert_eq!(border.west, 0);
         assert_eq!(border.east, 0);
         assert_eq!(border.live_mask(), 0);
+    }
+
+    #[test]
+    fn scalar_fused_no_track_empty_ghost_requires_prune_verification() {
+        let current = [CellBuf::empty(), CellBuf::empty()];
+        let mut next = [CellBuf::empty(), CellBuf::empty()];
+        let mut meta = [TileMeta::empty(), TileMeta::empty()];
+        meta[0].missing_mask = 0;
+        meta[0].set_has_live(false);
+        meta[0].set_alt_phase_dirty(false);
+        meta[1].set_has_live(false);
+        meta[1].set_alt_phase_dirty(false);
+
+        let mut next_borders_north = [u64::MAX; 2];
+        let mut next_borders_south = [u64::MAX; 2];
+        let mut next_borders_west = [u64::MAX; 2];
+        let mut next_borders_east = [u64::MAX; 2];
+        let borders_north_read = [0u64; 2];
+        let borders_south_read = [0u64; 2];
+        let borders_west_read = [0u64; 2];
+        let borders_east_read = [0u64; 2];
+        let neighbors = [[0 as NeighborIdx; 8], [0 as NeighborIdx; 8]];
+        let live_masks_read = [0u8; 2];
+        let mut next_live_masks = [u8::MAX; 2];
+
+        let result = unsafe {
+            advance_tile_fused_scalar_no_track(
+                current.as_ptr(),
+                next.as_mut_ptr(),
+                meta.as_mut_ptr(),
+                next_borders_north.as_mut_ptr(),
+                next_borders_south.as_mut_ptr(),
+                next_borders_west.as_mut_ptr(),
+                next_borders_east.as_mut_ptr(),
+                borders_north_read.as_ptr(),
+                borders_south_read.as_ptr(),
+                borders_west_read.as_ptr(),
+                borders_east_read.as_ptr(),
+                neighbors.as_ptr(),
+                live_masks_read.as_ptr(),
+                next_live_masks.as_mut_ptr(),
+                0,
+            )
+        };
+
+        assert!(!result.changed);
+        assert!(!result.has_live);
+        assert!(!result.prune_ready);
+        assert_eq!(next_live_masks[0], 0);
+    }
+
+    #[test]
+    fn scalar_fused_no_track_dying_tile_with_empty_ghost_requires_prune_verification() {
+        let mut current = [CellBuf::empty(), CellBuf::empty()];
+        current[0].0[7] = 1u64 << 13;
+        let mut next = [CellBuf::empty(), CellBuf::empty()];
+        let mut meta = [TileMeta::empty(), TileMeta::empty()];
+        meta[0].missing_mask = 0;
+        meta[0].set_has_live(true);
+        meta[0].set_alt_phase_dirty(false);
+        meta[1].set_has_live(false);
+        meta[1].set_alt_phase_dirty(false);
+
+        let mut next_borders_north = [u64::MAX; 2];
+        let mut next_borders_south = [u64::MAX; 2];
+        let mut next_borders_west = [u64::MAX; 2];
+        let mut next_borders_east = [u64::MAX; 2];
+        let borders_north_read = [0u64; 2];
+        let borders_south_read = [0u64; 2];
+        let borders_west_read = [0u64; 2];
+        let borders_east_read = [0u64; 2];
+        let neighbors = [[0 as NeighborIdx; 8], [0 as NeighborIdx; 8]];
+        let live_masks_read = [0u8; 2];
+        let mut next_live_masks = [u8::MAX; 2];
+
+        let result = unsafe {
+            advance_tile_fused_scalar_no_track(
+                current.as_ptr(),
+                next.as_mut_ptr(),
+                meta.as_mut_ptr(),
+                next_borders_north.as_mut_ptr(),
+                next_borders_south.as_mut_ptr(),
+                next_borders_west.as_mut_ptr(),
+                next_borders_east.as_mut_ptr(),
+                borders_north_read.as_ptr(),
+                borders_south_read.as_ptr(),
+                borders_west_read.as_ptr(),
+                borders_east_read.as_ptr(),
+                neighbors.as_ptr(),
+                live_masks_read.as_ptr(),
+                next_live_masks.as_mut_ptr(),
+                0,
+            )
+        };
+
+        assert!(result.changed);
+        assert!(!result.has_live);
+        assert!(!result.prune_ready);
+    }
+
+    #[test]
+    fn scalar_fused_no_track_isolated_dying_tile_sets_prune_ready() {
+        let mut current = [CellBuf::empty(), CellBuf::empty()];
+        current[0].0[7] = 1u64 << 13;
+        let mut next = [CellBuf::empty(), CellBuf::empty()];
+        let mut meta = [TileMeta::empty(), TileMeta::empty()];
+        meta[0].missing_mask = MISSING_ALL_NEIGHBORS;
+        meta[0].set_has_live(true);
+        meta[0].set_alt_phase_dirty(false);
+        meta[1].set_has_live(false);
+        meta[1].set_alt_phase_dirty(false);
+
+        let mut next_borders_north = [u64::MAX; 2];
+        let mut next_borders_south = [u64::MAX; 2];
+        let mut next_borders_west = [u64::MAX; 2];
+        let mut next_borders_east = [u64::MAX; 2];
+        let borders_north_read = [0u64; 2];
+        let borders_south_read = [0u64; 2];
+        let borders_west_read = [0u64; 2];
+        let borders_east_read = [0u64; 2];
+        let neighbors = [[0 as NeighborIdx; 8], [0 as NeighborIdx; 8]];
+        let live_masks_read = [0u8; 2];
+        let mut next_live_masks = [u8::MAX; 2];
+
+        let result = unsafe {
+            advance_tile_fused_scalar_no_track(
+                current.as_ptr(),
+                next.as_mut_ptr(),
+                meta.as_mut_ptr(),
+                next_borders_north.as_mut_ptr(),
+                next_borders_south.as_mut_ptr(),
+                next_borders_west.as_mut_ptr(),
+                next_borders_east.as_mut_ptr(),
+                borders_north_read.as_ptr(),
+                borders_south_read.as_ptr(),
+                borders_west_read.as_ptr(),
+                borders_east_read.as_ptr(),
+                neighbors.as_ptr(),
+                live_masks_read.as_ptr(),
+                next_live_masks.as_mut_ptr(),
+                0,
+            )
+        };
+
+        assert!(result.changed);
+        assert!(!result.has_live);
+        assert!(result.prune_ready);
+    }
+
+    #[test]
+    fn scalar_fused_no_track_empty_ghost_can_hide_future_neighbor_border_births() {
+        let mut current = [CellBuf::empty(), CellBuf::empty(), CellBuf::empty()];
+        // Horizontal triplet one row above the south edge. This births a live
+        // cell on the south edge next generation without any current south-edge
+        // activity.
+        current[2].0[1] = (1u64 << 10) | (1u64 << 11) | (1u64 << 12);
+
+        let mut next = [CellBuf::empty(), CellBuf::empty(), CellBuf::empty()];
+        let mut meta = [TileMeta::empty(), TileMeta::empty(), TileMeta::empty()];
+        meta[1].missing_mask = MISSING_ALL_NEIGHBORS & !(1 << 0);
+        meta[1].set_has_live(false);
+        meta[2].missing_mask = MISSING_ALL_NEIGHBORS & !(1 << 1);
+        meta[2].set_has_live(true);
+        for slot in &mut meta {
+            slot.set_alt_phase_dirty(false);
+        }
+
+        let mut next_borders_north = [u64::MAX; 3];
+        let mut next_borders_south = [u64::MAX; 3];
+        let mut next_borders_west = [u64::MAX; 3];
+        let mut next_borders_east = [u64::MAX; 3];
+        let borders_north_read = [0u64; 3];
+        let borders_south_read = [0u64; 3];
+        let borders_west_read = [0u64; 3];
+        let borders_east_read = [0u64; 3];
+        let mut neighbors = [[0 as NeighborIdx; 8]; 3];
+        neighbors[1][0] = 2;
+        neighbors[2][1] = 1;
+        let live_masks_read = [0u8; 3];
+        let mut next_live_masks = [u8::MAX; 3];
+
+        let target_result = unsafe {
+            advance_tile_fused_scalar_no_track(
+                current.as_ptr(),
+                next.as_mut_ptr(),
+                meta.as_mut_ptr(),
+                next_borders_north.as_mut_ptr(),
+                next_borders_south.as_mut_ptr(),
+                next_borders_west.as_mut_ptr(),
+                next_borders_east.as_mut_ptr(),
+                borders_north_read.as_ptr(),
+                borders_south_read.as_ptr(),
+                borders_west_read.as_ptr(),
+                borders_east_read.as_ptr(),
+                neighbors.as_ptr(),
+                live_masks_read.as_ptr(),
+                next_live_masks.as_mut_ptr(),
+                1,
+            )
+        };
+        let north_result = unsafe {
+            advance_tile_fused_scalar_no_track(
+                current.as_ptr(),
+                next.as_mut_ptr(),
+                meta.as_mut_ptr(),
+                next_borders_north.as_mut_ptr(),
+                next_borders_south.as_mut_ptr(),
+                next_borders_west.as_mut_ptr(),
+                next_borders_east.as_mut_ptr(),
+                borders_north_read.as_ptr(),
+                borders_south_read.as_ptr(),
+                borders_west_read.as_ptr(),
+                borders_east_read.as_ptr(),
+                neighbors.as_ptr(),
+                live_masks_read.as_ptr(),
+                next_live_masks.as_mut_ptr(),
+                2,
+            )
+        };
+
+        assert!(!target_result.changed);
+        assert!(!target_result.has_live);
+        assert!(!target_result.prune_ready);
+
+        assert!(north_result.changed);
+        assert!(north_result.has_live);
+        assert_ne!(next_live_masks[2] & super::LIVE_S, 0);
+        assert!(!unsafe {
+            ghost_is_empty_from_live_masks_ptr(next_live_masks.as_ptr(), &neighbors[1])
+        });
     }
 
     #[test]

@@ -57,6 +57,16 @@ To pass CLI args through to both training and benchmarking harness runs, append 
 ./scripts/build_pgo.sh 3 9 --threads 6 --kernel neon
 ```
 
+`--pgo-train` is reserved for internal script use and should not be passed manually.
+
+`build_pgo.sh` (and the PGO phase in `build_maxperf.sh`) now trains with `--pgo-train`, a TurboLife-only execution mode in `src/main.rs` that removes QuickLife/checkpoint I/O from profile collection so LLVM profile data stays focused on hot TurboLife kernels.
+
+Repo-local PGO override controls (handled by `scripts/rustc_wrapper.sh`):
+
+- `TURBOLIFE_PROFILE_USE=/absolute/or/repo/relative/path.profdata` — force a specific profile for the `turbo_life` crate only (dependencies stay untouched).
+- `TURBOLIFE_PROFILE_USE=off` — disable wrapper-injected profile use.
+- `TURBOLIFE_DISABLE_WRAPPER_PGO=1` — hard-disable wrapper auto-PGO.
+
 Max-performance auto-tuner (builds multiple compiler/feature variants, benchmarks each with `src/main.rs`, rejects regressions, then optionally tests PGO on top of the best non-PGO candidate):
 
 ```
@@ -68,6 +78,8 @@ Arguments:
 - First positional: benchmark runs per candidate (default `7`).
 - Second positional: PGO training runs (default `3`).
 - Remaining args are passed through to `src/main.rs` for both candidate benchmarking and PGO training.
+
+When `pgo/turbo-life-main.profdata` is present, `build_maxperf.sh` now benchmarks a `repo-profdata` candidate before fresh training. Fresh PGO instrumentation still starts from the best non-PGO candidate, so the seeded profile can improve winner selection without changing the fresh-training baseline.
 
 Output binary:
 

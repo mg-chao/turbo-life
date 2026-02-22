@@ -110,6 +110,27 @@ unsafe fn vec_push_if_branchless_unchecked<T: Copy>(buf: &mut Vec<T>, value: T, 
     }
 }
 
+/// # Safety
+/// When `target_len > buf.len()`, callers must overwrite every newly exposed
+/// element before any read of the vector contents.
+///
+/// This helper is restricted to `Copy` elements so panic-unwind paths cannot
+/// drop uninitialized values.
+#[inline(always)]
+unsafe fn vec_resize_uninit<T: Copy>(buf: &mut Vec<T>, target_len: usize) {
+    let len = buf.len();
+    if target_len <= len {
+        buf.truncate(target_len);
+        return;
+    }
+    if buf.capacity() < target_len {
+        buf.reserve(target_len - len);
+    }
+    unsafe {
+        buf.set_len(target_len);
+    }
+}
+
 #[inline]
 fn rebuild_active_set_from_occupied_bits(arena: &mut TileArena) {
     let target_len = arena.occupied_count;
@@ -915,10 +936,12 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                 let live_masks_ptr = SendConstPtr::new(live_masks_ptr);
                 if prune_len >= PARALLEL_PRUNE_BITMAP_MIN {
                     let words_len = prune_len.div_ceil(64);
-                    arena.prune_marks_words.resize(words_len, 0);
+                    unsafe {
+                        vec_resize_uninit(&mut arena.prune_marks_words, words_len);
+                    }
                     let word_chunk_size = candidate_chunk_size.div_ceil(64).max(1);
                     let prune_candidates_ptr = SendConstPtr::new(arena.prune_buf.as_ptr());
-                    let prune_marks_words = &mut arena.prune_marks_words;
+                    let prune_marks_words = &mut arena.prune_marks_words[..words_len];
                     prune_marks_words
                         .par_chunks_mut(word_chunk_size)
                         .enumerate()
@@ -945,8 +968,7 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                             }
                         });
 
-                    let prune_word_len = arena.prune_marks_words.len();
-                    for word_idx in 0..prune_word_len {
+                    for word_idx in 0..words_len {
                         let mut bits = arena.prune_marks_words[word_idx];
                         while bits != 0 {
                             let bit = bits.trailing_zeros() as usize;
@@ -956,9 +978,11 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
                         }
                     }
                 } else {
-                    arena.prune_marks.resize(prune_len, 0);
+                    unsafe {
+                        vec_resize_uninit(&mut arena.prune_marks, prune_len);
+                    }
                     let prune_candidates = &arena.prune_buf;
-                    let prune_marks = &mut arena.prune_marks;
+                    let prune_marks = &mut arena.prune_marks[..prune_len];
                     prune_candidates
                         .par_chunks(candidate_chunk_size)
                         .zip(prune_marks.par_chunks_mut(candidate_chunk_size))
@@ -1003,17 +1027,58 @@ pub fn finalize_prune_and_expand(arena: &mut TileArena) {
 
     if !arena.expand_buf.is_empty() {
         arena.reserve_additional_tiles(arena.expand_buf.len());
-        for i in 0..arena.expand_buf.len() {
+        let mut keep_dense_contiguous_active = arena.active_set_dense_contiguous
+            && arena.free_list.is_empty()
+            && arena.active_set.len() == arena.occupied_count
+            && arena.occupied_count + 1 == arena.meta.len()
+            && arena.active_set.first().map(|idx| idx.0) == Some(1)
+            && arena.active_set.last().map(|idx| idx.0) == Some(arena.occupied_count as u32);
+        if keep_dense_contiguous_active {
+            arena.active_set.reserve(arena.expand_buf.len());
+        }
+        let mut i = 0usize;
+        let expand_len = arena.expand_buf.len();
+        while i < expand_len {
             let candidate = arena.expand_buf[i];
             let src_i = (candidate >> 3) as usize;
-            let dir = (candidate & 0b111) as usize;
             debug_assert!(arena.meta[src_i].occupied());
             let src_idx = TileIdx(src_i as u32);
-            let (idx, was_allocated) = arena.allocate_absent_neighbor_from(src_idx, dir);
-            if !was_allocated {
-                continue;
+            let src_coord = arena.coords[src_i];
+            let (src_hash_x, src_hash_y) =
+                super::tilemap::tile_hash_lanes(src_coord.0, src_coord.1);
+
+            loop {
+                let dir = (arena.expand_buf[i] & 0b111) as usize;
+                let (idx, was_allocated) = arena.allocate_absent_neighbor_from_prehashed(
+                    src_idx, src_coord, src_hash_x, src_hash_y, dir,
+                );
+                if was_allocated {
+                    if keep_dense_contiguous_active {
+                        let expected_idx = arena.active_set.len() + 1;
+                        if idx.index() == expected_idx {
+                            unsafe {
+                                vec_push_unchecked(&mut arena.active_set, idx);
+                            }
+                        } else {
+                            keep_dense_contiguous_active = false;
+                        }
+                    }
+                    arena.mark_changed_new_unique(idx);
+                }
+                i += 1;
+                if i >= expand_len || ((arena.expand_buf[i] >> 3) as usize) != src_i {
+                    break;
+                }
             }
-            arena.mark_changed_new_unique(idx);
+        }
+        if keep_dense_contiguous_active
+            && arena.free_list.is_empty()
+            && arena.active_set.len() == arena.occupied_count
+            && arena.occupied_count + 1 == arena.meta.len()
+            && arena.active_set.first().map(|idx| idx.0) == Some(1)
+            && arena.active_set.last().map(|idx| idx.0) == Some(arena.occupied_count as u32)
+        {
+            arena.active_set_dense_contiguous = true;
         }
     }
 
@@ -1312,6 +1377,23 @@ mod tests {
 
         assert!(!arena.meta(idx).occupied());
         assert!(arena.prune_buf.is_empty());
+    }
+
+    #[test]
+    fn finalize_prune_and_expand_preserves_dense_active_cache_on_append_growth() {
+        let mut arena = TileArena::new();
+        let origin = arena.allocate((0, 0));
+        arena.active_set = vec![origin];
+        arena.active_set_dense_contiguous = true;
+        arena.expand_buf.push((origin.0 << 3) | 3);
+
+        finalize_prune_and_expand(&mut arena);
+
+        assert_eq!(arena.occupied_count, 2);
+        assert_eq!(arena.idx_at((1, 0)), Some(TileIdx(2)));
+        assert_eq!(arena.active_set, vec![TileIdx(1), TileIdx(2)]);
+        assert!(arena.active_set_dense_contiguous);
+        assert_eq!(arena.changed_list, vec![TileIdx(2)]);
     }
 
     #[test]

@@ -1,8 +1,14 @@
+# Route rustc through a tiny wrapper so release builds can inject repo-local
+# PGO profiles with absolute paths (stable across dependency build CWDs).
+[build]
+rustc-wrapper = "scripts/rustc_wrapper.sh"
+
 # Host-tuned codegen on mainstream desktop/server CPUs.
 [target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))']
 rustflags = [
     "-C", "target-cpu=native",
     "-C", "llvm-args=-unroll-threshold=300",
+    "-C", "llvm-args=-inline-threshold=275",
 ]
 
 # Apple Silicon (macOS): let the linker strip unreachable sections/dylibs.

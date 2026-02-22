@@ -291,7 +291,10 @@ impl TileMeta {
     #[inline(always)]
     pub fn update_after_step(&mut self, changed: bool, has_live: bool) {
         let step_mask = FLAG_HAS_LIVE | FLAG_ALT_PHASE_DIRTY;
-        self.flags = (self.flags & !step_mask) | ((has_live as u8) << 1) | ((changed as u8) << 2);
+        let step_bits = ((has_live as u8) << 1) | ((changed as u8) << 2);
+        if (self.flags & step_mask) != step_bits {
+            self.flags = (self.flags & !step_mask) | step_bits;
+        }
     }
 
     pub fn empty() -> Self {

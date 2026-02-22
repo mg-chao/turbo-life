@@ -95,7 +95,7 @@ impl CacheAlignedAtomicUsize {
 }
 
 const TILE_SIZE_I64: i64 = 64;
-const PARALLEL_KERNEL_MIN_ACTIVE: usize = 128;
+const PARALLEL_KERNEL_MIN_ACTIVE: usize = 512;
 const PARALLEL_KERNEL_TILES_PER_THREAD: usize = 16;
 const PARALLEL_KERNEL_MIN_CHUNKS: usize = 2;
 const KERNEL_CHUNK_MIN: usize = 32;
@@ -110,19 +110,36 @@ const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = None;
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = Some(8_192);
 // Dynamic scheduler chunking target per worker.
-// Keep one chunk per worker by default to minimize cursor traffic.
-// On Apple Silicon, medium/large frontiers benefit from splitting work into
-// two chunks per worker to reduce tail effects without over-fragmenting.
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 1;
+// Two chunks per worker reduces lock-free tail imbalance on the primary
+// main.rs harness without materially increasing cursor contention.
+const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 2;
+// First-pass static strip-mining for the lock-free scheduler.
+// Each worker consumes ~1/divisor of its nominal share before entering
+// lock-free chunk stealing, reducing atomic cursor traffic on dense frontiers.
+const PARALLEL_DYNAMIC_SEED_DIVISOR: usize = 4;
+// Throttle assume-changed prune passes while still periodically reclaiming
+// dead tiles so long-running runs do not accumulate stale occupancy.
+const ASSUME_CHANGED_PRUNE_STRIDE: u64 = 2048;
+// Apple hybrid cores benefit from finer tail granularity in the dynamic
+// scheduler: 4-tile tail chunks still let fast P-cores drain stragglers
+// while reducing cursor contention on this harness.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE: usize = 2;
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const PARALLEL_DYNAMIC_APPLE_DENSE_CHUNK_MIN_ACTIVE: usize = 2_048;
+const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 4;
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const PARALLEL_DYNAMIC_CHUNK_MIN: usize = 8;
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 2_048;
+// Keep chunks within one L1-friendly packet of tile descriptors on Apple
+// Silicon; larger packets regressed wall-clock on the primary harness.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const PARALLEL_DYNAMIC_CHUNK_MAX: usize = 64;
 #[cfg(target_arch = "x86_64")]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 1_024;
-#[cfg(target_arch = "aarch64")]
+// Apple Silicon benefits from enabling border-line prefetching at a lower
+// frontier size than other AArch64 targets in the primary harness.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 4_096;
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 const PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE: usize = 32_768;
 const CORE_BACKEND_SCALAR: u8 = 0;
 const CORE_BACKEND_AVX2: u8 = 1;
@@ -144,6 +161,11 @@ const _: [(); 1] = [(); (PREFETCH_TILE_NEAR_AHEAD_AARCH64 >= 1) as usize];
 #[cfg(target_arch = "aarch64")]
 const _: [(); 1] =
     [(); (PREFETCH_TILE_FAR_AHEAD_AARCH64 > PREFETCH_TILE_NEAR_AHEAD_AARCH64) as usize];
+const _: [(); 1] = [(); (PARALLEL_DYNAMIC_CHUNK_MIN > 0) as usize];
+const _: [(); 1] = [(); (PARALLEL_DYNAMIC_CHUNK_MIN <= PARALLEL_DYNAMIC_CHUNK_MAX) as usize];
+const _: [(); 1] = [(); (PARALLEL_DYNAMIC_SEED_DIVISOR > 0) as usize];
+const _: [(); 1] = [(); (ASSUME_CHANGED_PRUNE_STRIDE > 0) as usize];
+const _: [(); 1] = [(); ASSUME_CHANGED_PRUNE_STRIDE.is_power_of_two() as usize];
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -880,7 +902,11 @@ impl WorkerScratch {
     }
 
     #[inline]
-    fn reserve_for_chunk<const EMIT_CHANGED: bool, const TRACK_NEIGHBOR_INFLUENCE: bool>(
+    fn reserve_for_chunk<
+        const EMIT_CHANGED: bool,
+        const TRACK_NEIGHBOR_INFLUENCE: bool,
+        const ALLOW_PRUNE: bool,
+    >(
         &mut self,
         chunk_len: usize,
     ) {
@@ -890,7 +916,9 @@ impl WorkerScratch {
         if EMIT_CHANGED && TRACK_NEIGHBOR_INFLUENCE {
             Self::reserve_total_capacity(&mut self.changed_influence, chunk_len);
         }
-        Self::reserve_total_capacity(&mut self.prune, chunk_len);
+        if ALLOW_PRUNE {
+            Self::reserve_total_capacity(&mut self.prune, chunk_len);
+        }
         let expand_target = chunk_len.saturating_mul(8);
         Self::reserve_total_capacity(&mut self.expand, expand_target);
     }
@@ -899,6 +927,7 @@ impl WorkerScratch {
     fn reserve_for_additional_work<
         const EMIT_CHANGED: bool,
         const TRACK_NEIGHBOR_INFLUENCE: bool,
+        const ALLOW_PRUNE: bool,
     >(
         &mut self,
         work_items: usize,
@@ -909,7 +938,9 @@ impl WorkerScratch {
         if EMIT_CHANGED && TRACK_NEIGHBOR_INFLUENCE {
             Self::reserve_additional_capacity(&mut self.changed_influence, work_items);
         }
-        Self::reserve_additional_capacity(&mut self.prune, work_items);
+        if ALLOW_PRUNE {
+            Self::reserve_additional_capacity(&mut self.prune, work_items);
+        }
         let expand_additional = work_items.saturating_mul(8);
         Self::reserve_additional_capacity(&mut self.expand, expand_additional);
     }
@@ -1191,22 +1222,47 @@ fn churn_below_percent(changed_len: usize, active_len: usize, churn_pct_threshol
     (changed_len as u128) * 100 < (active_len as u128) * (churn_pct_threshold as u128)
 }
 
-#[inline]
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-fn dynamic_target_chunks_per_worker(active_len: usize, _changed_len: usize) -> usize {
-    if active_len >= PARALLEL_DYNAMIC_APPLE_DENSE_CHUNK_MIN_ACTIVE {
-        PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_APPLE_DENSE
-    } else {
-        PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE
-    }
-}
-
-#[inline]
-#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+#[inline(always)]
 fn dynamic_target_chunks_per_worker(_active_len: usize, _changed_len: usize) -> usize {
     PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE
 }
 
+#[inline(always)]
+fn dynamic_seed_plan(active_len: usize, worker_count: usize) -> (usize, usize) {
+    if worker_count == 0 {
+        return (0, 0);
+    }
+    let seed_span = active_len
+        .saturating_div(worker_count)
+        .saturating_div(PARALLEL_DYNAMIC_SEED_DIVISOR);
+    let seed_end = seed_span.saturating_mul(worker_count).min(active_len);
+    (seed_span, seed_end)
+}
+
+#[inline(always)]
+fn div_ceil_dispatch_small(n: usize, d: usize) -> usize {
+    macro_rules! dispatch_const_div_ceil {
+        ($n:expr, $d:expr, [$($k:literal),*]) => {{
+            match $d {
+                $(
+                    $k => $n.div_ceil($k),
+                )*
+                _ => $n.div_ceil($d),
+            }
+        }};
+    }
+
+    dispatch_const_div_ceil!(
+        n,
+        d,
+        [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32
+        ]
+    )
+}
+
+#[cfg(test)]
 #[inline]
 fn dynamic_parallel_chunk_size(
     active_len: usize,
@@ -1217,25 +1273,24 @@ fn dynamic_parallel_chunk_size(
     let target_chunks = workers
         .saturating_mul(dynamic_target_chunks_per_worker(active_len, changed_len))
         .max(workers);
-    let size = active_len.div_ceil(target_chunks);
-    size.clamp(PARALLEL_DYNAMIC_CHUNK_MIN, PARALLEL_DYNAMIC_CHUNK_MAX)
+    dynamic_parallel_chunk_size_for_target(active_len, target_chunks)
+}
+
+#[inline(always)]
+fn dynamic_parallel_chunk_size_for_target(active_len: usize, target_chunks: usize) -> usize {
+    div_ceil_dispatch_small(active_len, target_chunks.max(1))
+        .clamp(PARALLEL_DYNAMIC_CHUNK_MIN, PARALLEL_DYNAMIC_CHUNK_MAX)
+}
+
+#[inline(always)]
+fn should_run_prune_pass<const ASSUME_CHANGED_MODE: bool>(generation: u64) -> bool {
+    !ASSUME_CHANGED_MODE
+        || (generation != 0 && (generation & (ASSUME_CHANGED_PRUNE_STRIDE - 1)) == 0)
 }
 
 #[inline(always)]
 fn should_queue_prune<const EMIT_CHANGED: bool>(has_live: bool, changed: bool) -> bool {
     !has_live && (!EMIT_CHANGED || !changed)
-}
-
-#[cold]
-#[inline(never)]
-fn branch_hint_cold() {}
-
-#[inline(always)]
-fn unlikely(cond: bool) -> bool {
-    if cond {
-        branch_hint_cold();
-    }
-    cond
 }
 
 #[inline(always)]
@@ -1275,6 +1330,22 @@ where
                 || rayon::join(|| worker_fn(2), || worker_fn(3)),
             );
         }
+        6 => {
+            rayon::join(
+                || {
+                    rayon::join(
+                        || rayon::join(|| worker_fn(0), || worker_fn(1)),
+                        || worker_fn(2),
+                    );
+                },
+                || {
+                    rayon::join(
+                        || rayon::join(|| worker_fn(3), || worker_fn(4)),
+                        || worker_fn(5),
+                    );
+                },
+            );
+        }
         8 => {
             rayon::join(
                 || {
@@ -1295,6 +1366,8 @@ where
     }
 }
 
+// Keep this helper out-of-line so the rare expand-buffer miss path
+// does not inflate the hot tile-advance loop.
 #[cold]
 #[inline(never)]
 unsafe fn append_expand_candidates_cold(
@@ -1450,6 +1523,33 @@ pub struct TurboLife {
     worker_scratch: Vec<WorkerScratch>,
     /// Reusable touched-tile list for `set_cells`.
     set_cells_scratch: Vec<TileIdx>,
+    /// Last tile touched by public mutation APIs.
+    hot_tile_cache: HotTileCache,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct HotTileCache {
+    coord_x: i64,
+    coord_y: i64,
+    idx: TileIdx,
+}
+
+impl HotTileCache {
+    const EMPTY: Self = Self {
+        coord_x: 0,
+        coord_y: 0,
+        idx: TileIdx(0),
+    };
+
+    #[inline(always)]
+    fn get(self, coord: (i64, i64)) -> Option<TileIdx> {
+        if self.idx.0 != 0 && self.coord_x == coord.0 && self.coord_y == coord.1 {
+            Some(self.idx)
+        } else {
+            None
+        }
+    }
 }
 
 impl Default for TurboLife {
@@ -1486,16 +1586,57 @@ impl TurboLife {
                 .map(|_| WorkerScratch::default())
                 .collect(),
             set_cells_scratch: Vec::new(),
+            hot_tile_cache: HotTileCache::EMPTY,
         }
     }
 
+    #[inline(always)]
+    fn hot_tile_lookup(&mut self, coord: (i64, i64)) -> Option<TileIdx> {
+        let cached = self.hot_tile_cache.get(coord)?;
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            // Fast path: public mutation APIs only mutate/reuse tiles on the
+            // same thread, and step/step_n clear this cache before any prune/
+            // recycle activity can invalidate indices.
+            return Some(cached);
+        }
+        #[cfg(any(test, debug_assertions))]
+        {
+            let i = cached.index();
+            let valid = i < self.arena.meta.len()
+                && self.arena.meta[i].occupied()
+                && self.arena.coords[i] == coord;
+            if !valid {
+                self.hot_tile_clear();
+                return None;
+            }
+            Some(cached)
+        }
+    }
+
+    #[inline(always)]
+    fn hot_tile_store(&mut self, coord: (i64, i64), idx: TileIdx) {
+        self.hot_tile_cache = HotTileCache {
+            coord_x: coord.0,
+            coord_y: coord.1,
+            idx,
+        };
+    }
+
+    #[inline(always)]
+    fn hot_tile_clear(&mut self) {
+        self.hot_tile_cache = HotTileCache::EMPTY;
+    }
+
     #[inline]
-    fn prepare_worker_scratch(
+    fn prepare_worker_scratch<
+        const EMIT_CHANGED: bool,
+        const TRACK_NEIGHBOR_INFLUENCE: bool,
+        const ALLOW_PRUNE: bool,
+    >(
         &mut self,
         worker_count: usize,
         active_len: usize,
-        emit_changed: bool,
-        track_neighbor_influence: bool,
     ) {
         if self.worker_scratch.len() < worker_count {
             self.worker_scratch
@@ -1505,28 +1646,12 @@ impl TurboLife {
             return;
         }
         let chunk_len = active_len.div_ceil(worker_count);
-        if emit_changed {
-            if track_neighbor_influence {
-                for scratch in self.worker_scratch.iter_mut().take(worker_count) {
-                    scratch.clear();
-                    scratch.reserve_for_chunk::<true, true>(chunk_len);
-                }
-            } else {
-                for scratch in self.worker_scratch.iter_mut().take(worker_count) {
-                    scratch.clear();
-                    scratch.reserve_for_chunk::<true, false>(chunk_len);
-                }
-            }
-        } else if track_neighbor_influence {
-            for scratch in self.worker_scratch.iter_mut().take(worker_count) {
-                scratch.clear();
-                scratch.reserve_for_chunk::<false, true>(chunk_len);
-            }
-        } else {
-            for scratch in self.worker_scratch.iter_mut().take(worker_count) {
-                scratch.clear();
-                scratch.reserve_for_chunk::<false, false>(chunk_len);
-            }
+
+        for scratch in self.worker_scratch.iter_mut().take(worker_count) {
+            scratch.clear();
+            scratch.reserve_for_chunk::<EMIT_CHANGED, TRACK_NEIGHBOR_INFLUENCE, ALLOW_PRUNE>(
+                chunk_len,
+            );
         }
     }
 
@@ -1558,8 +1683,23 @@ impl TurboLife {
     }
 
     #[inline(always)]
+    fn changed_scratch_is_dense_contiguous(&self, len: usize) -> bool {
+        len != 0
+            && self.arena.changed_scratch.len() == len
+            && self.arena.changed_scratch.first().map(|idx| idx.0) == Some(1)
+            && self.arena.changed_scratch.last().map(|idx| idx.0) == Some(len as u32)
+    }
+
+    #[inline(always)]
     fn clone_active_into_changed_fast(&mut self) {
         let len = self.arena.active_set.len();
+        if self.changed_scratch_is_dense_contiguous(len) {
+            std::mem::swap(
+                &mut self.arena.changed_list,
+                &mut self.arena.changed_scratch,
+            );
+            return;
+        }
         self.arena.changed_list.clear();
         reserve_additional_capacity(&mut self.arena.changed_list, len);
         unsafe {
@@ -1623,6 +1763,82 @@ impl TurboLife {
         for i in 0..self.arena.prune_buf.len() {
             let idx = self.arena.prune_buf[i];
             self.touched_clear(idx.index());
+        }
+    }
+
+    #[inline]
+    fn finalize_parallel_expand_from_worker_scratch(
+        &mut self,
+        worker_count: usize,
+        total_expand: usize,
+    ) {
+        debug_assert!(worker_count <= self.worker_scratch.len());
+        if total_expand == 0 {
+            for worker_id in 0..worker_count {
+                self.worker_scratch[worker_id].expand.clear();
+            }
+            return;
+        }
+
+        self.arena.reserve_additional_tiles(total_expand);
+        let mut keep_dense_contiguous_active = self.arena.active_set_dense_contiguous
+            && self.arena.free_list.is_empty()
+            && self.arena.active_set.len() == self.arena.occupied_count
+            && self.arena.occupied_count + 1 == self.arena.meta.len()
+            && self.arena.active_set.first().map(|idx| idx.0) == Some(1)
+            && self.arena.active_set.last().map(|idx| idx.0)
+                == Some(self.arena.occupied_count as u32);
+        if keep_dense_contiguous_active {
+            self.arena.active_set.reserve(total_expand);
+        }
+
+        for worker_id in 0..worker_count {
+            let mut expand = std::mem::take(&mut self.worker_scratch[worker_id].expand);
+            let mut i = 0usize;
+            while i < expand.len() {
+                let candidate = expand[i];
+                let src_i = (candidate >> 3) as usize;
+                debug_assert!(self.arena.meta[src_i].occupied());
+                let src_idx = TileIdx(src_i as u32);
+                let src_coord = self.arena.coords[src_i];
+                let (src_hash_x, src_hash_y) =
+                    super::tilemap::tile_hash_lanes(src_coord.0, src_coord.1);
+
+                loop {
+                    let dir = (expand[i] & 0b111) as usize;
+                    let (idx, was_allocated) = self.arena.allocate_absent_neighbor_from_prehashed(
+                        src_idx, src_coord, src_hash_x, src_hash_y, dir,
+                    );
+                    if was_allocated {
+                        if keep_dense_contiguous_active {
+                            let expected_idx = self.arena.active_set.len() + 1;
+                            if idx.index() == expected_idx {
+                                self.arena.active_set.push(idx);
+                            } else {
+                                keep_dense_contiguous_active = false;
+                            }
+                        }
+                        self.arena.mark_changed_new_unique(idx);
+                    }
+                    i += 1;
+                    if i >= expand.len() || ((expand[i] >> 3) as usize) != src_i {
+                        break;
+                    }
+                }
+            }
+            expand.clear();
+            self.worker_scratch[worker_id].expand = expand;
+        }
+
+        if keep_dense_contiguous_active
+            && self.arena.free_list.is_empty()
+            && self.arena.active_set.len() == self.arena.occupied_count
+            && self.arena.occupied_count + 1 == self.arena.meta.len()
+            && self.arena.active_set.first().map(|idx| idx.0) == Some(1)
+            && self.arena.active_set.last().map(|idx| idx.0)
+                == Some(self.arena.occupied_count as u32)
+        {
+            self.arena.active_set_dense_contiguous = true;
         }
     }
 
@@ -1720,10 +1936,16 @@ impl TurboLife {
         let local_x = x.rem_euclid(TILE_SIZE_I64) as usize;
         let local_y = y.rem_euclid(TILE_SIZE_I64) as usize;
 
-        let idx = self
-            .arena
-            .idx_at_cached(tile_coord)
-            .unwrap_or_else(|| self.arena.allocate_absent(tile_coord));
+        let idx = if let Some(cached) = self.hot_tile_lookup(tile_coord) {
+            cached
+        } else {
+            let resolved = self
+                .arena
+                .idx_at_cached(tile_coord)
+                .unwrap_or_else(|| self.arena.allocate_absent(tile_coord));
+            self.hot_tile_store(tile_coord, resolved);
+            resolved
+        };
 
         let row_after: u64;
         {
@@ -1765,8 +1987,14 @@ impl TurboLife {
         let local_x = x.rem_euclid(TILE_SIZE_I64) as usize;
         let local_y = y.rem_euclid(TILE_SIZE_I64) as usize;
 
-        let Some(idx) = self.arena.idx_at_cached(tile_coord) else {
-            return;
+        let idx = if let Some(cached) = self.hot_tile_lookup(tile_coord) {
+            cached
+        } else {
+            let Some(found) = self.arena.idx_at_cached(tile_coord) else {
+                return;
+            };
+            self.hot_tile_store(tile_coord, found);
+            found
         };
 
         let row_after: u64;
@@ -1817,10 +2045,21 @@ impl TurboLife {
             let local_x = x.rem_euclid(TILE_SIZE_I64) as usize;
             let local_y = y.rem_euclid(TILE_SIZE_I64) as usize;
 
-            let idx = match self.arena.idx_at_cached(tile_coord) {
-                Some(existing) => existing,
-                None if alive => self.arena.allocate_absent(tile_coord),
-                None => continue,
+            let idx = if let Some(cached) = self.hot_tile_lookup(tile_coord) {
+                cached
+            } else {
+                match self.arena.idx_at_cached(tile_coord) {
+                    Some(existing) => {
+                        self.hot_tile_store(tile_coord, existing);
+                        existing
+                    }
+                    None if alive => {
+                        let allocated = self.arena.allocate_absent(tile_coord);
+                        self.hot_tile_store(tile_coord, allocated);
+                        allocated
+                    }
+                    None => continue,
+                }
             };
 
             let changed = {
@@ -1907,13 +2146,47 @@ impl TurboLife {
     }
 
     #[inline(always)]
-    fn step_impl_backend<const CORE_BACKEND: u8, const ASSUME_CHANGED_MODE: bool>(&mut self) {
+    fn step_impl_backend<
+        const CORE_BACKEND: u8,
+        const ASSUME_CHANGED_MODE: bool,
+        const ALLOW_PRUNE: bool,
+    >(
+        &mut self,
+    ) {
         debug_assert!(
             !ASSUME_CHANGED_MODE || CORE_BACKEND == CORE_BACKEND_NEON,
             "assume-changed mode is only valid for the NEON backend"
         );
+        debug_assert!(
+            ASSUME_CHANGED_MODE || ALLOW_PRUNE,
+            "non-assume mode must always run prune bookkeeping"
+        );
 
-        rebuild_active_set(&mut self.arena);
+        let allow_prune = ALLOW_PRUNE;
+        let skip_rebuild_assume_no_prune = ASSUME_CHANGED_MODE
+            && !allow_prune
+            && self.arena.active_set_dense_contiguous
+            && self.arena.free_list.is_empty()
+            && self.arena.active_set.len() == self.arena.occupied_count
+            && self.arena.occupied_count + 1 == self.arena.meta.len()
+            && self.arena.changed_list.len() == self.arena.active_set.len()
+            && self.arena.changed_list.first().map(|idx| idx.0) == Some(1)
+            && self.arena.changed_list.last().map(|idx| idx.0)
+                == Some(self.arena.occupied_count as u32)
+            && self.arena.changed_influence.is_empty();
+        debug_assert!(
+            !skip_rebuild_assume_no_prune
+                || self.arena.changed_list.iter().copied().eq(self
+                    .arena
+                    .active_set
+                    .iter()
+                    .copied()),
+            "assume-changed skip path requires changed_list to mirror active_set"
+        );
+
+        if !skip_rebuild_assume_no_prune {
+            rebuild_active_set(&mut self.arena);
+        }
 
         if self.arena.active_set.is_empty() {
             self.generation += 1;
@@ -1921,7 +2194,11 @@ impl TurboLife {
         }
 
         let active_len = self.arena.active_set.len();
-        let changed_len = self.arena.changed_scratch.len();
+        let changed_len = if skip_rebuild_assume_no_prune {
+            active_len
+        } else {
+            self.arena.changed_scratch.len()
+        };
         self.arena.expand_buf.clear();
         self.arena.prune_buf.clear();
         let use_serial_cache = SERIAL_CACHE_MAX_ACTIVE.is_some_and(|limit| active_len <= limit)
@@ -1936,7 +2213,9 @@ impl TurboLife {
         let run_parallel = effective_threads > 1;
         const TRACK_NEIGHBOR_INFLUENCE: bool = false;
         let emit_changed = !ASSUME_CHANGED_MODE;
-        self.arena.prune_candidates_verified = emit_changed && !run_parallel;
+        self.arena.prune_candidates_verified = allow_prune && !run_parallel;
+        let mut deferred_parallel_expand_worker_count = 0usize;
+        let mut deferred_parallel_expand_total = 0usize;
 
         let (cb_lo, cb_hi) = self.arena.cell_bufs.split_at_mut(1);
         let (current_vec, next_vec) = if cp == 0 {
@@ -1966,46 +2245,49 @@ impl TurboLife {
         debug_assert_eq!(self.arena.meta.len(), self.arena.neighbors.len());
         let dense_active_contiguous = self.arena.active_set_dense_contiguous;
 
-        macro_rules! dispatch_by_emit {
-            ($macro_name:ident, $advance:path, $track:expr) => {{
+        macro_rules! dispatch_by_emit_with_prune {
+            ($macro_name:ident, $advance:path, $track:expr, $allow_prune:literal) => {{
                 if dense_active_contiguous {
                     if emit_changed {
-                        $macro_name!($advance, $track, true, true);
+                        $macro_name!($advance, $track, true, true, $allow_prune);
                     } else {
-                        $macro_name!($advance, $track, false, true);
+                        $macro_name!($advance, $track, false, true, $allow_prune);
                     }
                 } else {
                     if emit_changed {
-                        $macro_name!($advance, $track, true, false);
+                        $macro_name!($advance, $track, true, false, $allow_prune);
                     } else {
-                        $macro_name!($advance, $track, false, false);
+                        $macro_name!($advance, $track, false, false, $allow_prune);
                     }
                 }
             }};
         }
 
-        macro_rules! dispatch_fused_kernel_by_emit {
-            ($macro_name:ident) => {{
+        macro_rules! dispatch_fused_kernel_by_emit_with_prune {
+            ($macro_name:ident, $allow_prune:literal) => {{
                 if CORE_BACKEND == CORE_BACKEND_SCALAR {
-                    dispatch_by_emit!(
+                    dispatch_by_emit_with_prune!(
                         $macro_name,
                         advance_tile_fused_scalar_backend::<TRACK_NEIGHBOR_INFLUENCE>,
-                        TRACK_NEIGHBOR_INFLUENCE
+                        TRACK_NEIGHBOR_INFLUENCE,
+                        $allow_prune
                     );
                 } else if CORE_BACKEND == CORE_BACKEND_AVX2 {
-                    dispatch_by_emit!(
+                    dispatch_by_emit_with_prune!(
                         $macro_name,
                         advance_tile_fused_avx2_backend::<TRACK_NEIGHBOR_INFLUENCE>,
-                        TRACK_NEIGHBOR_INFLUENCE
+                        TRACK_NEIGHBOR_INFLUENCE,
+                        $allow_prune
                     );
                 } else if CORE_BACKEND == CORE_BACKEND_NEON {
-                    dispatch_by_emit!(
+                    dispatch_by_emit_with_prune!(
                         $macro_name,
                         advance_tile_fused_neon_backend::<
                             TRACK_NEIGHBOR_INFLUENCE,
                             ASSUME_CHANGED_MODE,
                         >,
-                        TRACK_NEIGHBOR_INFLUENCE
+                        TRACK_NEIGHBOR_INFLUENCE,
+                        $allow_prune
                     );
                 } else {
                     unreachable!("invalid fused backend selector: {CORE_BACKEND}");
@@ -2018,7 +2300,9 @@ impl TurboLife {
             if TRACK_NEIGHBOR_INFLUENCE {
                 reserve_additional_capacity(&mut self.arena.changed_influence, active_len);
             }
-            reserve_additional_capacity(&mut self.arena.prune_buf, active_len);
+            if allow_prune {
+                reserve_additional_capacity(&mut self.arena.prune_buf, active_len);
+            }
             reserve_additional_capacity(&mut self.arena.expand_buf, active_len.saturating_mul(8));
 
             // Serial path: cached kernel with multi-level prefetching.
@@ -2044,7 +2328,13 @@ impl TurboLife {
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
 
             macro_rules! serial_loop_cached {
-                ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
+                (
+                    $advance:path,
+                    $track:expr,
+                    $emit_changed:literal,
+                    $dense:literal,
+                    $allow_prune:literal
+                ) => {{
                     for i in 0..active_len {
                         let idx = unsafe { active_tile_at::<$dense>(active_ptr, i) };
                         let ii = idx.index();
@@ -2151,23 +2441,27 @@ impl TurboLife {
                                 }
                             }
                         }
-                        let queue_prune =
-                            unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
-                        unsafe {
-                            vec_push_if_unchecked(&mut self.arena.prune_buf, idx, queue_prune);
-                        }
-                        if queue_prune && $emit_changed && !result.prune_ready {
-                            self.arena.prune_candidates_verified = false;
+                        if $allow_prune {
+                            let queue_prune =
+                                should_queue_prune::<$emit_changed>(has_live, changed);
+                            unsafe {
+                                vec_push_if_unchecked(&mut self.arena.prune_buf, idx, queue_prune);
+                            }
+                            if queue_prune && !result.prune_ready {
+                                self.arena.prune_candidates_verified = false;
+                            }
                         }
 
                         let missing = result.missing_mask;
-                        if unlikely(missing != 0) {
+                        let live_mask = result.live_mask;
+                        let expand_mask = missing & live_mask;
+                        if expand_mask != 0 {
                             unsafe {
                                 append_expand_candidates_cold(
                                     &mut self.arena.expand_buf,
                                     idx,
-                                    missing,
-                                    result.live_mask,
+                                    expand_mask,
+                                    live_mask,
                                 );
                             }
                         }
@@ -2176,7 +2470,13 @@ impl TurboLife {
             }
 
             macro_rules! serial_loop_fused {
-                ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
+                (
+                    $advance:path,
+                    $track:expr,
+                    $emit_changed:literal,
+                    $dense:literal,
+                    $allow_prune:literal
+                ) => {{
                     for i in 0..active_len {
                         let idx = unsafe { active_tile_at::<$dense>(active_ptr, i) };
                         let ii = idx.index();
@@ -2282,23 +2582,27 @@ impl TurboLife {
                                 }
                             }
                         }
-                        let queue_prune =
-                            unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
-                        unsafe {
-                            vec_push_if_unchecked(&mut self.arena.prune_buf, idx, queue_prune);
-                        }
-                        if queue_prune && $emit_changed && !result.prune_ready {
-                            self.arena.prune_candidates_verified = false;
+                        if $allow_prune {
+                            let queue_prune =
+                                should_queue_prune::<$emit_changed>(has_live, changed);
+                            unsafe {
+                                vec_push_if_unchecked(&mut self.arena.prune_buf, idx, queue_prune);
+                            }
+                            if queue_prune && !result.prune_ready {
+                                self.arena.prune_candidates_verified = false;
+                            }
                         }
 
                         let missing = result.missing_mask;
-                        if unlikely(missing != 0) {
+                        let live_mask = result.live_mask;
+                        let expand_mask = missing & live_mask;
+                        if expand_mask != 0 {
                             unsafe {
                                 append_expand_candidates_cold(
                                     &mut self.arena.expand_buf,
                                     idx,
-                                    missing,
-                                    result.live_mask,
+                                    expand_mask,
+                                    live_mask,
                                 );
                             }
                         }
@@ -2307,21 +2611,41 @@ impl TurboLife {
             }
 
             if use_serial_cache {
-                if CORE_BACKEND == CORE_BACKEND_AVX2 {
-                    dispatch_by_emit!(
+                if allow_prune {
+                    if CORE_BACKEND == CORE_BACKEND_AVX2 {
+                        dispatch_by_emit_with_prune!(
+                            serial_loop_cached,
+                            advance_tile_cached_avx2_backend::<TRACK_NEIGHBOR_INFLUENCE>,
+                            TRACK_NEIGHBOR_INFLUENCE,
+                            true
+                        );
+                    } else {
+                        dispatch_by_emit_with_prune!(
+                            serial_loop_cached,
+                            advance_tile_cached_scalar_backend::<TRACK_NEIGHBOR_INFLUENCE>,
+                            TRACK_NEIGHBOR_INFLUENCE,
+                            true
+                        );
+                    }
+                } else if CORE_BACKEND == CORE_BACKEND_AVX2 {
+                    dispatch_by_emit_with_prune!(
                         serial_loop_cached,
                         advance_tile_cached_avx2_backend::<TRACK_NEIGHBOR_INFLUENCE>,
-                        TRACK_NEIGHBOR_INFLUENCE
+                        TRACK_NEIGHBOR_INFLUENCE,
+                        false
                     );
                 } else {
-                    dispatch_by_emit!(
+                    dispatch_by_emit_with_prune!(
                         serial_loop_cached,
                         advance_tile_cached_scalar_backend::<TRACK_NEIGHBOR_INFLUENCE>,
-                        TRACK_NEIGHBOR_INFLUENCE
+                        TRACK_NEIGHBOR_INFLUENCE,
+                        false
                     );
                 }
+            } else if allow_prune {
+                dispatch_fused_kernel_by_emit_with_prune!(serial_loop_fused, true);
             } else {
-                dispatch_fused_kernel_by_emit!(serial_loop_fused);
+                dispatch_fused_kernel_by_emit_with_prune!(serial_loop_fused, false);
             }
         } else {
             // Parallel kernel compute with a hybrid scheduler:
@@ -2354,12 +2678,17 @@ impl TurboLife {
                 PARALLEL_STATIC_SCHEDULE_THRESHOLD,
                 Some(threshold) if active_len >= threshold
             );
-            self.prepare_worker_scratch(
-                worker_count,
-                active_len,
-                emit_changed,
-                TRACK_NEIGHBOR_INFLUENCE,
-            );
+            if ASSUME_CHANGED_MODE {
+                self.prepare_worker_scratch::<false, TRACK_NEIGHBOR_INFLUENCE, ALLOW_PRUNE>(
+                    worker_count,
+                    active_len,
+                );
+            } else {
+                self.prepare_worker_scratch::<true, TRACK_NEIGHBOR_INFLUENCE, ALLOW_PRUNE>(
+                    worker_count,
+                    active_len,
+                );
+            }
             let scratch_ptr = SendPtr::new(self.worker_scratch.as_mut_ptr());
             #[cfg(target_arch = "x86_64")]
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
@@ -2441,7 +2770,8 @@ impl TurboLife {
                     $end:expr,
                     $track:expr,
                     $emit_changed:literal,
-                    $dense:literal
+                    $dense:literal,
+                    $allow_prune:literal
                 ) => {{
                     prefetch_for_work_item!($i, $end, $dense);
                     let idx = unsafe { active_tile_at::<$dense>(active_ptr.get(), $i) };
@@ -2482,23 +2812,26 @@ impl TurboLife {
                             }
                         }
                     }
-                    let queue_prune =
-                        unlikely(should_queue_prune::<$emit_changed>(has_live, changed));
-                    unsafe {
-                        vec_push_if_unchecked(&mut ($scratch).prune, idx, queue_prune);
-                    }
-                    if queue_prune && $emit_changed && !result.prune_ready {
-                        ($scratch).prune_candidates_verified = false;
+                    if $allow_prune {
+                        let queue_prune = should_queue_prune::<$emit_changed>(has_live, changed);
+                        unsafe {
+                            vec_push_if_unchecked(&mut ($scratch).prune, idx, queue_prune);
+                        }
+                        if queue_prune && !result.prune_ready {
+                            ($scratch).prune_candidates_verified = false;
+                        }
                     }
 
                     let missing = result.missing_mask;
-                    if unlikely(missing != 0) {
+                    let live_mask = result.live_mask;
+                    let expand_mask = missing & live_mask;
+                    if expand_mask != 0 {
                         unsafe {
                             append_expand_candidates_cold(
                                 &mut ($scratch).expand,
                                 idx,
-                                missing,
-                                result.live_mask,
+                                expand_mask,
+                                live_mask,
                             );
                         }
                     }
@@ -2506,7 +2839,13 @@ impl TurboLife {
             }
 
             macro_rules! parallel_kernel_static {
-                ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
+                (
+                    $advance:path,
+                    $track:expr,
+                    $emit_changed:literal,
+                    $dense:literal,
+                    $allow_prune:literal
+                ) => {{
                     run_parallel_workers(active_workers, &|worker_id| {
                         let start = worker_id.saturating_mul(static_chunk_size);
                         if start >= active_len {
@@ -2514,7 +2853,9 @@ impl TurboLife {
                         }
                         let end = start.saturating_add(static_chunk_size).min(active_len);
                         let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
-                        scratch.reserve_for_additional_work::<$emit_changed, $track>(end - start);
+                        scratch.reserve_for_additional_work::<$emit_changed, $track, $allow_prune>(
+                            end - start,
+                        );
                         for i in start..end {
                             process_work_item!(
                                 $advance,
@@ -2523,7 +2864,8 @@ impl TurboLife {
                                 end,
                                 $track,
                                 $emit_changed,
-                                $dense
+                                $dense,
+                                $allow_prune
                             );
                         }
                     });
@@ -2531,30 +2873,66 @@ impl TurboLife {
             }
 
             if use_static_schedule {
-                dispatch_fused_kernel_by_emit!(parallel_kernel_static);
+                if allow_prune {
+                    dispatch_fused_kernel_by_emit_with_prune!(parallel_kernel_static, true);
+                } else {
+                    dispatch_fused_kernel_by_emit_with_prune!(parallel_kernel_static, false);
+                }
             } else {
-                let cursor = CacheAlignedAtomicUsize::new(0);
+                let dynamic_target_chunks = active_workers
+                    .saturating_mul(dynamic_target_chunks_per_worker(active_len, changed_len))
+                    .max(active_workers);
+                let (dynamic_seed_span, dynamic_seed_end) =
+                    dynamic_seed_plan(active_len, active_workers);
+                let cursor = CacheAlignedAtomicUsize::new(dynamic_seed_end);
                 macro_rules! parallel_kernel_lockfree {
-                    ($advance:path, $track:expr, $emit_changed:literal, $dense:literal) => {{
+                    (
+                        $advance:path,
+                        $track:expr,
+                        $emit_changed:literal,
+                        $dense:literal,
+                        $allow_prune:literal
+                    ) => {{
                         let cursor_ref = &cursor;
+                        let seed_span = dynamic_seed_span;
                         run_parallel_workers(active_workers, &|worker_id| {
                             let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
+                            if seed_span != 0 {
+                                let seed_start = worker_id.saturating_mul(seed_span);
+                                let seed_end = seed_start.saturating_add(seed_span).min(active_len);
+                                if seed_end > seed_start {
+                                    scratch.reserve_for_additional_work::<$emit_changed, $track, $allow_prune>(
+                                        seed_end - seed_start,
+                                    );
+                                    for i in seed_start..seed_end {
+                                        process_work_item!(
+                                            $advance,
+                                            scratch,
+                                            i,
+                                            seed_end,
+                                            $track,
+                                            $emit_changed,
+                                            $dense,
+                                            $allow_prune
+                                        );
+                                    }
+                                }
+                            }
                             loop {
                                 let observed = cursor_ref.load(Ordering::Relaxed);
                                 if observed >= active_len {
                                     break;
                                 }
-                                let chunk_size = dynamic_parallel_chunk_size(
+                                let chunk_size = dynamic_parallel_chunk_size_for_target(
                                     active_len - observed,
-                                    changed_len,
-                                    active_workers,
+                                    dynamic_target_chunks,
                                 );
                                 let start = cursor_ref.fetch_add(chunk_size, Ordering::Relaxed);
                                 if start >= active_len {
                                     break;
                                 }
                                 let end = start.saturating_add(chunk_size).min(active_len);
-                                scratch.reserve_for_additional_work::<$emit_changed, $track>(
+                                scratch.reserve_for_additional_work::<$emit_changed, $track, $allow_prune>(
                                     end - start,
                                 );
                                 for i in start..end {
@@ -2565,7 +2943,8 @@ impl TurboLife {
                                         end,
                                         $track,
                                         $emit_changed,
-                                        $dense
+                                        $dense,
+                                        $allow_prune
                                     );
                                 }
                             }
@@ -2573,84 +2952,187 @@ impl TurboLife {
                     }};
                 }
 
-                dispatch_fused_kernel_by_emit!(parallel_kernel_lockfree);
-            }
-
-            let mut total_expand = 0usize;
-            let mut total_prune = 0usize;
-            let mut total_changed = 0usize;
-            let mut max_expand = (0usize, 0usize);
-            let mut max_prune = (0usize, 0usize);
-            let mut max_changed = (0usize, 0usize);
-            let mut all_prune_candidates_verified = emit_changed;
-            for worker_id in 0..worker_count {
-                let scratch = &self.worker_scratch[worker_id];
-                let expand_len = scratch.expand.len();
-                let prune_len = scratch.prune.len();
-                let changed_len = scratch.changed.len();
-
-                total_expand = total_expand.saturating_add(expand_len);
-                total_prune = total_prune.saturating_add(prune_len);
-                total_changed = total_changed.saturating_add(changed_len);
-
-                if expand_len > max_expand.0 {
-                    max_expand = (expand_len, worker_id);
-                }
-                if prune_len > max_prune.0 {
-                    max_prune = (prune_len, worker_id);
-                }
-                if changed_len > max_changed.0 {
-                    max_changed = (changed_len, worker_id);
-                }
-                if emit_changed && !scratch.prune_candidates_verified {
-                    all_prune_candidates_verified = false;
-                }
-
-                if TRACK_NEIGHBOR_INFLUENCE {
-                    debug_assert_eq!(changed_len, scratch.changed_influence.len());
+                if allow_prune {
+                    dispatch_fused_kernel_by_emit_with_prune!(parallel_kernel_lockfree, true);
+                } else {
+                    dispatch_fused_kernel_by_emit_with_prune!(parallel_kernel_lockfree, false);
                 }
             }
 
-            macro_rules! merge_worker_vectors {
-                ($dst:expr, $field:ident, $total:expr, $max_pair:expr) => {{
-                    if $total == 0 {
-                        $dst.clear();
-                    } else {
-                        let base_worker = $max_pair.1;
-                        std::mem::swap(&mut $dst, &mut self.worker_scratch[base_worker].$field);
-                        let additional = $total.saturating_sub($dst.len());
-                        reserve_additional_capacity(&mut $dst, additional);
-                        for worker_id in 0..worker_count {
-                            if worker_id == base_worker {
-                                continue;
-                            }
-                            $dst.append(&mut self.worker_scratch[worker_id].$field);
-                        }
+            if !allow_prune && !emit_changed {
+                let mut total_expand = 0usize;
+                for worker_id in 0..worker_count {
+                    let scratch = &self.worker_scratch[worker_id];
+                    total_expand = total_expand.saturating_add(scratch.expand.len());
+                    debug_assert!(scratch.changed.is_empty());
+                    debug_assert!(scratch.prune.is_empty());
+                    if TRACK_NEIGHBOR_INFLUENCE {
+                        debug_assert!(scratch.changed_influence.is_empty());
                     }
-                }};
-            }
+                }
+                deferred_parallel_expand_worker_count = worker_count;
+                deferred_parallel_expand_total = total_expand;
+                self.arena.expand_buf.clear();
+                self.arena.prune_buf.clear();
+                if !skip_rebuild_assume_no_prune {
+                    self.arena.changed_list.clear();
+                }
+                self.arena.changed_influence.clear();
+                self.arena.prune_candidates_verified = false;
+            } else {
+                let mut total_expand = 0usize;
+                let mut total_prune = 0usize;
+                let mut total_changed = 0usize;
+                let mut all_prune_candidates_verified = allow_prune;
+                let mut max_expand_len = 0usize;
+                let mut max_expand_worker = 0usize;
+                let mut max_prune_len = 0usize;
+                let mut max_prune_worker = 0usize;
+                let mut max_changed_len = 0usize;
+                let mut max_changed_worker = 0usize;
+                for worker_id in 0..worker_count {
+                    let scratch = &self.worker_scratch[worker_id];
+                    let expand_len = scratch.expand.len();
+                    let changed_len = scratch.changed.len();
 
-            merge_worker_vectors!(self.arena.expand_buf, expand, total_expand, max_expand);
-            merge_worker_vectors!(self.arena.prune_buf, prune, total_prune, max_prune);
-            if emit_changed {
-                merge_worker_vectors!(self.arena.changed_list, changed, total_changed, max_changed);
-                if TRACK_NEIGHBOR_INFLUENCE {
+                    total_expand = total_expand.saturating_add(expand_len);
+                    if expand_len > max_expand_len {
+                        max_expand_len = expand_len;
+                        max_expand_worker = worker_id;
+                    }
+                    total_changed = total_changed.saturating_add(changed_len);
+                    if changed_len > max_changed_len {
+                        max_changed_len = changed_len;
+                        max_changed_worker = worker_id;
+                    }
+                    if allow_prune {
+                        let prune_len = scratch.prune.len();
+                        total_prune = total_prune.saturating_add(prune_len);
+                        if prune_len > max_prune_len {
+                            max_prune_len = prune_len;
+                            max_prune_worker = worker_id;
+                        }
+                        if !scratch.prune_candidates_verified {
+                            all_prune_candidates_verified = false;
+                        }
+                    } else {
+                        debug_assert!(scratch.prune.is_empty());
+                    }
+
+                    if TRACK_NEIGHBOR_INFLUENCE {
+                        debug_assert_eq!(changed_len, scratch.changed_influence.len());
+                    }
+                }
+
+                macro_rules! merge_worker_vectors {
+                    (
+                        $dst:expr,
+                        $field:ident,
+                        $total:expr,
+                        $anchor_worker:expr,
+                        $anchor_len:expr
+                    ) => {{
+                        if $total == 0 {
+                            $dst.clear();
+                        } else {
+                            let anchor_worker = $anchor_worker;
+                            let anchor_len = $anchor_len;
+                            debug_assert!(anchor_worker < worker_count);
+                            debug_assert!(anchor_len > 0);
+                            std::mem::swap(
+                                &mut $dst,
+                                &mut self.worker_scratch[anchor_worker].$field,
+                            );
+                            self.worker_scratch[anchor_worker].$field.clear();
+                            debug_assert_eq!($dst.len(), anchor_len);
+                            reserve_additional_capacity(
+                                &mut $dst,
+                                $total.saturating_sub(anchor_len),
+                            );
+                            debug_assert!($dst.capacity() >= $total);
+                            let dst_ptr = $dst.as_mut_ptr();
+                            let mut write = anchor_len;
+                            for worker_id in 0..worker_count {
+                                if worker_id == anchor_worker {
+                                    continue;
+                                }
+                                let src = &mut self.worker_scratch[worker_id].$field;
+                                let len = src.len();
+                                if len != 0 {
+                                    let end = write
+                                        .checked_add(len)
+                                        .expect("worker merge length overflowed usize");
+                                    debug_assert!(end <= $total);
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            src.as_ptr(),
+                                            dst_ptr.add(write),
+                                            len,
+                                        );
+                                        src.set_len(0);
+                                    }
+                                    write = end;
+                                }
+                            }
+                            debug_assert_eq!(write, $total);
+                            unsafe { $dst.set_len(write) };
+                        }
+                    }};
+                }
+
+                if allow_prune {
                     merge_worker_vectors!(
-                        self.arena.changed_influence,
-                        changed_influence,
-                        total_changed,
-                        max_changed
+                        self.arena.expand_buf,
+                        expand,
+                        total_expand,
+                        max_expand_worker,
+                        max_expand_len
                     );
                 } else {
+                    deferred_parallel_expand_worker_count = worker_count;
+                    deferred_parallel_expand_total = total_expand;
+                    self.arena.expand_buf.clear();
+                }
+                if allow_prune {
+                    merge_worker_vectors!(
+                        self.arena.prune_buf,
+                        prune,
+                        total_prune,
+                        max_prune_worker,
+                        max_prune_len
+                    );
+                } else {
+                    self.arena.prune_buf.clear();
+                }
+                if emit_changed {
+                    merge_worker_vectors!(
+                        self.arena.changed_list,
+                        changed,
+                        total_changed,
+                        max_changed_worker,
+                        max_changed_len
+                    );
+                    if TRACK_NEIGHBOR_INFLUENCE {
+                        merge_worker_vectors!(
+                            self.arena.changed_influence,
+                            changed_influence,
+                            total_changed,
+                            max_changed_worker,
+                            max_changed_len
+                        );
+                    } else {
+                        self.arena.changed_influence.clear();
+                    }
+                } else {
+                    if !skip_rebuild_assume_no_prune {
+                        self.arena.changed_list.clear();
+                    }
                     self.arena.changed_influence.clear();
                 }
-            } else {
-                self.arena.changed_list.clear();
-                self.arena.changed_influence.clear();
+                self.arena.prune_candidates_verified = all_prune_candidates_verified;
             }
-            self.arena.prune_candidates_verified = all_prune_candidates_verified;
         }
-        if ASSUME_CHANGED_MODE {
+        if ASSUME_CHANGED_MODE && !skip_rebuild_assume_no_prune {
             self.derive_changed_from_active_minus_prune();
         }
         if !self.arena.changed_list.is_empty() {
@@ -2668,6 +3150,12 @@ impl TurboLife {
 
         self.arena.flip_borders();
         self.arena.flip_cells();
+        if deferred_parallel_expand_worker_count != 0 {
+            self.finalize_parallel_expand_from_worker_scratch(
+                deferred_parallel_expand_worker_count,
+                deferred_parallel_expand_total,
+            );
+        }
 
         finalize_prune_and_expand(&mut self.arena);
 
@@ -2676,31 +3164,60 @@ impl TurboLife {
     }
 
     #[inline(always)]
-    fn step_n_impl_backend<const CORE_BACKEND: u8, const ASSUME_CHANGED_MODE: bool>(
+    fn step_n_impl_backend_with_prune<
+        const CORE_BACKEND: u8,
+        const ASSUME_CHANGED_MODE: bool,
+        const ALLOW_PRUNE: bool,
+    >(
         &mut self,
         mut remaining: u64,
     ) {
         while remaining >= 8 {
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
             remaining -= 8;
         }
         while remaining >= 4 {
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
             remaining -= 4;
         }
         while remaining != 0 {
-            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE>();
+            self.step_impl_backend::<CORE_BACKEND, ASSUME_CHANGED_MODE, ALLOW_PRUNE>();
             remaining -= 1;
+        }
+    }
+
+    #[inline(always)]
+    fn step_n_impl_backend<const CORE_BACKEND: u8, const ASSUME_CHANGED_MODE: bool>(
+        &mut self,
+        mut remaining: u64,
+    ) {
+        if !ASSUME_CHANGED_MODE {
+            self.step_n_impl_backend_with_prune::<CORE_BACKEND, false, true>(remaining);
+            return;
+        }
+
+        while remaining != 0 {
+            if should_run_prune_pass::<true>(self.generation) {
+                self.step_impl_backend::<CORE_BACKEND, true, true>();
+                remaining -= 1;
+                continue;
+            }
+
+            let generation_mod = self.generation & (ASSUME_CHANGED_PRUNE_STRIDE - 1);
+            let until_prune = ASSUME_CHANGED_PRUNE_STRIDE - generation_mod;
+            let batch = remaining.min(until_prune);
+            self.step_n_impl_backend_with_prune::<CORE_BACKEND, true, false>(batch);
+            remaining -= batch;
         }
     }
 
@@ -2736,6 +3253,7 @@ impl TurboLife {
     }
 
     pub fn step(&mut self) {
+        self.hot_tile_clear();
         // Split borrow: take a shared ref to the pool before mutably borrowing self.
         let pool = &self.pool as *const rayon::ThreadPool;
         // SAFETY: `pool` is not modified during `install`, and step logic only
@@ -2749,6 +3267,7 @@ impl TurboLife {
         if n == 0 {
             return;
         }
+        self.hot_tile_clear();
 
         // Split borrow: take a shared ref to the pool before mutably borrowing self.
         let pool = &self.pool as *const rayon::ThreadPool;
@@ -2757,6 +3276,68 @@ impl TurboLife {
         unsafe { &*pool }.install(|| {
             self.step_n_impl_dispatch(n);
         });
+    }
+
+    /// Reserve arena capacity for frontier growth before a long run.
+    ///
+    /// This shifts vector/hashmap growth out of hot `step_n` loops and helps
+    /// keep expansion-heavy workloads allocation-free during stepping.
+    pub fn reserve_for_generations(&mut self, generations: u64) {
+        if generations == 0 || self.arena.occupied_count == 0 {
+            return;
+        }
+
+        let mut min_tx = i64::MAX;
+        let mut min_ty = i64::MAX;
+        let mut max_tx = i64::MIN;
+        let mut max_ty = i64::MIN;
+
+        for (word_idx, &word) in self.arena.occupied_bits.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let i = (word_idx << 6) + bit;
+                if i == 0 || i >= self.arena.meta.len() {
+                    bits &= bits - 1;
+                    continue;
+                }
+                let (tx, ty) = self.arena.coords[i];
+                min_tx = min_tx.min(tx);
+                min_ty = min_ty.min(ty);
+                max_tx = max_tx.max(tx);
+                max_ty = max_ty.max(ty);
+                bits &= bits - 1;
+            }
+        }
+
+        if min_tx > max_tx || min_ty > max_ty {
+            return;
+        }
+
+        let grow_tiles =
+            usize::try_from(generations.div_ceil(tile::TILE_SIZE as u64)).unwrap_or(usize::MAX);
+        let span_x =
+            usize::try_from(i128::from(max_tx) - i128::from(min_tx) + 1).unwrap_or(usize::MAX);
+        let span_y =
+            usize::try_from(i128::from(max_ty) - i128::from(min_ty) + 1).unwrap_or(usize::MAX);
+        let target_span_x = span_x.saturating_add(grow_tiles.saturating_mul(2));
+        let target_span_y = span_y.saturating_add(grow_tiles.saturating_mul(2));
+        let target_tiles = target_span_x
+            .saturating_mul(target_span_y)
+            .min(tile::MAX_NEIGHBOR_INDEX);
+        let current_tiles = self.arena.meta.len().saturating_sub(1);
+        if target_tiles <= current_tiles {
+            return;
+        }
+
+        let additional = target_tiles - current_tiles;
+        self.arena.reserve_additional_tiles(additional);
+        reserve_additional_capacity(&mut self.arena.active_set, additional);
+        reserve_additional_capacity(&mut self.arena.changed_list, additional);
+        reserve_additional_capacity(&mut self.arena.changed_influence, additional);
+        reserve_additional_capacity(&mut self.arena.changed_influence_scratch, additional);
+        reserve_additional_capacity(&mut self.arena.expand_buf, additional.saturating_mul(8));
+        reserve_additional_capacity(&mut self.arena.prune_buf, additional);
     }
 
     pub fn population(&mut self) -> u64 {
@@ -2858,19 +3439,30 @@ mod tests {
     use super::{
         KernelBackend, PARALLEL_KERNEL_MIN_ACTIVE, TILE_SIZE_I64, TileIdx, TurboLife,
         TurboLifeConfig, auto_pool_thread_count, auto_pool_thread_count_for_physical,
-        churn_at_most_percent, churn_below_percent, dynamic_parallel_chunk_size,
+        churn_at_most_percent, churn_below_percent, dynamic_parallel_chunk_size, dynamic_seed_plan,
         dynamic_target_chunks_per_worker, macos_perf_only_enabled, memory_parallel_cap,
         parse_env_bool, run_parallel_workers,
     };
 
-    const PARALLEL_TEST_TILE_GRID: i64 = 12;
     const PARALLEL_TEST_CELLS_PER_TILE: usize = 16;
+    const PARALLEL_TEST_ACTIVE_TILE_MARGIN: usize = 64;
+
+    fn parallel_test_tile_grid() -> i64 {
+        let target_tiles =
+            PARALLEL_KERNEL_MIN_ACTIVE.saturating_add(PARALLEL_TEST_ACTIVE_TILE_MARGIN);
+        let mut side = 1usize;
+        while side.saturating_mul(side) < target_tiles {
+            side += 1;
+        }
+        i64::try_from(side).expect("parallel test tile grid should fit in i64")
+    }
 
     fn seed_parallel_scheduler_fixture(engine: &mut TurboLife) {
+        let tile_grid = parallel_test_tile_grid();
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xA55A_CE11_1234_5678);
         let mut cells = Vec::new();
-        for ty in 0..PARALLEL_TEST_TILE_GRID {
-            for tx in 0..PARALLEL_TEST_TILE_GRID {
+        for ty in 0..tile_grid {
+            for tx in 0..tile_grid {
                 let base_x = tx * TILE_SIZE_I64;
                 let base_y = ty * TILE_SIZE_I64;
                 for _ in 0..PARALLEL_TEST_CELLS_PER_TILE {
@@ -2989,7 +3581,7 @@ mod tests {
             .build()
             .expect("thread pool");
 
-        for worker_count in [1usize, 2, 3, 4, 5, 8, 9] {
+        for worker_count in [1usize, 2, 3, 4, 5, 6, 8, 9] {
             let visit_count = AtomicUsize::new(0);
             let visited_mask = AtomicUsize::new(0);
             pool.install(|| {
@@ -3051,22 +3643,43 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_chunk_targets_follow_platform_frontier_policy() {
-        assert_eq!(dynamic_target_chunks_per_worker(1, 1), 1);
-        assert_eq!(dynamic_target_chunks_per_worker(2_047, 2_047), 1);
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-        {
-            assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 2);
-            assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 2);
-            assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 2);
-            assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 2);
+    fn dynamic_chunk_targets_follow_base_policy() {
+        for (active_len, changed_len) in [(1, 1), (2_048, 900), (16_384, 16_384)] {
+            assert_eq!(
+                dynamic_target_chunks_per_worker(active_len, changed_len),
+                super::PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE
+            );
         }
-        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-        {
-            assert_eq!(dynamic_target_chunks_per_worker(2_048, 100), 1);
-            assert_eq!(dynamic_target_chunks_per_worker(2_048, 900), 1);
-            assert_eq!(dynamic_target_chunks_per_worker(16_383, 9_000), 1);
-            assert_eq!(dynamic_target_chunks_per_worker(16_384, 16_384), 1);
+    }
+
+    #[test]
+    fn dynamic_seed_plan_stays_bounded_and_worker_aligned() {
+        for active_len in [0usize, 1, 2, 3, 4, 7, 8, 9, 511, 512, 4_096, 65_535] {
+            for worker_count in 0usize..=32 {
+                let (seed_span, seed_end) = dynamic_seed_plan(active_len, worker_count);
+                if worker_count == 0 {
+                    assert_eq!(seed_span, 0);
+                    assert_eq!(seed_end, 0);
+                    continue;
+                }
+
+                assert!(
+                    seed_end <= active_len,
+                    "seed prefix must stay within active range: active={active_len} workers={worker_count} end={seed_end}"
+                );
+                assert_eq!(
+                    seed_end,
+                    seed_span.saturating_mul(worker_count).min(active_len),
+                    "seed prefix should be composed of contiguous per-worker strips"
+                );
+                if seed_span > 0 {
+                    assert_eq!(
+                        seed_end % worker_count,
+                        0,
+                        "non-empty seed prefixes should align to worker strip boundaries"
+                    );
+                }
+            }
         }
     }
 
@@ -3087,18 +3700,43 @@ mod tests {
         let medium_balanced = dynamic_parallel_chunk_size(4_096, 1_200, 4);
         let medium_high = dynamic_parallel_chunk_size(4_096, 3_000, 4);
         let large = dynamic_parallel_chunk_size(65_536, 50_000, 4);
-        assert_eq!(small, 200);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            assert_eq!(medium_balanced, 512);
-            assert_eq!(medium_high, 512);
+            assert_eq!(small, 64);
+            assert_eq!(medium_balanced, 64);
+            assert_eq!(medium_high, 64);
+            assert_eq!(large, 64);
         }
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         {
-            assert_eq!(medium_balanced, 1_024);
-            assert_eq!(medium_high, 1_024);
+            assert_eq!(small, 100);
+            assert_eq!(medium_balanced, 512);
+            assert_eq!(medium_high, 512);
+            assert_eq!(large, 2_048);
         }
-        assert_eq!(large, 2_048);
+    }
+
+    #[test]
+    fn div_ceil_dispatch_small_matches_builtin_div_ceil() {
+        let numerators = [
+            0usize,
+            1,
+            2,
+            3,
+            7,
+            31,
+            64,
+            255,
+            1_024,
+            4_096,
+            usize::MAX / 2,
+            usize::MAX / 2 + 1,
+        ];
+        for d in 1..=64usize {
+            for &n in &numerators {
+                assert_eq!(super::div_ceil_dispatch_small(n, d), n.div_ceil(d));
+            }
+        }
     }
 
     #[test]
@@ -3112,6 +3750,101 @@ mod tests {
         assert!(!super::should_queue_prune::<true>(false, true));
         assert!(super::should_queue_prune::<false>(false, false));
         assert!(super::should_queue_prune::<false>(false, true));
+    }
+
+    #[test]
+    fn assume_changed_prune_policy_applies_only_to_non_assume_mode() {
+        assert!(super::should_run_prune_pass::<false>(0));
+        assert!(super::should_run_prune_pass::<false>(7));
+        assert!(super::should_run_prune_pass::<false>(31));
+    }
+
+    #[test]
+    fn assume_changed_mode_prune_pass_follows_generation_stride() {
+        let stride = super::ASSUME_CHANGED_PRUNE_STRIDE;
+        assert!(!super::should_run_prune_pass::<true>(0));
+        if stride > 1 {
+            assert!(!super::should_run_prune_pass::<true>(1));
+            assert!(!super::should_run_prune_pass::<true>(stride - 1));
+        }
+        assert!(super::should_run_prune_pass::<true>(stride));
+        if let Some(next_cycle) = stride.checked_mul(2) {
+            assert!(!super::should_run_prune_pass::<true>(next_cycle - 1));
+            assert!(super::should_run_prune_pass::<true>(next_cycle));
+        }
+    }
+
+    #[test]
+    fn assume_changed_mode_skips_prune_on_generation_zero() {
+        let mut engine = TurboLife::with_config(TurboLifeConfig::default().thread_count(1));
+        engine.set_cell(0, 0, true);
+
+        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true, false>();
+
+        assert_eq!(engine.population(), 0);
+        assert!(engine.arena.occupied_count > 0);
+    }
+
+    #[test]
+    fn assume_changed_mode_prunes_extinct_tile_on_stride_boundary() {
+        let mut engine = TurboLife::with_config(TurboLifeConfig::default().thread_count(1));
+        engine.set_cell(0, 0, true);
+        engine.generation = super::ASSUME_CHANGED_PRUNE_STRIDE;
+
+        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true, true>();
+
+        assert_eq!(engine.population(), 0);
+        assert_eq!(engine.arena.occupied_count, 0);
+        assert!(engine.arena.active_set.is_empty());
+    }
+
+    fn seed_assume_changed_dense_skip_fixture(
+        engine: &mut TurboLife,
+        tile_count: usize,
+    ) -> Vec<TileIdx> {
+        assert!(tile_count > 0);
+        let mut idxs = Vec::with_capacity(tile_count);
+        for tx in 0..tile_count as i64 {
+            idxs.push(engine.arena.allocate((tx, 0)));
+        }
+        engine.arena.active_set = idxs.clone();
+        engine.arena.active_set_dense_contiguous = true;
+        engine.arena.changed_list = idxs.clone();
+        engine.arena.changed_influence.clear();
+        engine.generation = 1;
+        idxs
+    }
+
+    #[test]
+    fn assume_changed_skip_rebuild_keeps_changed_queue_serial() {
+        let mut engine = TurboLife::with_config(TurboLifeConfig::default().thread_count(1));
+        let expected_changed = seed_assume_changed_dense_skip_fixture(&mut engine, 8);
+        let sentinel = TileIdx(u32::MAX);
+        engine.arena.changed_scratch = vec![sentinel];
+
+        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true, false>();
+
+        assert_eq!(engine.arena.changed_scratch, vec![sentinel]);
+        assert_eq!(engine.arena.changed_list, expected_changed);
+        assert!(engine.arena.changed_influence.is_empty());
+    }
+
+    #[test]
+    fn assume_changed_skip_rebuild_keeps_changed_queue_parallel() {
+        let mut engine = TurboLife::with_config(TurboLifeConfig::default().thread_count(4));
+        let expected_changed =
+            seed_assume_changed_dense_skip_fixture(&mut engine, PARALLEL_KERNEL_MIN_ACTIVE);
+        assert!(
+            super::tuned_parallel_threads(engine.arena.active_set.len(), engine.pool_threads) > 1
+        );
+        let sentinel = TileIdx(u32::MAX);
+        engine.arena.changed_scratch = vec![sentinel];
+
+        engine.step_impl_backend::<{ super::CORE_BACKEND_NEON }, true, false>();
+
+        assert_eq!(engine.arena.changed_scratch, vec![sentinel]);
+        assert_eq!(engine.arena.changed_list, expected_changed);
+        assert!(engine.arena.changed_influence.is_empty());
     }
 
     #[test]
@@ -3135,10 +3868,10 @@ mod tests {
     #[test]
     fn worker_scratch_reserve_for_chunk_reaches_requested_capacity() {
         let mut scratch = super::WorkerScratch::default();
-        scratch.reserve_for_chunk::<true, true>(8);
+        scratch.reserve_for_chunk::<true, true, true>(8);
 
         let chunk_target = scratch.changed.capacity() + 1;
-        scratch.reserve_for_chunk::<true, true>(chunk_target);
+        scratch.reserve_for_chunk::<true, true, true>(chunk_target);
         assert!(
             scratch.changed.capacity() >= chunk_target,
             "changed capacity {} < chunk target {chunk_target}",
@@ -3157,7 +3890,7 @@ mod tests {
 
         let expand_chunk_target = scratch.expand.capacity().div_ceil(3) + 1;
         let expand_target = expand_chunk_target.saturating_mul(3);
-        scratch.reserve_for_chunk::<false, false>(expand_chunk_target);
+        scratch.reserve_for_chunk::<false, false, false>(expand_chunk_target);
         assert!(
             scratch.expand.capacity() >= expand_target,
             "expand capacity {} < expand target {expand_target}",
@@ -3329,6 +4062,34 @@ mod tests {
         let changed_before = engine.arena.changed_list.len();
         engine.set_cell_alive(63, 5);
         assert_eq!(engine.arena.changed_list.len(), changed_before);
+    }
+
+    #[test]
+    fn hot_tile_cache_rejects_stale_recycled_slot() {
+        let mut engine = TurboLife::new();
+        engine.set_cell_alive(0, 0);
+        let stale_idx = engine
+            .arena
+            .idx_at_cached((0, 0))
+            .expect("tile should exist after mutation");
+
+        engine.arena.release(stale_idx);
+        assert!(engine.arena.idx_at((0, 0)).is_none());
+
+        let reused_idx = engine.arena.allocate_absent((1, 0));
+        assert_eq!(reused_idx, stale_idx);
+
+        engine.set_cell_alive(0, 0);
+        assert!(engine.get_cell(0, 0));
+        assert!(
+            !engine.get_cell(64, 0),
+            "stale cache must not redirect writes into the recycled slot"
+        );
+        assert_eq!(
+            engine.arena.idx_at((1, 0)),
+            Some(reused_idx),
+            "reused slot must stay mapped to its new coordinate"
+        );
     }
 
     #[test]
