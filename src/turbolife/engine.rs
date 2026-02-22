@@ -113,6 +113,10 @@ const PARALLEL_STATIC_SCHEDULE_THRESHOLD: Option<usize> = Some(8_192);
 // Two chunks per worker reduces lock-free tail imbalance on the primary
 // main.rs harness without materially increasing cursor contention.
 const PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE: usize = 2;
+// First-pass static strip-mining for the lock-free scheduler.
+// Each worker consumes ~1/divisor of its nominal share before entering
+// lock-free chunk stealing, reducing atomic cursor traffic on dense frontiers.
+const PARALLEL_DYNAMIC_SEED_DIVISOR: usize = 4;
 // Throttle assume-changed prune passes while still periodically reclaiming
 // dead tiles so long-running runs do not accumulate stale occupancy.
 const ASSUME_CHANGED_PRUNE_STRIDE: u64 = 2048;
@@ -159,6 +163,7 @@ const _: [(); 1] =
     [(); (PREFETCH_TILE_FAR_AHEAD_AARCH64 > PREFETCH_TILE_NEAR_AHEAD_AARCH64) as usize];
 const _: [(); 1] = [(); (PARALLEL_DYNAMIC_CHUNK_MIN > 0) as usize];
 const _: [(); 1] = [(); (PARALLEL_DYNAMIC_CHUNK_MIN <= PARALLEL_DYNAMIC_CHUNK_MAX) as usize];
+const _: [(); 1] = [(); (PARALLEL_DYNAMIC_SEED_DIVISOR > 0) as usize];
 const _: [(); 1] = [(); (ASSUME_CHANGED_PRUNE_STRIDE > 0) as usize];
 const _: [(); 1] = [(); ASSUME_CHANGED_PRUNE_STRIDE.is_power_of_two() as usize];
 
@@ -1220,6 +1225,18 @@ fn churn_below_percent(changed_len: usize, active_len: usize, churn_pct_threshol
 #[inline(always)]
 fn dynamic_target_chunks_per_worker(_active_len: usize, _changed_len: usize) -> usize {
     PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE
+}
+
+#[inline(always)]
+fn dynamic_seed_plan(active_len: usize, worker_count: usize) -> (usize, usize) {
+    if worker_count == 0 {
+        return (0, 0);
+    }
+    let seed_span = active_len
+        .saturating_div(worker_count)
+        .saturating_div(PARALLEL_DYNAMIC_SEED_DIVISOR);
+    let seed_end = seed_span.saturating_mul(worker_count).min(active_len);
+    (seed_span, seed_end)
 }
 
 #[inline(always)]
@@ -2862,10 +2879,12 @@ impl TurboLife {
                     dispatch_fused_kernel_by_emit_with_prune!(parallel_kernel_static, false);
                 }
             } else {
-                let cursor = CacheAlignedAtomicUsize::new(0);
                 let dynamic_target_chunks = active_workers
                     .saturating_mul(dynamic_target_chunks_per_worker(active_len, changed_len))
                     .max(active_workers);
+                let (dynamic_seed_span, dynamic_seed_end) =
+                    dynamic_seed_plan(active_len, active_workers);
+                let cursor = CacheAlignedAtomicUsize::new(dynamic_seed_end);
                 macro_rules! parallel_kernel_lockfree {
                     (
                         $advance:path,
@@ -2875,8 +2894,30 @@ impl TurboLife {
                         $allow_prune:literal
                     ) => {{
                         let cursor_ref = &cursor;
+                        let seed_span = dynamic_seed_span;
                         run_parallel_workers(active_workers, &|worker_id| {
                             let scratch = unsafe { &mut *scratch_ptr.get().add(worker_id) };
+                            if seed_span != 0 {
+                                let seed_start = worker_id.saturating_mul(seed_span);
+                                let seed_end = seed_start.saturating_add(seed_span).min(active_len);
+                                if seed_end > seed_start {
+                                    scratch.reserve_for_additional_work::<$emit_changed, $track, $allow_prune>(
+                                        seed_end - seed_start,
+                                    );
+                                    for i in seed_start..seed_end {
+                                        process_work_item!(
+                                            $advance,
+                                            scratch,
+                                            i,
+                                            seed_end,
+                                            $track,
+                                            $emit_changed,
+                                            $dense,
+                                            $allow_prune
+                                        );
+                                    }
+                                }
+                            }
                             loop {
                                 let observed = cursor_ref.load(Ordering::Relaxed);
                                 if observed >= active_len {
@@ -3398,7 +3439,7 @@ mod tests {
     use super::{
         KernelBackend, PARALLEL_KERNEL_MIN_ACTIVE, TILE_SIZE_I64, TileIdx, TurboLife,
         TurboLifeConfig, auto_pool_thread_count, auto_pool_thread_count_for_physical,
-        churn_at_most_percent, churn_below_percent, dynamic_parallel_chunk_size,
+        churn_at_most_percent, churn_below_percent, dynamic_parallel_chunk_size, dynamic_seed_plan,
         dynamic_target_chunks_per_worker, macos_perf_only_enabled, memory_parallel_cap,
         parse_env_bool, run_parallel_workers,
     };
@@ -3608,6 +3649,37 @@ mod tests {
                 dynamic_target_chunks_per_worker(active_len, changed_len),
                 super::PARALLEL_DYNAMIC_TARGET_CHUNKS_PER_WORKER_BASE
             );
+        }
+    }
+
+    #[test]
+    fn dynamic_seed_plan_stays_bounded_and_worker_aligned() {
+        for active_len in [0usize, 1, 2, 3, 4, 7, 8, 9, 511, 512, 4_096, 65_535] {
+            for worker_count in 0usize..=32 {
+                let (seed_span, seed_end) = dynamic_seed_plan(active_len, worker_count);
+                if worker_count == 0 {
+                    assert_eq!(seed_span, 0);
+                    assert_eq!(seed_end, 0);
+                    continue;
+                }
+
+                assert!(
+                    seed_end <= active_len,
+                    "seed prefix must stay within active range: active={active_len} workers={worker_count} end={seed_end}"
+                );
+                assert_eq!(
+                    seed_end,
+                    seed_span.saturating_mul(worker_count).min(active_len),
+                    "seed prefix should be composed of contiguous per-worker strips"
+                );
+                if seed_span > 0 {
+                    assert_eq!(
+                        seed_end % worker_count,
+                        0,
+                        "non-empty seed prefixes should align to worker strip boundaries"
+                    );
+                }
+            }
         }
     }
 
