@@ -1602,13 +1602,14 @@ impl TurboLife {
     }
 
     #[inline]
-    fn prepare_worker_scratch(
+    fn prepare_worker_scratch<
+        const EMIT_CHANGED: bool,
+        const TRACK_NEIGHBOR_INFLUENCE: bool,
+        const ALLOW_PRUNE: bool,
+    >(
         &mut self,
         worker_count: usize,
         active_len: usize,
-        emit_changed: bool,
-        track_neighbor_influence: bool,
-        allow_prune: bool,
     ) {
         if self.worker_scratch.len() < worker_count {
             self.worker_scratch
@@ -1619,26 +1620,11 @@ impl TurboLife {
         }
         let chunk_len = active_len.div_ceil(worker_count);
 
-        macro_rules! reset_and_reserve_scratch {
-            ($emit_changed:literal, $track_neighbor_influence:literal, $allow_prune:literal) => {{
-                for scratch in self.worker_scratch.iter_mut().take(worker_count) {
-                    scratch.clear();
-                    scratch.reserve_for_chunk::<$emit_changed, $track_neighbor_influence, $allow_prune>(
-                        chunk_len,
-                    );
-                }
-            }};
-        }
-
-        match (emit_changed, track_neighbor_influence, allow_prune) {
-            (true, true, true) => reset_and_reserve_scratch!(true, true, true),
-            (true, true, false) => reset_and_reserve_scratch!(true, true, false),
-            (true, false, true) => reset_and_reserve_scratch!(true, false, true),
-            (true, false, false) => reset_and_reserve_scratch!(true, false, false),
-            (false, true, true) => reset_and_reserve_scratch!(false, true, true),
-            (false, true, false) => reset_and_reserve_scratch!(false, true, false),
-            (false, false, true) => reset_and_reserve_scratch!(false, false, true),
-            (false, false, false) => reset_and_reserve_scratch!(false, false, false),
+        for scratch in self.worker_scratch.iter_mut().take(worker_count) {
+            scratch.clear();
+            scratch.reserve_for_chunk::<EMIT_CHANGED, TRACK_NEIGHBOR_INFLUENCE, ALLOW_PRUNE>(
+                chunk_len,
+            );
         }
     }
 
@@ -2665,13 +2651,17 @@ impl TurboLife {
                 PARALLEL_STATIC_SCHEDULE_THRESHOLD,
                 Some(threshold) if active_len >= threshold
             );
-            self.prepare_worker_scratch(
-                worker_count,
-                active_len,
-                emit_changed,
-                TRACK_NEIGHBOR_INFLUENCE,
-                allow_prune,
-            );
+            if ASSUME_CHANGED_MODE {
+                self.prepare_worker_scratch::<false, TRACK_NEIGHBOR_INFLUENCE, ALLOW_PRUNE>(
+                    worker_count,
+                    active_len,
+                );
+            } else {
+                self.prepare_worker_scratch::<true, TRACK_NEIGHBOR_INFLUENCE, ALLOW_PRUNE>(
+                    worker_count,
+                    active_len,
+                );
+            }
             let scratch_ptr = SendPtr::new(self.worker_scratch.as_mut_ptr());
             #[cfg(target_arch = "x86_64")]
             let prefetch_neighbor_borders = active_len >= PREFETCH_NEIGHBOR_BORDERS_MIN_ACTIVE;
