@@ -49,8 +49,10 @@ impl TileAdvanceResult {
 
 #[inline(always)]
 fn full_add(a: u64, b: u64, c: u64) -> (u64, u64) {
-    let sum = a ^ b ^ c;
-    let carry = (a & b) | (b & c) | (a & c);
+    let ab_xor = a ^ b;
+    let sum = ab_xor ^ c;
+    // Equivalent to (a & b) | (b & c) | (a & c), with fewer logic ops.
+    let carry = (a & b) | (c & ab_xor);
     (sum, carry)
 }
 
@@ -412,11 +414,9 @@ unsafe fn avx2_full_add(
 ) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i) {
     use std::arch::x86_64::{_mm256_and_si256, _mm256_or_si256, _mm256_xor_si256};
     unsafe {
-        let sum = _mm256_xor_si256(_mm256_xor_si256(a, b), c);
-        let carry = _mm256_or_si256(
-            _mm256_or_si256(_mm256_and_si256(a, b), _mm256_and_si256(b, c)),
-            _mm256_and_si256(a, c),
-        );
+        let ab_xor = _mm256_xor_si256(a, b);
+        let sum = _mm256_xor_si256(ab_xor, c);
+        let carry = _mm256_or_si256(_mm256_and_si256(a, b), _mm256_and_si256(c, ab_xor));
         (sum, carry)
     }
 }
@@ -674,8 +674,9 @@ unsafe fn neon_full_add(
 ) {
     use std::arch::aarch64::{vandq_u64, veorq_u64, vorrq_u64};
     unsafe {
-        let sum = veorq_u64(veorq_u64(a, b), c);
-        let carry = vorrq_u64(vorrq_u64(vandq_u64(a, b), vandq_u64(b, c)), vandq_u64(a, c));
+        let ab_xor = veorq_u64(a, b);
+        let sum = veorq_u64(ab_xor, c);
+        let carry = vorrq_u64(vandq_u64(a, b), vandq_u64(c, ab_xor));
         (sum, carry)
     }
 }
